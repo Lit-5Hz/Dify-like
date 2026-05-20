@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -7,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
 from app.services.rag_service import retrieve_chunks
+from app.services.model_credential_service import resolve_model_api_key
 from app.services.run_log_service import add_step
 from app.tools.registry import run_tool
 
@@ -93,6 +96,7 @@ class WorkflowExecutor:
             "input": tool_input,
             "output": output,
             "node_id": node.get("id"),
+            "source": "workflow",
         }
         self.result.tool_calls.append(event)
         add_step(
@@ -107,28 +111,43 @@ class WorkflowExecutor:
         yield event
 
     async def _execute_agent(self, node: dict[str, Any], context: dict[str, Any]) -> AsyncIterator[RuntimeEvent]:
-        # 记录 agent 节点开始时间
+        # 记录 agent 节点开始时间，后面写 run step 时用来计算整体耗时
         started = perf_counter()
-        # 读取节点级配置
+        # 读取节点级 adapter 配置；如果节点没有显式声明，就由模型 provider 决定走 mock 还是 AgentScope
         adapter_name = node.get("adapter")
-        model_config = node.get("model", {})
-        # 决定使用哪个 agent adapter
-        adapter = build_agent_adapter(adapter_name, model_config.get("provider") or self.app.model_provider)
-        # 构造 AgentInvocation, agent runtime 的输入包. 作用：WorkflowExecutor 把 workflow 前面准备好的东西打包，然后交给 agent adapter
+        # 合并 App 级模型配置和节点级 model 覆盖配置。节点里的 model 优先级更高，方便后面做多模型 workflow。
+        model_config = self._resolve_model_config(node)
+        # 决定使用哪个 agent adapter：mock provider 继续走 MockAgentAdapter，真实 provider 默认走 AgentScopeAdapter。
+        provider = model_config.get("provider") or self.app.model_provider
+        adapter = build_agent_adapter(adapter_name, provider)
+        # 构造 AgentInvocation, agent runtime 的输入包。
+        # 作用：WorkflowExecutor 把 workflow 前面准备好的 query、工具列表、检索片段、模型配置打包，然后交给 agent adapter。
+        credential_id = str(model_config.get("credential_id") or "").strip()
+        api_key = ""
+        if adapter.name == "agentscope":
+            if not credential_id:
+                raise ValueError("Missing model credential. Choose a credential in the app or agent node config.")
+            try:
+                api_key = resolve_model_api_key(self.db, credential_id, getattr(self.app, "owner_user_id", ""))
+            except Exception as exc:
+                raise ValueError(str(exc)) from exc
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
             system_prompt=self.app.system_prompt,
-            model_provider=model_config.get("provider") or self.app.model_provider,
+            model_provider=provider,
             model_name=model_config.get("model_name") or self.app.model_name,
             model_config=model_config,
+            model_credential_id=credential_id,
+            api_key=api_key,
             node_config=node,
             enabled_tools=context["enabled_tools"],
-            retrieved_chunks=self.result.retrieved_chunks, # retrieval 节点检索到的片段在这里传给 agent
+            retrieved_chunks=self.result.retrieved_chunks,  # retrieval 节点检索到的片段在这里传给 agent
         )
 
         final_answer = ""
-        # 跑 adapter，并处理事件
+        # 跑 adapter，并处理 adapter 持续吐出的统一事件。
+        # 这里不关心底层是 mock 还是 AgentScope，只处理 tool_call / final / adapter_error 等 RuntimeEvent。
         async for event in adapter.run(invocation):
             if event["type"] == "tool_call":
                 self.result.tool_calls.append(event)
@@ -144,15 +163,33 @@ class WorkflowExecutor:
                 final_answer = str(event.get("content", ""))
                 self.result.answer = final_answer
             elif event["type"] == "adapter_error":
-                add_step(self.db, self.run_id, "error", "agent_adapter", {"node": node}, event, error=event["message"])
+                add_step(
+                    self.db,
+                    self.run_id,
+                    "error",
+                    "agent_adapter",
+                    {"node": node},
+                    event,
+                    error=str(event.get("message", "")),
+                )
+                yield event
+                return
             yield event
-        # 最后，写一个 agent step，表示这个 agent 节点整体跑完了：
+
+        # 最后，写一个 agent step，表示这个 agent 节点整体跑完了。
+        # input 里保留 adapter 和模型配置摘要，方便在 Logs 里回看当时实际用了哪个模型入口。
         add_step(
             self.db,
             self.run_id,
             "agent",
             node.get("id", "agent"),
-            {"adapter": adapter.name, "model_provider": invocation.model_provider, "model_name": invocation.model_name},
+            {
+                "adapter": adapter.name,
+                "model_provider": invocation.model_provider,
+                "model_name": invocation.model_name,
+                "model_credential_id": invocation.model_credential_id,
+                "model_base_url": model_config.get("base_url", ""),
+            },
             {"answer": final_answer, "tool_calls": self.result.tool_calls},
             latency_ms=int((perf_counter() - started) * 1000),
         )
@@ -172,8 +209,8 @@ class WorkflowExecutor:
         if not nodes:
             return [
                 {"id": "start", "type": "start"},
-                {"id": "retrieval", "type": "retrieval", "enabled": True},
-                {"id": "agent", "type": "react_agent"},
+                {"id": "retrieval", "type": "retrieval", "enabled": True, "top_k": 3},
+                {"id": "agent", "type": "react_agent", "model": {}},
                 {"id": "end", "type": "end"},
             ]
 
@@ -196,7 +233,30 @@ class WorkflowExecutor:
         return ordered
 
     def _normalize_type(self, node_type: str) -> str:
-        # 它不是在“完整标准化所有节点类型”，而是在处理当前唯一的同义词。其他类型要么已经是标准名，要么本来就该被当成未知节点。
+        # 它不是在“完整标准化所有节点类型”，而是在处理当前唯一的同义词。
+        # 其他类型要么已经是标准名，要么本来就该被当成未知节点。
         if node_type in {"agent", "react_agent"}:
             return "agent"
         return node_type
+
+    def _resolve_model_config(self, node: dict[str, Any]) -> dict[str, Any]:
+        # node.model 是节点级覆盖项；app_model 是应用级默认项。
+        # 例如整个 App 默认用 DeepSeek，但某个 agent 节点可以临时覆盖成 Qwen。
+        node_model = node.get("model") if isinstance(node.get("model"), dict) else {}
+        app_model = {
+            "provider": getattr(self.app, "model_provider", "mock"),
+            "model_name": getattr(self.app, "model_name", "mock-react"),
+            "credential_id": getattr(self.app, "model_credential_id", ""),
+            "base_url": getattr(self.app, "model_base_url", ""),
+            "temperature": getattr(self.app, "temperature", None),
+            "top_p": getattr(self.app, "top_p", None),
+            "max_tokens": getattr(self.app, "max_tokens", None),
+        }
+        # 只让 node 里“真正填写了值”的字段覆盖 App 级默认值，避免空字符串把默认配置冲掉。
+        node_overrides = {
+            key: value
+            for key, value in node_model.items()
+            if key != "api_key" and value not in (None, "")
+        }
+        merged = {**app_model, **node_overrides}
+        return merged
