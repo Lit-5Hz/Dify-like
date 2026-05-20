@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Run, RunStep
+from app.db.models import App, Run, RunStep
 
 
 def create_run(db: Session, app_id: str, conversation_id: str, input_message_id: str | None = None) -> Run:
@@ -61,6 +61,14 @@ def finish_run(
 
 def list_runs(db: Session, app_id: str) -> list[Run]:
     return list(db.scalars(select(Run).where(Run.app_id == app_id).order_by(Run.created_at.desc())))
+
+
+def get_run_for_owner(db: Session, run_id: str, owner_user_id: str) -> Run | None:
+    return db.scalar(
+        select(Run)
+        .join(App, App.id == Run.app_id)
+        .where(Run.id == run_id, App.owner_user_id == owner_user_id)
+    )
 
 
 def list_run_steps(db: Session, run_id: str) -> list[RunStep]:
