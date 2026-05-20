@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from collections.abc import Generator  # 导入 Generator 类型，用来标注会生成数据库会话的函数
 
-from sqlalchemy import create_engine  # 导入创建数据库引擎的函数
+from sqlalchemy import create_engine, inspect, text  # create_engine 创建连接；inspect/text 用于轻量级自动补列
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker  # 导入 ORM 基类、会话类型和会话工厂
 
 from app.core.config import get_settings  # 导入读取配置的函数
@@ -33,4 +35,49 @@ def init_db() -> None:  # 定义数据库初始化函数，启动时会调用
     # 但它其实是为了触发模型注册，让 Base.metadata.create_all() 能看到所有表定义，
     # 所以这个导入是有副作用的，不是多余的。
     """
+
     Base.metadata.create_all(bind=engine)  # 根据已注册的模型元数据，自动创建缺失的数据表
+    _ensure_app_model_columns()  # MVP 阶段没有正式 migration，先用启动时补列兼容已有本地数据库
+    _ensure_model_credential_columns()
+
+
+def _ensure_app_model_columns() -> None:
+    # 这个函数只处理本次新增的 App 模型配置字段，避免旧库启动时报缺列。
+    # 后续引入 Alembic 后，这里应迁移成正式版本化 migration。
+    inspector = inspect(engine)
+    if "apps" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("apps")}
+    statements = []
+    if "owner_user_id" not in existing_columns:
+        statements.append("ALTER TABLE apps ADD COLUMN owner_user_id VARCHAR(120) NOT NULL DEFAULT 'anonymous'")
+    if "model_credential_id" not in existing_columns:
+        statements.append("ALTER TABLE apps ADD COLUMN model_credential_id VARCHAR(120) NOT NULL DEFAULT ''")
+    if "model_base_url" not in existing_columns:
+        statements.append("ALTER TABLE apps ADD COLUMN model_base_url TEXT NOT NULL DEFAULT ''")
+
+    if not statements:
+        return
+
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+
+
+def _ensure_model_credential_columns() -> None:
+    inspector = inspect(engine)
+    if "model_credentials" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("model_credentials")}
+    statements = []
+    if "owner_user_id" not in existing_columns:
+        statements.append("ALTER TABLE model_credentials ADD COLUMN owner_user_id VARCHAR(120) NOT NULL DEFAULT 'anonymous'")
+
+    if not statements:
+        return
+
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))

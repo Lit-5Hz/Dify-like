@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime
 from uuid import uuid4
 
@@ -16,16 +18,30 @@ def now_col() -> Mapped[datetime]:
     return mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = uuid_pk()
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_token: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True, default=None)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class App(Base):
     __tablename__ = "apps"
 
     id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous")
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="draft")
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     model_provider: Mapped[str] = mapped_column(String(80), default="mock")
     model_name: Mapped[str] = mapped_column(String(120), default="mock-react")
+    model_credential_id: Mapped[str] = mapped_column(String(120), default="")
+    model_base_url: Mapped[str] = mapped_column(Text, default="")
     temperature: Mapped[int] = mapped_column(Integer, default=70)
     top_p: Mapped[int] = mapped_column(Integer, default=100)
     max_tokens: Mapped[int] = mapped_column(Integer, default=1024)
@@ -35,6 +51,18 @@ class App(Base):
 
     tools: Mapped[list["AppTool"]] = relationship(back_populates="app", cascade="all, delete-orphan")
     documents: Mapped[list["Document"]] = relationship(back_populates="app", cascade="all, delete-orphan")
+
+
+class ModelCredential(Base):
+    __tablename__ = "model_credentials"
+
+    id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous")
+    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    encrypted_api_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class AppTool(Base):
