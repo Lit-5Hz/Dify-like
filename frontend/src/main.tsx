@@ -144,6 +144,22 @@ function App() {
     const [appToolList, runList] = await Promise.all([api.listAppTools(app.id), api.listRuns(app.id)]);
     setAppTools(appToolList);
     setRuns(runList);
+
+    const latestConversationId = runList[0]?.conversation_id ?? null;
+    setConversationId(latestConversationId);
+    if (!latestConversationId) {
+      return;
+    }
+
+    const history = await api.listMessages(latestConversationId);
+    setMessages(
+      history
+        .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
+        .map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+    );
   }
 
   async function refresh(preferredAppId?: string | null) {

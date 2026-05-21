@@ -1,4 +1,4 @@
-import type { AppItem, AppTool, AuthResponse, ModelCredential, RunItem, ToolItem, UserItem } from "./types";
+import type { AppItem, AppTool, AuthResponse, MessageItem, ModelCredential, RunItem, ToolItem, UserItem } from "./types";
 
 const API_BASE = "http://localhost:8000/api";
 const AUTH_TOKEN_KEY = "dify_like_auth_token";
@@ -105,6 +105,7 @@ export const api = {
       body: JSON.stringify({ tool_names: toolNames }),
     }),
   listRuns: (appId: string) => request<RunItem[]>(`/apps/${appId}/runs`),
+  listMessages: (conversationId: string) => request<MessageItem[]>(`/conversations/${conversationId}/messages`),
   uploadDocument: async (appId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);

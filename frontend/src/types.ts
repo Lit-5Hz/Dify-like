@@ -48,9 +48,19 @@ export type AppTool = {
 
 export type RunItem = {
   id: string;
+  conversation_id: string;
   status: string;
   latency_ms: number;
   error: string;
+  created_at: string;
+};
+
+export type MessageItem = {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  metadata_json: Record<string, unknown>;
   created_at: string;
 };
 
