@@ -225,7 +225,7 @@ class AgentScopeAdapter(BaseAgentAdapter):
             )
 
         if provider in {"openai", "openai_compatible", "deepseek", "vllm"}:
-            from agentscope.formatter import OpenAIChatFormatter
+            from agentscope.formatter import DeepSeekChatFormatter, OpenAIChatFormatter
             from agentscope.model import OpenAIChatModel
 
             kwargs: dict[str, Any] = {
@@ -240,7 +240,8 @@ class AgentScopeAdapter(BaseAgentAdapter):
             if base_url:
                 # AgentScope 的 OpenAIChatModel 不收顶层 base_url，需要放进 client_kwargs。
                 kwargs["client_kwargs"] = {"base_url": base_url}
-            return OpenAIChatModel(**kwargs), OpenAIChatFormatter()
+            formatter = DeepSeekChatFormatter() if self._should_use_deepseek_formatter(provider, model_name, base_url) else OpenAIChatFormatter()
+            return OpenAIChatModel(**kwargs), formatter
 
         if provider in {"dashscope", "qwen"}:
             from agentscope.formatter import DashScopeChatFormatter
@@ -283,6 +284,12 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 generate_kwargs[key] = int(value)
 
         return generate_kwargs
+
+    def _should_use_deepseek_formatter(self, provider: str, model_name: str, base_url: str) -> bool:
+        # DeepSeek reasoning/tool-call 回合需要把 thinking block 重新格式化成 reasoning_content。
+        # 通用 OpenAIChatFormatter 会跳过 thinking block，工具调用后的第二次请求会被 DeepSeek 拒绝。
+        text = f"{provider} {model_name} {base_url}".lower()
+        return "deepseek" in text
 
     def _resolve_provider(self, invocation: AgentInvocation) -> str:
         # provider 优先读合并后的 model_config；没有时回退到 invocation.model_provider。
