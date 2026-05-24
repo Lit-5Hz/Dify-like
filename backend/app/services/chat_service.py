@@ -97,14 +97,18 @@ async def chat_stream(db: Session, app, query: str, user_id: str, conversation_i
     写在前面：
     整个函数的作用是接住 workflow_executor 吐出来的事件，再转成 SSE 发给前端。
         函数流程：
-            1. 创建会话
-            2. 保存用户消息
+            1. 创建/复用 conversation
+            2. 先把 user 消息落库
             3. 创建 run
-            4. 先 yield 一个 run_started
-            5. 让 WorkflowExecutor 跑 workflow
-            6. 每收到一个事件，就转成 SSE 再 yield 给前端
-            7. 收到 final 后，落库 assistant 消息，结束 run
-        
+            4. 先发 run_started SSE
+            5. 调用 WorkflowExecutor.execute()
+            6. 把每个 RuntimeEvent 转成 SSE
+            7. final 时把 assistant 落库
+            8. finish_run()
+        也就是说：
+            WorkflowExecutor 给它 RuntimeEvent
+            chat_stream 把 RuntimeEvent 变成 SSE event
+
         其中的变量内涵：
             Conversation = 一整段对话
             Message = 对话中的一条消息

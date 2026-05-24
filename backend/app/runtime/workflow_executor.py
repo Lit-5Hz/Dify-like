@@ -22,6 +22,22 @@ class WorkflowResult:
 
 
 class WorkflowExecutor:
+    """
+    它是 workflow 的执行器，负责按节点顺序跑：
+        start -> retrieval -> agent -> end
+    对于 agent 节点，它会：
+        1. 解析 node 里的 model 覆盖项
+        2. 决定 provider
+        3. 选择 adapter
+        4. 组装 AgentInvocation
+        5. 调用 adapter.run()
+        6. 接住 adapter 吐出来的 RuntimeEvent
+    它接到事件后会做两件事：
+        tool_call -> 写 run_step
+        final -> 更新 self.result.answer
+        adapter_error -> 写错误 step 并返回
+    所以 WorkflowExecutor 的角色是：把 agent 的内部事件，纳入 workflow trace 体系
+    """
     def __init__(self, db: Session, app: Any, run_id: str):
         self.db = db
         self.app = app
@@ -35,15 +51,21 @@ class WorkflowExecutor:
         }
 
         for node in self._ordered_nodes(self.app.workflow_spec):
+            """
+            nodes的数据结构：
+                "nodes": [
+                    {"id": "start",        "type": "start"},
+                    {"id": "retrieval",    "type": "retrieval", "enabled": True, "top_k": 3},
+                    {"id": "agent",        "type": "react_agent", "model": {}},
+                    {"id": "end",          "type": "end"}
+                ]
+            """
             node_type = self._normalize_type(node.get("type", ""))
             if node_type == "start":
                 for event in self._execute_start(node, context):
                     yield event
             elif node_type == "retrieval":
                 for event in self._execute_retrieval(node, context):
-                    yield event
-            elif node_type == "tool":
-                for event in self._execute_tool(node, context):
                     yield event
             elif node_type == "agent":
                 async for event in self._execute_agent(node, context):
@@ -68,6 +90,7 @@ class WorkflowExecutor:
     def _execute_retrieval(self, node: dict[str, Any], context: dict[str, Any]):
         started = perf_counter()
         enabled = bool(node.get("enabled", True))
+        # 从该 App 下所有已上传文档的切块中，用关键词词频匹配找出与用户问题最相关的 Top-K 个片段（RAG的接口之一：检索接口）：
         chunks = retrieve_chunks(self.db, self.app.id, context["query"], limit=int(node.get("top_k", 3))) if enabled else []
         self.result.retrieved_chunks = chunks
         output = {
@@ -85,32 +108,9 @@ class WorkflowExecutor:
         )
         yield {"type": "retrieval", **output}
 
-    def _execute_tool(self, node: dict[str, Any], context: dict[str, Any]):
-        started = perf_counter()
-        tool_name = node.get("tool_name") or node.get("name")
-        tool_input = node.get("input", {})
-        output = run_tool(tool_name, tool_input)
-        event = {
-            "type": "tool_call",
-            "name": tool_name,
-            "input": tool_input,
-            "output": output,
-            "node_id": node.get("id"),
-            "source": "workflow",
-        }
-        self.result.tool_calls.append(event)
-        add_step(
-            self.db,
-            self.run_id,
-            "tool_call",
-            tool_name or node.get("id", "tool"),
-            {"node": node, "context": {"query": context["query"]}},
-            output,
-            latency_ms=int((perf_counter() - started) * 1000),
-        )
-        yield event
-
     async def _execute_agent(self, node: dict[str, Any], context: dict[str, Any]) -> AsyncIterator[RuntimeEvent]:
+
+        # TODO: 取出所有执行agent的必要配置——————————————————————————————————————————————————
         # 记录 agent 节点开始时间，后面写 run step 时用来计算整体耗时
         started = perf_counter()
         # 读取节点级 adapter 配置；如果节点没有显式声明，就由模型 provider 决定走 mock 还是 AgentScope
@@ -120,8 +120,6 @@ class WorkflowExecutor:
         # 决定使用哪个 agent adapter：mock provider 继续走 MockAgentAdapter，真实 provider 默认走 AgentScopeAdapter。
         provider = model_config.get("provider") or self.app.model_provider
         adapter = build_agent_adapter(adapter_name, provider)
-        # 构造 AgentInvocation, agent runtime 的输入包。
-        # 作用：WorkflowExecutor 把 workflow 前面准备好的 query、工具列表、检索片段、模型配置打包，然后交给 agent adapter。
         credential_id = str(model_config.get("credential_id") or "").strip()
         api_key = ""
         if adapter.name == "agentscope":
@@ -131,6 +129,9 @@ class WorkflowExecutor:
                 api_key = resolve_model_api_key(self.db, credential_id, getattr(self.app, "owner_user_id", ""))
             except Exception as exc:
                 raise ValueError(str(exc)) from exc
+        
+        # TODO: 构造 AgentInvocation, agent runtime 的输入包————————————————————————————————
+        # 作用：WorkflowExecutor 把 workflow 前面准备好的 query、工具列表、检索片段、模型配置打包，然后交给 agent adapter。
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
@@ -146,7 +147,7 @@ class WorkflowExecutor:
         )
 
         final_answer = ""
-        # 跑 adapter，并处理 adapter 持续吐出的统一事件。
+        # TODO: 跑 adapter，并处理 adapter 持续吐出的统一事件————————————————————————————————
         # 这里不关心底层是 mock 还是 AgentScope，只处理 tool_call / final / adapter_error 等 RuntimeEvent。
         async for event in adapter.run(invocation):
             if event["type"] == "tool_call":
@@ -176,7 +177,7 @@ class WorkflowExecutor:
                 return
             yield event
 
-        # 最后，写一个 agent step，表示这个 agent 节点整体跑完了。
+        # TODO: 最后，写一个 agent step，表示这个 agent 节点整体跑完了————————————————————————
         # input 里保留 adapter 和模型配置摘要，方便在 Logs 里回看当时实际用了哪个模型入口。
         add_step(
             self.db,

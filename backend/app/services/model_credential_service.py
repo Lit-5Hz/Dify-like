@@ -69,6 +69,7 @@ def resolve_model_api_key(db: Session, credential_id: str | None, owner_user_id:
     credential = get_model_credential(db, credential_id, owner_user_id)
     if not credential:
         raise ValueError(f"Model credential not found: {credential_id}")
+    # 把数据库中存储的加密 API Key（密文）解密回明文，供 agent 调用模型时使用。
     return decrypt_secret(credential.encrypted_api_key)
 
 

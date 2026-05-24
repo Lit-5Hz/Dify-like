@@ -94,8 +94,7 @@ def build_agentscope_toolkit(
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ):
     # 函数作用：把本平台里启用的工具名，包装成 AgentScope 可以注册和调用的 Python 函数。
-    # 这里不再用一个 **kwargs 的通用 platform_tool，而是为每个工具提供明确函数签名，
-    # 这样 AgentScope 能从函数签名和 docstring 推断出更准确的工具 schema。
+    # builders 中的函数为每个工具提供明确函数签名，这样 AgentScope 能从函数签名和 docstring 推断出更准确的工具 schema。
     from agentscope.tool import Toolkit
 
     toolkit = Toolkit()
@@ -111,6 +110,7 @@ def build_agentscope_toolkit(
             continue
         tool_builder = builders.get(tool_name)
         if tool_builder:
+            # register_tool_function() 会把 Python 函数解析成 AgentScope 能理解的工具对象，再存进 toolkit.tools。
             toolkit.register_tool_function(tool_builder(trace_sink))
 
     return toolkit

@@ -33,10 +33,14 @@ async def chat(
             chat_stream(db, app, payload.query, current_user.id, payload.conversation_id),  # 一个异步生成器，负责一段段吐数据
             media_type="text/event-stream",  # 告诉浏览器这是 SSE 格式(SSE = Server-Sent Events （服务器发送事件）, 就是后端到前端的单向实时推送流。)
         )  # 真正发给前端的内容，是后面由这个"流式响应对象"去不断消费 chat_stream() 产生的 yield
-    """
-    await：用在异步函数内部，等待一个异步操作完成，同时让出执行权，让程序可以去做别的事。
-    """
-    try:
+        """
+        写在chat_stream入口：
+            AgentScopeAdapter 负责“把 AgentScope 事件翻译成项目事件”
+            WorkflowExecutor 负责“按 workflow 执行，并把事件写进 run log”
+            chat_stream 负责“把事件再翻译成 SSE 发给前端，同时落库消息”
+            前端负责“边收边画气泡，结束后保留会话 id”
+        """
+    try: # await：用在异步函数内部，等待一个异步操作完成，同时让出执行权，让程序可以去做别的事。
         return await chat_once(db, app, payload.query, current_user.id, payload.conversation_id)  # 如果不是流式，就一次性返回完整结果
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

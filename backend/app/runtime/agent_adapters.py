@@ -92,11 +92,26 @@ class MockAgentAdapter(BaseAgentAdapter):
 
 
 class AgentScopeAdapter(BaseAgentAdapter):
+    """
+    职责是把 AgentScope 的 ReActAgent 包装成本项目统一认识的事件流。大概流程是：
+        输入 AgentInvocation
+        -> 创建 AgentScope model + formatter
+        -> 注册工具 toolkit
+        -> 启动 ReActAgent
+        -> 监听 stream_printing_messages
+        -> 把 AgentScope 输出转成 RuntimeEvent
+    它吐给上层的事件主要有几类：
+        message_delta   模型增量输出
+        tool_call       AgentScope 内部调用工具
+        final           这轮 agent 结束
+        adapter_error   AgentScope 出错
+    """
+
     name = "agentscope"
 
     async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
-        # 函数作用：把项目内部的 AgentInvocation 转成 AgentScope 调用，
-        # 再把 AgentScope 的输出转回项目统一的 RuntimeEvent。
+        # 函数作用：把项目内部的 AgentInvocation 转成 AgentScope 调用，再把 AgentScope 的输出转回项目统一的 RuntimeEvent。
+
         # tool_events 用来接住 AgentScope 内部工具调用产生的 trace，再穿透给 workflow/chat_stream。
         tool_events: list[RuntimeEvent] = []
         try:
@@ -196,7 +211,6 @@ class AgentScopeAdapter(BaseAgentAdapter):
         # formatter 是 LLM 消息协议适配器，告诉 AgentScope 怎么把消息整理给这个品牌的 LLM 模型。
         model, formatter = self._build_model_and_formatter(invocation)
         # 创建 AgentScope 工具箱，并把当前 app 启用的平台工具注册进去。
-        # register_tool_function() 会把 Python 函数解析成 AgentScope 能理解的工具对象，再存进 toolkit.tools。
         toolkit = build_agentscope_toolkit(invocation.enabled_tools, trace_sink=trace_sink)
         sys_prompt = self._build_system_prompt(invocation)
         return ReActAgent(
