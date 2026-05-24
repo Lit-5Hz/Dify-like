@@ -166,6 +166,10 @@ async def chat_stream(db: Session, app, query: str, user_id: str, conversation_i
                 yield _sse("message_delta", {"content": event["content"]})
             elif event["type"] == "workflow_warning":  # 如果是 workflow 警告，转成 SSE 发给前端
                 yield _sse("workflow_warning", event)
+            elif event["type"] == "workflow_node":  # workflow_node 是节点级执行事件，目前不推送给前端
+                # 这里保留显式忽略，是为了说明 WorkflowExecutor 仍会产出完整节点事件；
+                # 后期开发后台 run worker、workflow 可视化执行面板时，可以复用这类事件。
+                continue
             elif event["type"] == "adapter_error":  # 如果是 agent adapter 错误，把错误发给前端
                 final_sent = True
                 finish_run(db, run, started, status="error", error=str(event["message"]))

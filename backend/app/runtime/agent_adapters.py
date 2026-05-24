@@ -184,7 +184,8 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 "message": str(exc),
             }
             return
-
+        # stream_printing_messages 结束时，agent可能在最后一轮打印之后又调了一个工具（还没等模型输出新文本，循环就结束了）。这个工具事件装在 tool_events里但循环已经退出，没人消费它。
+        # 下面这两行代码做了兜底清空——确保没有任何工具事件被漏掉，然后才发 final。
         while tool_events:
             yield tool_events.pop(0)
 
