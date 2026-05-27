@@ -44,11 +44,6 @@ cd F:\my_folder\Work\LLM\Project\Dify-like
 docker compose up -d
 ```
 
-这会启动：
-
-- PostgreSQL: `localhost:5432`
-- Redis: `localhost:6379`
-
 如果你本机没有 Docker，先安装 Docker Desktop，再执行上面的命令。
 
 ## 本地配置
@@ -69,17 +64,9 @@ postgresql+psycopg://postgres:postgres@localhost:5432/dify_like
 
 ```powershell
 cd F:\my_folder\Work\LLM\Project\Dify-like\backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-uvicorn app.main:app --reload --port 8000
-```
-
-如果 PowerShell 不允许激活脚本，可以直接使用虚拟环境里的 Python：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+conda activate dify
+python -m pip install -e .
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 后端地址：
