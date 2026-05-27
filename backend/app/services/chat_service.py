@@ -59,7 +59,7 @@ async def chat_once(db: Session, app, query: str, user_id: str, conversation_id:
     executor = WorkflowExecutor(db, app, run.id)  # 创建 workflow 执行器，绑定这次 run
     adapter_error = ""
     try:
-        async for event in executor.execute(query, enabled_tools):  # 执行 workflow，但这里不逐个处理事件
+        async for event in executor.execute(query, enabled_tools, conversation.id, user_id):  # 执行 workflow，但这里不逐个处理事件
             if event["type"] == "adapter_error":
                 adapter_error = str(event.get("message", "Agent adapter error"))
                 break
@@ -120,7 +120,7 @@ async def chat_stream(db: Session, app, query: str, user_id: str, conversation_i
                 Message 1: user: 我的订单 10086 到哪了？
                 Run 1: 执行这条用户消息
                     RunStep: start
-                    RunStep: retrieval
+                    RunStep: rag
                     RunStep: tool_call
                     RunStep: agent
                     RunStep: end
@@ -157,9 +157,9 @@ async def chat_stream(db: Session, app, query: str, user_id: str, conversation_i
     executor = WorkflowExecutor(db, app, run.id)  # 创建 workflow 执行器
     final_sent = False  # 标记是否已经收到了 final 事件
     try:  # try能避免运行时异常直接把流打断
-        async for event in executor.execute(query, enabled_tools):  # 依次接收 workflow 的事件
-            if event["type"] == "retrieval":  # 如果是检索事件，转成 SSE 发给前端
-                yield _sse("retrieval", event)
+        async for event in executor.execute(query, enabled_tools, conversation.id, user_id):  # 依次接收 workflow 的事件
+            if event["type"] == "rag":  # 如果是 RAG 事件，转成 SSE 发给前端
+                yield _sse("rag", event)
             elif event["type"] == "tool_call":  # 如果是工具调用事件，转成 SSE 发给前端
                 yield _sse("tool_call", event)
             elif event["type"] == "message_delta":  # 如果是模型输出的增量文本，只把增量内容发给前端

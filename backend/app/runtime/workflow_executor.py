@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
-from app.services.rag_service import retrieve_chunks
+from app.services.rag_service import retrieve_rag_chunks
 from app.services.model_credential_service import resolve_model_api_key
 from app.services.run_log_service import add_step
 from app.tools.registry import run_tool
@@ -24,7 +24,7 @@ class WorkflowResult:
 class WorkflowExecutor:
     """
     它是 workflow 的执行器，负责按节点顺序跑：
-        start -> retrieval -> agent -> end
+        start -> rag -> agent -> end
     对于 agent 节点，它会：
         1. 解析 node 里的 model 覆盖项
         2. 决定 provider
@@ -44,10 +44,18 @@ class WorkflowExecutor:
         self.run_id = run_id
         self.result = WorkflowResult()
 
-    async def execute(self, query: str, enabled_tools: list[str]) -> AsyncIterator[RuntimeEvent]:
+    async def execute(
+        self,
+        query: str,
+        enabled_tools: list[str],
+        conversation_id: str = "",
+        user_id: str = "",
+    ) -> AsyncIterator[RuntimeEvent]:
         context: dict[str, Any] = {
             "query": query,
             "enabled_tools": enabled_tools,
+            "conversation_id": conversation_id,
+            "user_id": user_id,
         }
 
         for node in self._ordered_nodes(self.app.workflow_spec):
@@ -55,7 +63,7 @@ class WorkflowExecutor:
             nodes的数据结构：
                 "nodes": [
                     {"id": "start",        "type": "start"},
-                    {"id": "retrieval",    "type": "retrieval", "enabled": True, "top_k": 3},
+                    {"id": "rag",          "type": "rag", "enabled": True, "retrieval_top_k": 20},
                     {"id": "agent",        "type": "react_agent", "model": {}},
                     {"id": "end",          "type": "end"}
                 ]
@@ -64,8 +72,8 @@ class WorkflowExecutor:
             if node_type == "start":
                 for event in self._execute_start(node, context):
                     yield event
-            elif node_type == "retrieval":
-                for event in self._execute_retrieval(node, context):
+            elif node_type == "rag":
+                for event in self._execute_rag(node, context):
                     yield event
             elif node_type == "agent":
                 async for event in self._execute_agent(node, context):
@@ -87,26 +95,58 @@ class WorkflowExecutor:
         add_step(self.db, self.run_id, "start", node.get("id", "start"), node, output)
         yield {"type": "workflow_node", "node_id": node.get("id"), "node_type": "start", "output": output}
 
-    def _execute_retrieval(self, node: dict[str, Any], context: dict[str, Any]):
+    def _execute_rag(self, node: dict[str, Any], context: dict[str, Any]):
         started = perf_counter()
         enabled = bool(node.get("enabled", True))
-        # 从该 App 下所有已上传文档的切块中，用关键词词频匹配找出与用户问题最相关的 Top-K 个片段（RAG的接口之一：检索接口）：
-        chunks = retrieve_chunks(self.db, self.app.id, context["query"], limit=int(node.get("top_k", 3))) if enabled else []
+        metadata: dict[str, Any] = {
+            "kb_ids": [],
+            "runtime_kb_id": None,
+            "retrieval_mode": "disabled",
+            "total_retrieved": 0,
+            "total_returned": 0,
+            "intent_matched": False,
+            "standard_query": None,
+            "warnings": [],
+        }
+
+        if not enabled:
+            chunks = []
+        else:
+            result = retrieve_rag_chunks(
+                db=self.db,
+                app=self.app,
+                owner_user_id=getattr(self.app, "owner_user_id", ""),
+                conversation_id=str(context.get("conversation_id") or ""),
+                query=context["query"],
+                rag_node=node,
+            )
+            chunks = result["chunks"]
+            metadata = result["metadata"]
+
         self.result.retrieved_chunks = chunks
         output = {
             "chunks": chunks,
             "enabled": enabled,
+            "metadata": metadata,
         }
         add_step(
             self.db,
             self.run_id,
-            "retrieval",
-            node.get("id", "retrieval"),
+            "rag",
+            node.get("id", "rag"),
             {"query": context["query"], "node": node},
             output,
             latency_ms=int((perf_counter() - started) * 1000),
         )
-        yield {"type": "retrieval", **output}
+        yield {"type": "rag", **output}
+        for warning in metadata.get("warnings", []):
+            event = {
+                "type": "workflow_warning",
+                "node_id": node.get("id", "rag"),
+                "message": warning,
+            }
+            add_step(self.db, self.run_id, "workflow_warning", node.get("id", "rag"), node, event)
+            yield event
 
     async def _execute_agent(self, node: dict[str, Any], context: dict[str, Any]) -> AsyncIterator[RuntimeEvent]:
 
@@ -143,7 +183,7 @@ class WorkflowExecutor:
             api_key=api_key,
             node_config=node,
             enabled_tools=context["enabled_tools"],
-            retrieved_chunks=self.result.retrieved_chunks,  # retrieval 节点检索到的片段在这里传给 agent
+            retrieved_chunks=self.result.retrieved_chunks,  # rag 节点检索到的片段在这里传给 agent
         )
 
         final_answer = ""
@@ -210,7 +250,7 @@ class WorkflowExecutor:
         if not nodes:
             return [
                 {"id": "start", "type": "start"},
-                {"id": "retrieval", "type": "retrieval", "enabled": True, "top_k": 3},
+                {"id": "rag", "type": "rag", "enabled": True, "retrieval_top_k": 20},
                 {"id": "agent", "type": "react_agent", "model": {}},
                 {"id": "end", "type": "end"},
             ]
@@ -238,6 +278,8 @@ class WorkflowExecutor:
         # 其他类型要么已经是标准名，要么本来就该被当成未知节点。
         if node_type in {"agent", "react_agent"}:
             return "agent"
+        if node_type == "rag":
+            return "rag"
         return node_type
 
     def _resolve_model_config(self, node: dict[str, Any]) -> dict[str, Any]:
