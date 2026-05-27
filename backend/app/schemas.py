@@ -10,7 +10,22 @@ from pydantic import BaseModel, Field
 DEFAULT_WORKFLOW_SPEC = {
     "nodes": [
         {"id": "start", "type": "start"},
-        {"id": "retrieval", "type": "retrieval", "enabled": True, "top_k": 3},
+        {
+            "id": "rag",
+            "type": "rag",
+            "enabled": True,
+            "retrieval_top_k": 20,
+            "rerank_provider": "passthrough",
+            "rerank_top_n": 5,
+            "embedding_provider": "",
+            "embedding_model": "",
+            "embedding_dimension": 0,
+            "embedding_credential_id": "",
+            "embedding_base_url": "",
+            "chunk_size": 512,
+            "chunk_overlap": 64,
+            "chunk_strategy": "auto",
+        },
         {
             "id": "agent",
             "type": "react_agent",
@@ -18,7 +33,7 @@ DEFAULT_WORKFLOW_SPEC = {
         },
         {"id": "end", "type": "end"},
     ],
-    "edges": [["start", "retrieval"], ["retrieval", "agent"], ["agent", "end"]],
+    "edges": [["start", "rag"], ["rag", "agent"], ["agent", "end"]],
 }
 
 
@@ -140,15 +155,50 @@ class ChatResponse(BaseModel):
     retrieved_chunks: list[dict[str, Any]]
 
 
-class DocumentOut(BaseModel):
+class KnowledgeBaseOut(BaseModel):
     id: str
+    owner_user_id: str
+    scope: str
     app_id: str
-    filename: str
-    status: str
-    error: str
+    conversation_id: str
+    name: str
+    description: str
+    embedding_provider: str
+    embedding_model: str
+    embedding_dimension: int
+    embedding_credential_id: str
+    embedding_base_url: str
+    qdrant_collection: str
+    locked: bool
+    chunk_size: int
+    chunk_overlap: int
+    chunk_strategy: str
+    enable_parent_child: bool
+    config_json: dict[str, Any]
     created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class KnowledgeDocumentOut(BaseModel):
+    id: str
+    knowledge_base_id: str
+    filename: str
+    mime_type: str
+    status: str
+    error: str
+    metadata_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RuntimeKnowledgeDocumentUploadOut(BaseModel):
+    conversation_id: str
+    knowledge_base: KnowledgeBaseOut
+    document: KnowledgeDocumentOut
 
 
 class RunOut(BaseModel):

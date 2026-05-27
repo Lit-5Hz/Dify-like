@@ -50,7 +50,6 @@ class App(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     tools: Mapped[list["AppTool"]] = relationship(back_populates="app", cascade="all, delete-orphan")
-    documents: Mapped[list["Document"]] = relationship(back_populates="app", cascade="all, delete-orphan")
 
 
 class ModelCredential(Base):
@@ -65,6 +64,69 @@ class ModelCredential(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class KnowledgeBase(Base):
+    __tablename__ = "knowledge_bases"
+
+    id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    scope: Mapped[str] = mapped_column(String(32), default="runtime", index=True)
+    app_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    conversation_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    embedding_provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(120), nullable=False)
+    embedding_dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_credential_id: Mapped[str] = mapped_column(String(120), default="")
+    embedding_base_url: Mapped[str] = mapped_column(Text, default="")
+    qdrant_collection: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    locked: Mapped[bool] = mapped_column(default=False)
+    chunk_size: Mapped[int] = mapped_column(Integer, default=512)
+    chunk_overlap: Mapped[int] = mapped_column(Integer, default=64)
+    chunk_strategy: Mapped[str] = mapped_column(String(32), default="auto")
+    enable_parent_child: Mapped[bool] = mapped_column(default=False)
+    config_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    documents: Mapped[list["KnowledgeDocument"]] = relationship(back_populates="knowledge_base", cascade="all, delete-orphan")
+    chunks: Mapped[list["KnowledgeChunk"]] = relationship(back_populates="knowledge_base", cascade="all, delete-orphan")
+
+
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+
+    id: Mapped[str] = uuid_pk()
+    knowledge_base_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("knowledge_bases.id", ondelete="CASCADE"))
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    error: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    knowledge_base: Mapped[KnowledgeBase] = relationship(back_populates="documents")
+    chunks: Mapped[list["KnowledgeChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+
+
+class KnowledgeChunk(Base):
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[str] = uuid_pk()
+    knowledge_base_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("knowledge_bases.id", ondelete="CASCADE"))
+    document_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("knowledge_documents.id", ondelete="CASCADE"))
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    qdrant_point_id: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime] = now_col()
+
+    knowledge_base: Mapped[KnowledgeBase] = relationship(back_populates="chunks")
+    document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")
+
+
 class AppTool(Base):
     __tablename__ = "app_tools"
 
@@ -77,34 +139,6 @@ class AppTool(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     app: Mapped[App] = relationship(back_populates="tools")
-
-
-class Document(Base):
-    __tablename__ = "documents"
-
-    id: Mapped[str] = uuid_pk()
-    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
-    filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    file_path: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="ready")
-    error: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = now_col()
-
-    app: Mapped[App] = relationship(back_populates="documents")
-    chunks: Mapped[list["DocumentChunk"]] = relationship(back_populates="document", cascade="all, delete-orphan")
-
-
-class DocumentChunk(Base):
-    __tablename__ = "document_chunks"
-
-    id: Mapped[str] = uuid_pk()
-    document_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("documents.id", ondelete="CASCADE"))
-    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = now_col()
-
-    document: Mapped[Document] = relationship(back_populates="chunks")
 
 
 class Conversation(Base):

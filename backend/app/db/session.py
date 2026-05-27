@@ -39,6 +39,7 @@ def init_db() -> None:  # 定义数据库初始化函数，启动时会调用
     Base.metadata.create_all(bind=engine)  # 根据已注册的模型元数据，自动创建缺失的数据表
     _ensure_app_model_columns()  # MVP 阶段没有正式 migration，先用启动时补列兼容已有本地数据库
     _ensure_model_credential_columns()
+    _ensure_knowledge_base_scope_columns()
 
 
 def _ensure_app_model_columns() -> None:
@@ -74,6 +75,28 @@ def _ensure_model_credential_columns() -> None:
     statements = []
     if "owner_user_id" not in existing_columns:
         statements.append("ALTER TABLE model_credentials ADD COLUMN owner_user_id VARCHAR(120) NOT NULL DEFAULT 'anonymous'")
+
+    if not statements:
+        return
+
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+
+
+def _ensure_knowledge_base_scope_columns() -> None:
+    inspector = inspect(engine)
+    if "knowledge_bases" not in inspector.get_table_names():
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns("knowledge_bases")}
+    statements = []
+    if "scope" not in existing_columns:
+        statements.append("ALTER TABLE knowledge_bases ADD COLUMN scope VARCHAR(32) NOT NULL DEFAULT 'runtime'")
+    if "app_id" not in existing_columns:
+        statements.append("ALTER TABLE knowledge_bases ADD COLUMN app_id VARCHAR(120) NOT NULL DEFAULT ''")
+    if "conversation_id" not in existing_columns:
+        statements.append("ALTER TABLE knowledge_bases ADD COLUMN conversation_id VARCHAR(120) NOT NULL DEFAULT ''")
 
     if not statements:
         return
