@@ -7,6 +7,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/dify_like"
     redis_url: str = "redis://localhost:6379/0"
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str = ""
+    rag_inline_ingest: bool = True
     storage_dir: Path = Path("./storage")
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
