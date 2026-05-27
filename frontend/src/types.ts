@@ -23,6 +23,48 @@ export type ModelCredential = {
   updated_at: string;
 };
 
+export type KnowledgeBase = {
+  id: string;
+  owner_user_id: string;
+  scope: string;
+  app_id: string;
+  conversation_id: string;
+  name: string;
+  description: string;
+  embedding_provider: string;
+  embedding_model: string;
+  embedding_dimension: number;
+  embedding_credential_id: string;
+  embedding_base_url: string;
+  qdrant_collection: string;
+  locked: boolean;
+  chunk_size: number;
+  chunk_overlap: number;
+  chunk_strategy: string;
+  enable_parent_child: boolean;
+  config_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type KnowledgeDocument = {
+  id: string;
+  knowledge_base_id: string;
+  filename: string;
+  mime_type: string;
+  status: string;
+  error: string;
+  metadata_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type RuntimeKnowledgeDocumentUpload = {
+  conversation_id: string;
+  knowledge_base: KnowledgeBase;
+  document: KnowledgeDocument;
+};
+
 export type ToolItem = {
   name: string;
   label: string;

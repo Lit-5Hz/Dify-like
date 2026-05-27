@@ -1,4 +1,15 @@
-import type { AppItem, AppTool, AuthResponse, MessageItem, ModelCredential, RunItem, ToolItem, UserItem } from "./types";
+import type {
+  AppItem,
+  AppTool,
+  AuthResponse,
+  KnowledgeDocument,
+  MessageItem,
+  ModelCredential,
+  RunItem,
+  RuntimeKnowledgeDocumentUpload,
+  ToolItem,
+  UserItem,
+} from "./types";
 
 const API_BASE = "http://localhost:8000/api";
 const AUTH_TOKEN_KEY = "dify_like_auth_token";
@@ -98,6 +109,25 @@ export const api = {
     request<{ ok: boolean }>(`/model-credentials/${credentialId}`, {
       method: "DELETE",
     }),
+  listRuntimeRagDocuments: (appId: string, conversationId: string | null) =>
+    request<KnowledgeDocument[]>(
+      `/apps/${appId}/rag/documents${conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ""}`,
+    ),
+  uploadRuntimeRagDocument: async (appId: string, conversationId: string | null, file: File) => {
+    const form = new FormData();
+    if (conversationId) form.append("conversation_id", conversationId);
+    form.append("file", file);
+    const headers = getRequestHeaders();
+    const response = await fetch(`${API_BASE}/apps/${appId}/rag/documents`, {
+      method: "POST",
+      body: form,
+      headers,
+    });
+    if (!response.ok) {
+      throw new Error(await readErrorMessage(response));
+    }
+    return response.json() as Promise<RuntimeKnowledgeDocumentUpload>;
+  },
   listAppTools: (appId: string) => request<AppTool[]>(`/apps/${appId}/tools`),
   updateAppTools: (appId: string, toolNames: string[]) =>
     request<AppTool[]>(`/apps/${appId}/tools`, {
@@ -106,20 +136,6 @@ export const api = {
     }),
   listRuns: (appId: string) => request<RunItem[]>(`/apps/${appId}/runs`),
   listMessages: (conversationId: string) => request<MessageItem[]>(`/conversations/${conversationId}/messages`),
-  uploadDocument: async (appId: string, file: File) => {
-    const form = new FormData();
-    form.append("file", file);
-    const headers = getRequestHeaders();
-    const response = await fetch(`${API_BASE}/apps/${appId}/documents`, {
-      method: "POST",
-      body: form,
-      headers,
-    });
-    if (!response.ok) {
-      throw new Error(await readErrorMessage(response));
-    }
-    return response.json();
-  },
 };
 
 export async function streamChat(
