@@ -8,10 +8,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
-from app.services.rag_service import retrieve_rag_chunks
 from app.services.model_credential_service import resolve_model_api_key
+from app.services.retrieval_service import retrieve_chunks
 from app.services.run_log_service import add_step
-from app.tools.registry import run_tool
 
 
 @dataclass
@@ -22,22 +21,6 @@ class WorkflowResult:
 
 
 class WorkflowExecutor:
-    """
-    它是 workflow 的执行器，负责按节点顺序跑：
-        start -> rag -> agent -> end
-    对于 agent 节点，它会：
-        1. 解析 node 里的 model 覆盖项
-        2. 决定 provider
-        3. 选择 adapter
-        4. 组装 AgentInvocation
-        5. 调用 adapter.run()
-        6. 接住 adapter 吐出来的 RuntimeEvent
-    它接到事件后会做两件事：
-        tool_call -> 写 run_step
-        final -> 更新 self.result.answer
-        adapter_error -> 写错误 step 并返回
-    所以 WorkflowExecutor 的角色是：把 agent 的内部事件，纳入 workflow trace 体系
-    """
     def __init__(self, db: Session, app: Any, run_id: str):
         self.db = db
         self.app = app
@@ -59,21 +42,12 @@ class WorkflowExecutor:
         }
 
         for node in self._ordered_nodes(self.app.workflow_spec):
-            """
-            nodes的数据结构：
-                "nodes": [
-                    {"id": "start",        "type": "start"},
-                    {"id": "rag",          "type": "rag", "enabled": True, "retrieval_top_k": 20},
-                    {"id": "agent",        "type": "react_agent", "model": {}},
-                    {"id": "end",          "type": "end"}
-                ]
-            """
-            node_type = self._normalize_type(node.get("type", ""))
+            node_type = self._normalize_type(str(node.get("type", "")))
             if node_type == "start":
                 for event in self._execute_start(node, context):
                     yield event
-            elif node_type == "rag":
-                for event in self._execute_rag(node, context):
+            elif node_type == "retrieval":
+                for event in self._execute_retrieval(node, context):
                     yield event
             elif node_type == "agent":
                 async for event in self._execute_agent(node, context):
@@ -95,34 +69,39 @@ class WorkflowExecutor:
         add_step(self.db, self.run_id, "start", node.get("id", "start"), node, output)
         yield {"type": "workflow_node", "node_id": node.get("id"), "node_type": "start", "output": output}
 
-    def _execute_rag(self, node: dict[str, Any], context: dict[str, Any]):
+    def _execute_retrieval(self, node: dict[str, Any], context: dict[str, Any]):
         started = perf_counter()
         enabled = bool(node.get("enabled", True))
-        metadata: dict[str, Any] = {
-            "kb_ids": [],
-            "runtime_kb_id": None,
-            "retrieval_mode": "disabled",
-            "total_retrieved": 0,
-            "total_returned": 0,
-            "intent_matched": False,
-            "standard_query": None,
-            "warnings": [],
-        }
-
         if not enabled:
-            chunks = []
+            result = {
+                "chunks": [],
+                "metadata": {
+                    "contract_version": "retrieval.v1",
+                    "knowledge_base_ids": [],
+                    "retrieval_mode": "disabled",
+                    "retrieval_top_k": int(node.get("retrieval_top_k", 20) or 20),
+                    "dense_retrieved": 0,
+                    "sparse_retrieved": 0,
+                    "sparse_top_k": 20,
+                    "rrf_k": 60,
+                    "total_retrieved": 0,
+                    "total_returned": 0,
+                    "rerank_enabled": False,
+                    "rerank_provider": "passthrough",
+                    "query_enhancement": {},
+                    "warnings": [],
+                },
+            }
         else:
-            result = retrieve_rag_chunks(
+            result = retrieve_chunks(
                 db=self.db,
-                app=self.app,
                 owner_user_id=getattr(self.app, "owner_user_id", ""),
-                conversation_id=str(context.get("conversation_id") or ""),
                 query=context["query"],
-                rag_node=node,
+                retrieval_node=node,
             )
-            chunks = result["chunks"]
-            metadata = result["metadata"]
 
+        chunks = result["chunks"]
+        metadata = result["metadata"]
         self.result.retrieved_chunks = chunks
         output = {
             "chunks": chunks,
@@ -132,32 +111,26 @@ class WorkflowExecutor:
         add_step(
             self.db,
             self.run_id,
-            "rag",
-            node.get("id", "rag"),
+            "retrieval",
+            node.get("id", "retrieval"),
             {"query": context["query"], "node": node},
             output,
             latency_ms=int((perf_counter() - started) * 1000),
         )
-        yield {"type": "rag", **output}
+        yield {"type": "retrieval", **output}
         for warning in metadata.get("warnings", []):
             event = {
                 "type": "workflow_warning",
-                "node_id": node.get("id", "rag"),
+                "node_id": node.get("id", "retrieval"),
                 "message": warning,
             }
-            add_step(self.db, self.run_id, "workflow_warning", node.get("id", "rag"), node, event)
+            add_step(self.db, self.run_id, "workflow_warning", node.get("id", "retrieval"), node, event)
             yield event
 
     async def _execute_agent(self, node: dict[str, Any], context: dict[str, Any]) -> AsyncIterator[RuntimeEvent]:
-
-        # TODO: 取出所有执行agent的必要配置——————————————————————————————————————————————————
-        # 记录 agent 节点开始时间，后面写 run step 时用来计算整体耗时
         started = perf_counter()
-        # 读取节点级 adapter 配置；如果节点没有显式声明，就由模型 provider 决定走 mock 还是 AgentScope
         adapter_name = node.get("adapter")
-        # 合并 App 级模型配置和节点级 model 覆盖配置。节点里的 model 优先级更高，方便后面做多模型 workflow。
         model_config = self._resolve_model_config(node)
-        # 决定使用哪个 agent adapter：mock provider 继续走 MockAgentAdapter，真实 provider 默认走 AgentScopeAdapter。
         provider = model_config.get("provider") or self.app.model_provider
         adapter = build_agent_adapter(adapter_name, provider)
         credential_id = str(model_config.get("credential_id") or "").strip()
@@ -169,9 +142,7 @@ class WorkflowExecutor:
                 api_key = resolve_model_api_key(self.db, credential_id, getattr(self.app, "owner_user_id", ""))
             except Exception as exc:
                 raise ValueError(str(exc)) from exc
-        
-        # TODO: 构造 AgentInvocation, agent runtime 的输入包————————————————————————————————
-        # 作用：WorkflowExecutor 把 workflow 前面准备好的 query、工具列表、检索片段、模型配置打包，然后交给 agent adapter。
+
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
@@ -183,12 +154,10 @@ class WorkflowExecutor:
             api_key=api_key,
             node_config=node,
             enabled_tools=context["enabled_tools"],
-            retrieved_chunks=self.result.retrieved_chunks,  # rag 节点检索到的片段在这里传给 agent
+            retrieved_chunks=self.result.retrieved_chunks,
         )
 
         final_answer = ""
-        # TODO: 跑 adapter，并处理 adapter 持续吐出的统一事件————————————————————————————————
-        # 这里不关心底层是 mock 还是 AgentScope，只处理 tool_call / final / adapter_error 等 RuntimeEvent。
         async for event in adapter.run(invocation):
             if event["type"] == "tool_call":
                 self.result.tool_calls.append(event)
@@ -217,8 +186,6 @@ class WorkflowExecutor:
                 return
             yield event
 
-        # TODO: 最后，写一个 agent step，表示这个 agent 节点整体跑完了————————————————————————
-        # input 里保留 adapter 和模型配置摘要，方便在 Logs 里回看当时实际用了哪个模型入口。
         add_step(
             self.db,
             self.run_id,
@@ -231,7 +198,11 @@ class WorkflowExecutor:
                 "model_credential_id": invocation.model_credential_id,
                 "model_base_url": model_config.get("base_url", ""),
             },
-            {"answer": final_answer, "tool_calls": self.result.tool_calls},
+            {
+                "answer": final_answer,
+                "tool_calls": self.result.tool_calls,
+                "context": invocation.context_metadata,
+            },
             latency_ms=int((perf_counter() - started) * 1000),
         )
 
@@ -246,11 +217,11 @@ class WorkflowExecutor:
 
     def _ordered_nodes(self, workflow_spec: dict[str, Any] | None) -> list[dict[str, Any]]:
         spec = workflow_spec or {}
-        nodes = {node["id"]: node for node in spec.get("nodes", []) if "id" in node}
+        nodes = {node["id"]: node for node in spec.get("nodes", []) if isinstance(node, dict) and "id" in node}
         if not nodes:
             return [
                 {"id": "start", "type": "start"},
-                {"id": "rag", "type": "rag", "enabled": True, "retrieval_top_k": 20},
+                {"id": "retrieval", "type": "retrieval", "enabled": True, "retrieval_top_k": 20},
                 {"id": "agent", "type": "react_agent", "model": {}},
                 {"id": "end", "type": "end"},
             ]
@@ -270,21 +241,14 @@ class WorkflowExecutor:
             seen.add(current)
             ordered.append(nodes[current])
             current = next_by_source.get(current, "")
-
         return ordered
 
     def _normalize_type(self, node_type: str) -> str:
-        # 它不是在“完整标准化所有节点类型”，而是在处理当前唯一的同义词。
-        # 其他类型要么已经是标准名，要么本来就该被当成未知节点。
         if node_type in {"agent", "react_agent"}:
             return "agent"
-        if node_type == "rag":
-            return "rag"
         return node_type
 
     def _resolve_model_config(self, node: dict[str, Any]) -> dict[str, Any]:
-        # node.model 是节点级覆盖项；app_model 是应用级默认项。
-        # 例如整个 App 默认用 DeepSeek，但某个 agent 节点可以临时覆盖成 Qwen。
         node_model = node.get("model") if isinstance(node.get("model"), dict) else {}
         app_model = {
             "provider": getattr(self.app, "model_provider", "mock"),
@@ -295,11 +259,9 @@ class WorkflowExecutor:
             "top_p": getattr(self.app, "top_p", None),
             "max_tokens": getattr(self.app, "max_tokens", None),
         }
-        # 只让 node 里“真正填写了值”的字段覆盖 App 级默认值，避免空字符串把默认配置冲掉。
         node_overrides = {
             key: value
             for key, value in node_model.items()
             if key != "api_key" and value not in (None, "")
         }
-        merged = {**app_model, **node_overrides}
-        return merged
+        return {**app_model, **node_overrides}

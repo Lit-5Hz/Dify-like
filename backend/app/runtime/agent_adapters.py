@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from time import perf_counter
 from typing import Any
 
 from app.tools.registry import build_agentscope_toolkit, run_tool
@@ -25,6 +24,7 @@ class AgentInvocation:
     node_config: dict[str, Any] = field(default_factory=dict)
     enabled_tools: list[str] = field(default_factory=list)
     retrieved_chunks: list[dict[str, Any]] = field(default_factory=list)
+    context_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseAgentAdapter:
@@ -32,6 +32,124 @@ class BaseAgentAdapter:
 
     async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
         raise NotImplementedError
+
+
+def build_agent_context(invocation: AgentInvocation) -> tuple[str, dict[str, Any]]:
+    if not invocation.retrieved_chunks:
+        return "", {"used_chunk_ids": [], "dropped_chunk_ids": [], "available_tokens": 0}
+
+    context_window = _resolve_context_window(invocation)
+    reserved_output = _to_int(
+        invocation.model_config.get("context_reserved_output_tokens")
+        or invocation.model_config.get("max_tokens")
+        or invocation.node_config.get("context_reserved_output_tokens"),
+        1024,
+    )
+    safety_margin = _to_int(
+        invocation.model_config.get("context_safety_margin") or invocation.node_config.get("context_safety_margin"),
+        400,
+    )
+    base_tokens = _estimate_tokens(invocation.system_prompt) + _estimate_tokens(invocation.query)
+    available_tokens = max(context_window - reserved_output - safety_margin - base_tokens, 0)
+
+    ranked_chunks = sorted(
+        invocation.retrieved_chunks,
+        key=lambda item: float(item.get("score", 0.0) or 0.0),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    used_tokens = 0
+    for chunk in ranked_chunks:
+        block = _format_context_chunk(chunk)
+        token_count = _estimate_tokens(block)
+        if token_count <= max(available_tokens - used_tokens, 0):
+            selected.append({**chunk, "_context_block": block, "_context_tokens": token_count})
+            used_tokens += token_count
+        else:
+            dropped.append(chunk)
+
+    reordered = _lost_in_the_middle_reorder(selected)
+    context_block = "\n\n".join(str(chunk.get("_context_block") or "") for chunk in reordered if chunk.get("_context_block"))
+    metadata = {
+        "context_window": context_window,
+        "reserved_output_tokens": reserved_output,
+        "safety_margin_tokens": safety_margin,
+        "base_tokens": base_tokens,
+        "available_tokens": available_tokens,
+        "used_tokens": used_tokens,
+        "used_chunk_ids": [str(chunk.get("chunk_id") or "") for chunk in reordered],
+        "dropped_chunk_ids": [str(chunk.get("chunk_id") or "") for chunk in dropped],
+        "reorder": "lost_in_the_middle",
+        "source_label_format": "[source_file | page page_num | chunk_type | chunk_id]",
+    }
+    return context_block, metadata
+
+
+def _resolve_context_window(invocation: AgentInvocation) -> int:
+    configured = _to_int(
+        invocation.model_config.get("model_context_window") or invocation.node_config.get("model_context_window"),
+        0,
+    )
+    if configured > 0:
+        return configured
+    text = f"{invocation.model_provider} {invocation.model_name}".lower()
+    if "gpt-4o" in text or "gpt-4.1" in text:
+        return 128000
+    if "deepseek" in text:
+        return 64000
+    if "qwen" in text and "72" in text:
+        return 32000
+    if "qwen" in text:
+        return 8192
+    return 8192
+
+
+def _estimate_tokens(text: str) -> int:
+    value = str(text or "")
+    if not value:
+        return 0
+    try:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return int(len(encoding.encode(value)) * 1.2) + 1
+    except Exception:
+        return max(len(value) // 3, 1)
+
+
+def _format_context_chunk(chunk: dict[str, Any]) -> str:
+    source_file = str(chunk.get("source_file") or "unknown")
+    page_num = chunk.get("page_num")
+    page_label = f"page {page_num}" if page_num not in {None, "", 0} else "page unknown"
+    chunk_type = str(chunk.get("chunk_type") or "text")
+    chunk_id = str(chunk.get("chunk_id") or "unknown")
+    section = str(chunk.get("section") or "").strip()
+    section_line = f"Section: {section}\n" if section else ""
+    return f"[{source_file} | {page_label} | {chunk_type} | {chunk_id}]\n{section_line}{chunk.get('content', '')}"
+
+
+def _lost_in_the_middle_reorder(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(chunks) <= 2:
+        return chunks
+    reordered: list[dict[str, Any] | None] = [None] * len(chunks)
+    left = 0
+    right = len(chunks) - 1
+    for index, chunk in enumerate(chunks):
+        if index % 2 == 0:
+            reordered[left] = chunk
+            left += 1
+        else:
+            reordered[right] = chunk
+            right -= 1
+    return [chunk for chunk in reordered if chunk is not None]
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class MockAgentAdapter(BaseAgentAdapter):
@@ -78,8 +196,10 @@ class MockAgentAdapter(BaseAgentAdapter):
             }
             answer_parts.append(tool_result["weather"])
 
-        if invocation.retrieved_chunks:
-            context = invocation.retrieved_chunks[0]["content"]
+        context_block, context_metadata = build_agent_context(invocation)
+        invocation.context_metadata = context_metadata
+        if context_block:
+            context = context_block
             answer_parts.append(f"根据知识库：{context[:260]}")
 
         if not answer_parts:
@@ -277,10 +397,11 @@ class AgentScopeAdapter(BaseAgentAdapter):
         raise ValueError(f"Unsupported AgentScope model provider: {provider}")
 
     def _build_system_prompt(self, invocation: AgentInvocation) -> str:
-        if not invocation.retrieved_chunks:
+        context_block, context_metadata = build_agent_context(invocation)
+        invocation.context_metadata = context_metadata
+        if not context_block:
             return invocation.system_prompt
-        context = "\n\n".join(chunk["content"] for chunk in invocation.retrieved_chunks)
-        return f"{invocation.system_prompt}\n\nKnowledge context:\n{context}"
+        return f"{invocation.system_prompt}\n\nKnowledge context:\n{context_block}"
 
     def _build_generate_kwargs(self, invocation: AgentInvocation) -> dict[str, Any]:
         # 前端目前沿用 70/100 这种百分比式数值；真实模型 API 通常需要 0.7/1.0。
