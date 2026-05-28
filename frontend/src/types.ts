@@ -1,5 +1,6 @@
 export type AppItem = {
   id: string;
+  owner_user_id: string;
   name: string;
   description: string;
   status: string;
@@ -12,6 +13,17 @@ export type AppItem = {
   top_p: number;
   max_tokens: number;
   workflow_spec: Record<string, unknown>;
+};
+
+export type PublishedAppItem = {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  description: string;
+  status: string;
+  owned: boolean;
+  created_at: string;
+  updated_at: string;
 };
 
 export type ModelCredential = {
@@ -59,12 +71,6 @@ export type KnowledgeDocument = {
   updated_at: string;
 };
 
-export type RuntimeKnowledgeDocumentUpload = {
-  conversation_id: string;
-  knowledge_base: KnowledgeBase;
-  document: KnowledgeDocument;
-};
-
 export type ToolItem = {
   name: string;
   label: string;
@@ -90,6 +96,7 @@ export type AppTool = {
 
 export type RunItem = {
   id: string;
+  app_id: string;
   conversation_id: string;
   status: string;
   latency_ms: number;

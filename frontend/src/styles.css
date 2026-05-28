@@ -172,6 +172,13 @@ small {
   margin-top: 16px;
 }
 
+.app-section-title {
+  margin-top: 8px;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .app-item {
   align-items: flex-start;
   flex-direction: column;
@@ -229,10 +236,25 @@ textarea {
   font-weight: 700;
 }
 
+.notice {
+  margin-top: 12px;
+  border: 1px solid #bfd7d1;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #eef8f5;
+  color: #24564e;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .workflow-canvas {
   display: grid;
   gap: 0;
   margin-top: 12px;
+}
+
+.workflow-chain-item {
+  display: grid;
 }
 
 .workflow-node {
@@ -378,6 +400,16 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.doc-item {
+  grid-template-columns: 1fr 30px;
+  align-items: center;
+}
+
+.doc-item strong,
+.doc-item span {
+  grid-column: 1;
+}
+
 .credential-item {
   display: grid;
   grid-template-columns: 1fr 30px;
@@ -439,6 +471,18 @@ textarea {
   padding: 0 12px;
 }
 
+.actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.inline-button {
+  width: auto;
+  padding: 0 14px;
+}
+
 .check {
   grid-template-columns: 18px 1fr;
   align-items: start;
@@ -490,13 +534,6 @@ textarea {
   gap: 10px;
   border-top: 1px solid #d9e0ea;
   padding-top: 14px;
-}
-
-.playground-rag-files {
-  display: grid;
-  gap: 10px;
-  border-top: 1px solid #d9e0ea;
-  padding-top: 12px;
 }
 
 .runtime-doc-list {

@@ -2,11 +2,12 @@ import type {
   AppItem,
   AppTool,
   AuthResponse,
+  KnowledgeBase,
   KnowledgeDocument,
   MessageItem,
   ModelCredential,
+  PublishedAppItem,
   RunItem,
-  RuntimeKnowledgeDocumentUpload,
   ToolItem,
   UserItem,
 } from "./types";
@@ -18,9 +19,7 @@ let authToken = typeof window !== "undefined" ? window.localStorage.getItem(AUTH
 
 function applyAuthToken(token: string) {
   authToken = token.trim();
-  if (typeof window === "undefined") {
-    return;
-  }
+  if (typeof window === "undefined") return;
   if (authToken) {
     window.localStorage.setItem(AUTH_TOKEN_KEY, authToken);
   } else {
@@ -77,13 +76,14 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   listApps: () => request<AppItem[]>("/apps"),
+  listPublishedApps: () => request<PublishedAppItem[]>("/published-apps"),
   createApp: () =>
     request<AppItem>("/apps", {
       method: "POST",
       body: JSON.stringify({
-        name: "电商客服 Agent",
-        description: "用于演示订单查询、FAQ 检索和运行日志。",
-        system_prompt: "你是一个专业、耐心、简洁的电商客服智能体。",
+        name: "知识库问答应用",
+        description: "创建者维护知识库，使用者只能提问。",
+        system_prompt: "你是一个专业、耐心、简洁的智能体。优先依据检索到的知识库上下文回答。",
         model_provider: "mock",
         model_name: "mock-react",
         model_credential_id: "",
@@ -98,6 +98,57 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(payload),
     }),
+  deleteApp: (appId: string) =>
+    request<{ ok: boolean }>(`/apps/${appId}`, {
+      method: "DELETE",
+    }),
+  publishApp: (appId: string) =>
+    request<AppItem>(`/apps/${appId}/publish`, {
+      method: "POST",
+    }),
+  unpublishApp: (appId: string) =>
+    request<AppItem>(`/apps/${appId}/unpublish`, {
+      method: "POST",
+    }),
+  listKnowledgeBases: () => request<KnowledgeBase[]>("/knowledge-bases"),
+  createKnowledgeBase: (payload: { name: string; description: string }) =>
+    request<KnowledgeBase>("/knowledge-bases", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  updateKnowledgeBase: (kbId: string, payload: Partial<KnowledgeBase>) =>
+    request<KnowledgeBase>(`/knowledge-bases/${kbId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteKnowledgeBase: (kbId: string) =>
+    request<{ ok: boolean }>(`/knowledge-bases/${kbId}`, {
+      method: "DELETE",
+    }),
+  listKnowledgeDocuments: (kbId: string) => request<KnowledgeDocument[]>(`/knowledge-bases/${kbId}/documents`),
+  uploadKnowledgeDocument: async (kbId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const headers = getRequestHeaders();
+    const response = await fetch(`${API_BASE}/knowledge-bases/${kbId}/documents`, {
+      method: "POST",
+      body: form,
+      headers,
+    });
+    if (!response.ok) {
+      throw new Error(await readErrorMessage(response));
+    }
+    return response.json() as Promise<KnowledgeDocument>;
+  },
+  deleteKnowledgeDocument: (kbId: string, documentId: string) =>
+    request<{ ok: boolean }>(`/knowledge-bases/${kbId}/documents/${documentId}`, {
+      method: "DELETE",
+    }),
+  rebuildKnowledgeBase: (kbId: string) =>
+    request<KnowledgeBase>(`/knowledge-bases/${kbId}/rebuild`, {
+      method: "POST",
+    }),
+  retrievalCapabilities: () => request<Record<string, unknown>>("/retrieval/capabilities"),
   listTools: () => request<ToolItem[]>("/tools"),
   listModelCredentials: () => request<ModelCredential[]>("/model-credentials"),
   createModelCredential: (payload: { provider: string; name: string; api_key: string }) =>
@@ -109,25 +160,6 @@ export const api = {
     request<{ ok: boolean }>(`/model-credentials/${credentialId}`, {
       method: "DELETE",
     }),
-  listRuntimeRagDocuments: (appId: string, conversationId: string | null) =>
-    request<KnowledgeDocument[]>(
-      `/apps/${appId}/rag/documents${conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : ""}`,
-    ),
-  uploadRuntimeRagDocument: async (appId: string, conversationId: string | null, file: File) => {
-    const form = new FormData();
-    if (conversationId) form.append("conversation_id", conversationId);
-    form.append("file", file);
-    const headers = getRequestHeaders();
-    const response = await fetch(`${API_BASE}/apps/${appId}/rag/documents`, {
-      method: "POST",
-      body: form,
-      headers,
-    });
-    if (!response.ok) {
-      throw new Error(await readErrorMessage(response));
-    }
-    return response.json() as Promise<RuntimeKnowledgeDocumentUpload>;
-  },
   listAppTools: (appId: string) => request<AppTool[]>(`/apps/${appId}/tools`),
   updateAppTools: (appId: string, toolNames: string[]) =>
     request<AppTool[]>(`/apps/${appId}/tools`, {

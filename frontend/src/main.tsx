@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Bot,
@@ -22,8 +22,10 @@ import type {
   AppItem,
   AppTool,
   ChatMessage,
+  KnowledgeBase,
   KnowledgeDocument,
   ModelCredential,
+  PublishedAppItem,
   RunItem,
   ToolItem,
   UserItem,
@@ -31,20 +33,11 @@ import type {
 import "./styles.css";
 
 const MODEL_PROVIDERS = ["mock", "openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm"];
-const CREDENTIAL_PROVIDERS = [
-  "openai",
-  "openai_compatible",
-  "deepseek",
-  "dashscope",
-  "qwen",
-  "vllm",
-  "zhipu",
-  "zhipuai",
-  "jina",
-  "cohere",
-];
-const EMBEDDING_PROVIDERS = ["openai", "openai_compatible", "zhipu", "zhipuai"];
-const RERANK_PROVIDERS = ["passthrough", "jina", "cohere"];
+const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "mock");
+const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
+const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
+
+type SelectedApp = AppItem | PublishedAppItem;
 
 type AgentNodeModel = {
   provider?: string;
@@ -54,24 +47,23 @@ type AgentNodeModel = {
   temperature?: string | number;
   top_p?: string | number;
   max_tokens?: string | number;
+  model_context_window?: string | number;
+  context_reserved_output_tokens?: string | number;
+  context_safety_margin?: string | number;
 };
 
-type RagNodeModel = {
-  retrieval_top_k?: string | number;
-  rerank_provider?: string;
-  rerank_top_n?: string | number;
-  rerank_credential_id?: string;
-  rerank_model?: string;
-  rerank_base_url?: string;
-  embedding_provider?: string;
-  embedding_model?: string;
-  embedding_dimension?: string | number;
-  embedding_credential_id?: string;
-  embedding_base_url?: string;
-  chunk_size?: string | number;
-  chunk_overlap?: string | number;
-  chunk_strategy?: string;
+type RetrievalNodeModel = {
   enabled?: boolean;
+  knowledge_base_ids?: string[];
+  retrieval_top_k?: string | number;
+  rerank_enabled?: boolean;
+  query_enhancement_enabled?: boolean;
+  query_enhancement_strategy?: string;
+  query_llm_provider?: string;
+  query_llm_model?: string;
+  query_llm_credential_id?: string;
+  query_llm_base_url?: string;
+  query_llm_temperature?: string | number;
 };
 
 type WorkflowNode = Record<string, unknown>;
@@ -87,23 +79,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isFullApp(app: SelectedApp | null): app is AppItem {
+  return Boolean(app && "workflow_spec" in app);
+}
+
 function defaultCredentialProvider(provider: string) {
   return provider && provider !== "mock" ? provider : "openai_compatible";
 }
 
-function defaultEmbeddingConfig(provider: string) {
-  if (provider === "zhipu" || provider === "zhipuai") {
-    return {
-      embedding_model: "embedding-3",
-      embedding_dimension: 2048,
-      embedding_base_url: "https://open.bigmodel.cn/api/paas/v4",
-    };
-  }
-  return {
-    embedding_model: "text-embedding-3-small",
-    embedding_dimension: 1536,
-    embedding_base_url: "https://api.openai.com/v1",
-  };
+function defaultQueryLlmBaseUrl(provider: string) {
+  if (provider === "openai") return "https://api.openai.com/v1";
+  if (provider === "deepseek") return "https://api.deepseek.com/v1";
+  if (provider === "dashscope" || provider === "qwen") return "https://dashscope.aliyuncs.com/compatible-mode/v1";
+  return "";
 }
 
 function getWorkflowNodes(app: AppItem): WorkflowNode[] {
@@ -133,9 +121,9 @@ function getWorkflowNodeType(node: WorkflowNode) {
   return String(node.type ?? "unknown");
 }
 
-function isRagNode(node: WorkflowNode) {
+function isRetrievalNode(node: WorkflowNode) {
   const type = getWorkflowNodeType(node);
-  return node.id === "rag" || type === "rag";
+  return node.id === "retrieval" || type === "retrieval";
 }
 
 function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
@@ -144,7 +132,7 @@ function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
   if (id === "start" || type === "start") return "Start";
   if (id === "end" || type === "end") return "End";
   if (id === "agent" || type === "agent" || type === "react_agent") return "Agent";
-  if (isRagNode(node)) return "RAG";
+  if (isRetrievalNode(node)) return "检索节点";
   return id;
 }
 
@@ -156,15 +144,13 @@ function getAgentNodeModel(app: AppItem): AgentNodeModel {
   return isRecord(node?.model) ? (node.model as AgentNodeModel) : {};
 }
 
-function getRagNode(app: AppItem): WorkflowNode {
-  const node = getWorkflowNodes(app).find((item) => isRagNode(item));
-  return node ?? {};
+function getRetrievalNode(app: AppItem): WorkflowNode {
+  return getWorkflowNodes(app).find((item) => isRetrievalNode(item)) ?? {};
 }
 
 function updateAgentNodeModel(app: AppItem, key: keyof AgentNodeModel, value: string | number): AppItem {
   const spec = app.workflow_spec ?? {};
-  const nodes = getWorkflowNodes(app);
-  const nextNodes = nodes.map((item) => {
+  const nextNodes = getWorkflowNodes(app).map((item) => {
     const type = getWorkflowNodeType(item);
     const isAgentNode = item.id === "agent" || type === "agent" || type === "react_agent";
     if (!isAgentNode) return item;
@@ -186,12 +172,11 @@ function updateAgentNodeModel(app: AppItem, key: keyof AgentNodeModel, value: st
   };
 }
 
-function updateRagNode(app: AppItem, key: keyof RagNodeModel, value: string | number | boolean | string[]): AppItem {
+function updateRetrievalNode(app: AppItem, key: keyof RetrievalNodeModel, value: string | number | boolean | string[]): AppItem {
   const spec = app.workflow_spec ?? {};
-  const nodes = getWorkflowNodes(app);
-  const nextNodes = nodes.map((item) => {
-    if (!isRagNode(item)) return item;
-    return { ...item, id: "rag", type: "rag", [key]: value };
+  const nextNodes = getWorkflowNodes(app).map((item) => {
+    if (!isRetrievalNode(item)) return item;
+    return { ...item, id: "retrieval", type: "retrieval", [key]: value };
   });
   return {
     ...app,
@@ -209,130 +194,140 @@ function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [apps, setApps] = useState<AppItem[]>([]);
-  const [selectedApp, setSelectedApp] = useState<AppItem | null>(null);
+  const [publishedApps, setPublishedApps] = useState<PublishedAppItem[]>([]);
+  const [selectedApp, setSelectedApp] = useState<SelectedApp | null>(null);
   const [credentials, setCredentials] = useState<ModelCredential[]>([]);
-  const [runtimeKnowledgeDocuments, setRuntimeKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
   const [credentialDraft, setCredentialDraft] = useState({
     provider: "openai_compatible",
     name: "",
     api_key: "",
   });
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
+  const [selectedKnowledgeBaseId, setSelectedKnowledgeBaseId] = useState("");
+  const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
+  const [knowledgeDraft, setKnowledgeDraft] = useState({ name: "", description: "" });
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [appTools, setAppTools] = useState<AppTool[]>([]);
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
   const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState("");
-  const [input, setInput] = useState("我的订单 10086 到哪了？");
+  const [input, setInput] = useState("这份知识库里讲了什么？");
   const [trace, setTrace] = useState<Record<string, unknown>[]>([]);
   const [busy, setBusy] = useState(false);
+  const [statusMessage, setStatusMessage] = useState("");
 
+  const selectedOwnedApp = isFullApp(selectedApp) && selectedApp.owner_user_id === user?.id ? selectedApp : null;
+  const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
+  const canEditSelectedApp = Boolean(selectedOwnedApp);
   const enabledToolNames = useMemo(
     () => appTools.filter((item) => item.enabled).map((item) => item.tool_name),
     [appTools],
   );
-  const agentNodeModel = useMemo(() => (selectedApp ? getAgentNodeModel(selectedApp) : {}), [selectedApp]);
-  const ragNode = useMemo(() => (selectedApp ? getRagNode(selectedApp) : {}), [selectedApp]);
-  const ragNodeModel = ragNode as RagNodeModel;
-  const workflowNodes = useMemo(() => (selectedApp ? getWorkflowNodes(selectedApp) : []), [selectedApp]);
-  const workflowEdges = useMemo(() => (selectedApp ? getWorkflowEdges(selectedApp) : []), [selectedApp]);
+  const agentNodeModel = useMemo(() => (selectedOwnedApp ? getAgentNodeModel(selectedOwnedApp) : {}), [selectedOwnedApp]);
+  const retrievalNode = useMemo(() => (selectedOwnedApp ? getRetrievalNode(selectedOwnedApp) : {}), [selectedOwnedApp]);
+  const retrievalNodeModel = retrievalNode as RetrievalNodeModel;
+  const workflowNodes = useMemo(() => (selectedOwnedApp ? getWorkflowNodes(selectedOwnedApp) : []), [selectedOwnedApp]);
+  const workflowEdges = useMemo(() => (selectedOwnedApp ? getWorkflowEdges(selectedOwnedApp) : []), [selectedOwnedApp]);
   const selectedWorkflowNode = useMemo(() => {
     const node = workflowNodes.find((item, index) => getWorkflowNodeId(item, index) === selectedWorkflowNodeId);
     return node ?? workflowNodes[0] ?? null;
   }, [selectedWorkflowNodeId, workflowNodes]);
   const selectedWorkflowNodeType = selectedWorkflowNode ? getWorkflowNodeType(selectedWorkflowNode) : "";
-  const ragUploadEnabled = Boolean(ragNodeModel.enabled ?? true);
 
-  useEffect(() => {
-    if (!workflowNodes.length) {
-      setSelectedWorkflowNodeId("");
-      return;
-    }
-    const selectedStillExists = workflowNodes.some((node, index) => getWorkflowNodeId(node, index) === selectedWorkflowNodeId);
-    if (selectedStillExists) return;
-    const defaultNode =
-      workflowNodes.find((node, index) => {
-        const id = getWorkflowNodeId(node, index);
-        const type = getWorkflowNodeType(node);
-        return isRagNode(node) || id === "agent" || type === "react_agent";
-      }) ?? workflowNodes[0];
-    setSelectedWorkflowNodeId(getWorkflowNodeId(defaultNode, workflowNodes.indexOf(defaultNode)));
-  }, [selectedWorkflowNodeId, workflowNodes]);
-
-  useEffect(() => {
-    if (!selectedApp || !conversationId) {
-      setRuntimeKnowledgeDocuments([]);
-      return;
-    }
-    api.listRuntimeRagDocuments(selectedApp.id, conversationId).then(setRuntimeKnowledgeDocuments).catch((error) => {
-      console.error(error);
-      setRuntimeKnowledgeDocuments([]);
-    });
-  }, [selectedApp?.id, conversationId]);
+  function setActiveConversationId(nextConversationId: string | null) {
+    conversationIdRef.current = nextConversationId;
+    setConversationId(nextConversationId);
+  }
 
   function resetWorkspace() {
     setApps([]);
+    setPublishedApps([]);
     setSelectedApp(null);
     setCredentials([]);
-    setRuntimeKnowledgeDocuments([]);
+    setKnowledgeBases([]);
+    setSelectedKnowledgeBaseId("");
+    setKnowledgeDocuments([]);
     setTools([]);
     setAppTools([]);
     setRuns([]);
     setMessages([]);
     setTrace([]);
-    setConversationId(null);
+    setActiveConversationId(null);
     setSelectedWorkflowNodeId("");
-    setInput("我的订单 10086 到哪了？");
     setBusy(false);
   }
 
-  async function selectApp(app: AppItem | null) {
+  async function selectApp(app: SelectedApp | null) {
     setSelectedApp(app);
     setMessages([]);
     setTrace([]);
-    setConversationId(null);
+    setActiveConversationId(null);
+    setStatusMessage("");
     if (!app) {
       setAppTools([]);
       setRuns([]);
       setSelectedWorkflowNodeId("");
-      setRuntimeKnowledgeDocuments([]);
       return;
     }
-    const [appToolList, runList] = await Promise.all([
-      api.listAppTools(app.id),
-      api.listRuns(app.id),
-    ]);
+    if (!isFullApp(app) || app.owner_user_id !== user?.id) {
+      setAppTools([]);
+      setRuns([]);
+      setSelectedWorkflowNodeId("");
+      return;
+    }
+
+    const [appToolList, runList] = await Promise.all([api.listAppTools(app.id), api.listRuns(app.id)]);
     setAppTools(appToolList);
     setRuns(runList);
-
     const latestConversationId = runList[0]?.conversation_id ?? null;
-    setConversationId(latestConversationId);
-    setRuntimeKnowledgeDocuments(latestConversationId ? await api.listRuntimeRagDocuments(app.id, latestConversationId) : []);
+    setActiveConversationId(latestConversationId);
     if (!latestConversationId) return;
-
-    const history = await api.listMessages(latestConversationId);
-    setMessages(
-      history
-        .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
-        .map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
-    );
+    try {
+      const history = await api.listMessages(latestConversationId);
+      setMessages(
+        history
+          .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
+          .map((message) => ({
+            role: message.role,
+            content: message.content,
+          })),
+      );
+    } catch (error) {
+      console.warn(error);
+      setActiveConversationId(null);
+      setMessages([]);
+    }
   }
 
   async function refresh(preferredAppId?: string | null) {
     if (!user) return;
-    const [appList, toolList, credentialList] = await Promise.all([
+    const [appList, publishedList, toolList, credentialList, kbList] = await Promise.all([
       api.listApps(),
+      api.listPublishedApps(),
       api.listTools(),
       api.listModelCredentials(),
+      api.listKnowledgeBases(),
     ]);
     setApps(appList);
+    setPublishedApps(publishedList);
     setTools(toolList);
     setCredentials(credentialList);
-    const currentApp = selectedApp ? appList.find((item) => item.id === selectedApp.id) : null;
-    const app = appList.find((item) => item.id === preferredAppId) ?? currentApp ?? appList[0] ?? null;
+    setKnowledgeBases(kbList);
+    if (!selectedKnowledgeBaseId && kbList[0]) {
+      setSelectedKnowledgeBaseId(kbList[0].id);
+    }
+
+    const currentId = selectedApp?.id ?? null;
+    const app =
+      appList.find((item) => item.id === preferredAppId) ??
+      appList.find((item) => item.id === currentId) ??
+      publishedList.find((item) => item.id === preferredAppId) ??
+      publishedList.find((item) => item.id === currentId) ??
+      appList[0] ??
+      publishedList[0] ??
+      null;
     await selectApp(app);
   }
 
@@ -369,12 +364,39 @@ function App() {
   }, [user?.id]);
 
   useEffect(() => {
-    if (!selectedApp) return;
+    if (!workflowNodes.length) {
+      setSelectedWorkflowNodeId("");
+      return;
+    }
+    const selectedStillExists = workflowNodes.some((node, index) => getWorkflowNodeId(node, index) === selectedWorkflowNodeId);
+    if (selectedStillExists) return;
+    const defaultNode =
+      workflowNodes.find((node, index) => {
+        const id = getWorkflowNodeId(node, index);
+        const type = getWorkflowNodeType(node);
+        return isRetrievalNode(node) || id === "agent" || type === "react_agent";
+      }) ?? workflowNodes[0];
+    setSelectedWorkflowNodeId(getWorkflowNodeId(defaultNode, workflowNodes.indexOf(defaultNode)));
+  }, [selectedWorkflowNodeId, workflowNodes]);
+
+  useEffect(() => {
+    if (!canEditSelectedApp || !selectedKnowledgeBaseId) {
+      setKnowledgeDocuments([]);
+      return;
+    }
+    api.listKnowledgeDocuments(selectedKnowledgeBaseId).then(setKnowledgeDocuments).catch((error) => {
+      console.error(error);
+      setKnowledgeDocuments([]);
+    });
+  }, [canEditSelectedApp, selectedKnowledgeBaseId]);
+
+  useEffect(() => {
+    if (!selectedOwnedApp) return;
     setCredentialDraft((draft) => ({
       ...draft,
-      provider: defaultCredentialProvider(selectedApp.model_provider),
+      provider: defaultCredentialProvider(selectedOwnedApp.model_provider),
     }));
-  }, [selectedApp?.id]);
+  }, [selectedOwnedApp?.id]);
 
   async function submitAuth(action: AuthAction) {
     const email = authForm.email.trim();
@@ -411,11 +433,66 @@ function App() {
   }
 
   async function saveConfig() {
-    if (!selectedApp) return;
-    const updated = await api.updateApp(selectedApp.id, selectedApp);
-    setSelectedApp(updated);
-    await api.updateAppTools(selectedApp.id, enabledToolNames);
+    if (!selectedOwnedApp) return;
+    const updated = await api.updateApp(selectedOwnedApp.id, selectedOwnedApp);
+    await api.updateAppTools(updated.id, enabledToolNames);
     await refresh(updated.id);
+    setStatusMessage("配置已保存。");
+  }
+
+  async function publishSelectedApp() {
+    if (!selectedOwnedApp) return;
+    const updated = await api.publishApp(selectedOwnedApp.id);
+    await refresh(updated.id);
+    setStatusMessage("应用已发布。");
+  }
+
+  async function unpublishSelectedApp() {
+    if (!selectedOwnedApp) return;
+    const updated = await api.unpublishApp(selectedOwnedApp.id);
+    await refresh(updated.id);
+    setStatusMessage("应用已取消发布。");
+  }
+
+  async function createKnowledgeBase() {
+    const name = knowledgeDraft.name.trim();
+    if (!name) return;
+    setBusy(true);
+    setStatusMessage("正在创建知识库...");
+    try {
+      const kb = await api.createKnowledgeBase({ name, description: knowledgeDraft.description.trim() });
+      setKnowledgeDraft({ name: "", description: "" });
+      setSelectedKnowledgeBaseId(kb.id);
+      setKnowledgeBases(await api.listKnowledgeBases());
+      setStatusMessage("知识库已创建。");
+    } catch (error) {
+      setStatusMessage(`创建知识库失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadKnowledgeFile(file: File | null) {
+    if (!selectedKnowledgeBaseId || !file) return;
+    setBusy(true);
+    try {
+      await api.uploadKnowledgeDocument(selectedKnowledgeBaseId, file);
+      setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteKnowledgeDocument(documentId: string) {
+    if (!selectedKnowledgeBaseId) return;
+    await api.deleteKnowledgeDocument(selectedKnowledgeBaseId, documentId);
+    setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+  }
+
+  async function rebuildSelectedKnowledgeBase() {
+    if (!selectedKnowledgeBaseId) return;
+    await api.rebuildKnowledgeBase(selectedKnowledgeBaseId);
+    setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
   }
 
   async function createCredential() {
@@ -423,19 +500,15 @@ function App() {
     const apiKey = credentialDraft.api_key.trim();
     if (!provider || !apiKey) return;
     const name = credentialDraft.name.trim() || `${provider} credential`;
-    const credential = await api.createModelCredential({
-      provider,
-      name,
-      api_key: apiKey,
-    });
+    const credential = await api.createModelCredential({ provider, name, api_key: apiKey });
     setCredentials(await api.listModelCredentials());
     setCredentialDraft({
-      provider: defaultCredentialProvider(selectedApp?.model_provider ?? "openai_compatible"),
+      provider: defaultCredentialProvider(selectedOwnedApp?.model_provider ?? "openai_compatible"),
       name: "",
       api_key: "",
     });
     setSelectedApp((current) => {
-      if (!current) return current;
+      if (!isFullApp(current)) return current;
       return current.model_credential_id ? current : { ...current, model_credential_id: credential.id };
     });
   }
@@ -443,52 +516,44 @@ function App() {
   async function deleteCredential(credentialId: string) {
     await api.deleteModelCredential(credentialId);
     setCredentials(await api.listModelCredentials());
-    if (!selectedApp) return;
-    const needAppUpdate = selectedApp.model_credential_id === credentialId;
-    const needNodeUpdate = String(agentNodeModel.credential_id ?? "") === credentialId;
-    if (!needAppUpdate && !needNodeUpdate) return;
-
-    let nextApp = selectedApp;
-    if (needAppUpdate) nextApp = { ...nextApp, model_credential_id: "" };
-    if (needNodeUpdate) nextApp = updateAgentNodeModel(nextApp, "credential_id", "");
-    const saved = await api.updateApp(nextApp.id, nextApp);
-    setSelectedApp(saved);
+    if (!selectedOwnedApp) return;
+    let nextApp = selectedOwnedApp;
+    if (selectedOwnedApp.model_credential_id === credentialId) {
+      nextApp = { ...nextApp, model_credential_id: "" };
+    }
+    if (String(agentNodeModel.credential_id ?? "") === credentialId) {
+      nextApp = updateAgentNodeModel(nextApp, "credential_id", "");
+    }
+    if (String(retrievalNodeModel.query_llm_credential_id ?? "") === credentialId) {
+      nextApp = updateRetrievalNode(nextApp, "query_llm_credential_id", "");
+    }
+    setSelectedApp(nextApp);
   }
 
   async function toggleTool(toolName: string) {
-    if (!selectedApp) return;
+    if (!selectedOwnedApp) return;
     const next = appTools.some((item) => item.tool_name === toolName && item.enabled)
       ? enabledToolNames.filter((name) => name !== toolName)
       : [...enabledToolNames, toolName];
-    const updated = await api.updateAppTools(selectedApp.id, next);
+    const updated = await api.updateAppTools(selectedOwnedApp.id, next);
     setAppTools(updated);
   }
 
-  async function uploadRuntimeRagFile(file: File | null) {
-    if (!selectedApp || !file) return;
-    const savedApp = await api.updateApp(selectedApp.id, selectedApp);
-    setSelectedApp(savedApp);
-    const result = await api.uploadRuntimeRagDocument(savedApp.id, conversationId, file);
-    setConversationId(result.conversation_id);
-    setRuntimeKnowledgeDocuments(await api.listRuntimeRagDocuments(savedApp.id, result.conversation_id));
-    setTrace((items) => [
-      ...items,
-      { event: "runtime_rag_document_uploaded", filename: file.name, conversation_id: result.conversation_id },
-    ]);
+  function updateRetrievalConfig(key: keyof RetrievalNodeModel, value: string | number | boolean | string[]) {
+    if (!selectedOwnedApp) return;
+    setSelectedApp(updateRetrievalNode(selectedOwnedApp, key, value));
   }
 
-  function updateRagConfig(key: keyof RagNodeModel, value: string | number | boolean | string[]) {
-    if (!selectedApp) return;
-    setSelectedApp(updateRagNode(selectedApp, key, value));
+  function toggleKnowledgeBaseInNode(kbId: string) {
+    const currentIds = Array.isArray(retrievalNodeModel.knowledge_base_ids) ? retrievalNodeModel.knowledge_base_ids : [];
+    const nextIds = currentIds.includes(kbId) ? currentIds.filter((item) => item !== kbId) : [...currentIds, kbId];
+    updateRetrievalConfig("knowledge_base_ids", nextIds);
   }
 
-  function updateRagEmbeddingProvider(provider: string) {
-    if (!selectedApp) return;
-    const defaults = defaultEmbeddingConfig(provider);
-    let nextApp = updateRagNode(selectedApp, "embedding_provider", provider);
-    nextApp = updateRagNode(nextApp, "embedding_model", defaults.embedding_model);
-    nextApp = updateRagNode(nextApp, "embedding_dimension", defaults.embedding_dimension);
-    nextApp = updateRagNode(nextApp, "embedding_base_url", defaults.embedding_base_url);
+  function updateRetrievalQueryLlmProvider(provider: string) {
+    if (!selectedOwnedApp) return;
+    let nextApp = updateRetrievalNode(selectedOwnedApp, "query_llm_provider", provider);
+    nextApp = updateRetrievalNode(nextApp, "query_llm_base_url", defaultQueryLlmBaseUrl(provider));
     setSelectedApp(nextApp);
   }
 
@@ -501,9 +566,9 @@ function App() {
     setMessages((items) => [...items, { role: "user", content: query }, { role: "assistant", content: "" }]);
 
     try {
-      await streamChat(selectedApp.id, query, conversationId, (event, data) => {
+      await streamChat(selectedApp.id, query, conversationIdRef.current, (event, data) => {
         if (event === "run_started") {
-          setConversationId(String(data.conversation_id));
+          setActiveConversationId(String(data.conversation_id));
         }
         if (event === "error") {
           const message = String(data.message ?? "运行出错");
@@ -528,31 +593,33 @@ function App() {
             return next;
           });
         }
-        if (event === "rag" || event === "tool_call" || event === "final" || event === "workflow_warning") {
+        if (event === "retrieval" || event === "tool_call" || event === "final" || event === "workflow_warning") {
           setTrace((items) => [...items, { event, ...data }]);
         }
       });
-      setRuns(await api.listRuns(selectedApp.id));
+      if (selectedOwnedApp) {
+        setRuns(await api.listRuns(selectedOwnedApp.id));
+      }
     } finally {
       setBusy(false);
     }
   }
 
   function renderWorkflowNodeIcon(type: string) {
-    if (type === "rag") return <Database size={16} />;
+    if (type === "retrieval") return <Database size={16} />;
     if (type === "react_agent" || type === "agent") return <Bot size={16} />;
     return <Play size={16} />;
   }
 
   function renderWorkflowNodeSummary(node: WorkflowNode) {
     const type = getWorkflowNodeType(node);
-    if (isRagNode(node)) {
-      if (!Boolean(node.enabled ?? true)) return "已停用";
-      return "Playground 上传文件";
+    if (isRetrievalNode(node)) {
+      const ids = Array.isArray(node.knowledge_base_ids) ? node.knowledge_base_ids : [];
+      return ids.length ? `${ids.length} 个知识库` : "未选择知识库";
     }
     if (type === "react_agent" || type === "agent") {
       const model = isRecord(node.model) ? node.model : {};
-      return String(model.model_name ?? selectedApp?.model_name ?? "继承 App 模型");
+      return String(model.model_name ?? selectedOwnedApp?.model_name ?? "继承 App 模型");
     }
     if (type === "start") return "接收用户输入";
     if (type === "end") return "结束并返回结果";
@@ -560,6 +627,7 @@ function App() {
   }
 
   function renderWorkflowCanvas() {
+    if (!selectedOwnedApp) return null;
     return (
       <section className="panel">
         <div className="panel-title">
@@ -572,7 +640,7 @@ function App() {
             const isSelected = selectedWorkflowNodeId === id || (!selectedWorkflowNodeId && index === 0);
             const outgoing = workflowEdges.filter((edge) => edge.source === id).map((edge) => edge.target);
             return (
-              <React.Fragment key={`${id}-${index}`}>
+              <div className="workflow-chain-item" key={`${id}-${index}`}>
                 <button
                   className={isSelected ? "workflow-node active" : "workflow-node"}
                   onClick={() => setSelectedWorkflowNodeId(id)}
@@ -590,7 +658,7 @@ function App() {
                     <small>{outgoing.length ? outgoing.join(", ") : "next"}</small>
                   </div>
                 ) : null}
-              </React.Fragment>
+              </div>
             );
           })}
         </div>
@@ -599,7 +667,7 @@ function App() {
   }
 
   function renderAppSettings() {
-    if (!selectedApp) return null;
+    if (!selectedOwnedApp) return null;
     return (
       <section className="panel">
         <div className="panel-title">
@@ -607,186 +675,251 @@ function App() {
         </div>
         <label>
           名称
-          <input value={selectedApp.name} onChange={(event) => setSelectedApp({ ...selectedApp, name: event.target.value })} />
+          <input value={selectedOwnedApp.name} onChange={(event) => setSelectedApp({ ...selectedOwnedApp, name: event.target.value })} />
         </label>
         <label>
           描述
           <textarea
             rows={2}
-            value={selectedApp.description}
-            onChange={(event) => setSelectedApp({ ...selectedApp, description: event.target.value })}
+            value={selectedOwnedApp.description}
+            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, description: event.target.value })}
           />
         </label>
         <label>
           System Prompt
           <textarea
             rows={4}
-            value={selectedApp.system_prompt}
-            onChange={(event) => setSelectedApp({ ...selectedApp, system_prompt: event.target.value })}
+            value={selectedOwnedApp.system_prompt}
+            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, system_prompt: event.target.value })}
           />
         </label>
       </section>
     );
   }
 
-  function renderRagNodeSettings() {
+  function renderKnowledgeDatabasePanel() {
+    return (
+      <section className="panel">
+        <div className="panel-title">
+          <Database size={16} /> 知识库
+        </div>
+        <div className="grid-two">
+          <label>
+            名称
+            <input value={knowledgeDraft.name} onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, name: event.target.value })} />
+          </label>
+          <label>
+            操作
+            <button className="secondary" disabled={!knowledgeDraft.name.trim()} onClick={createKnowledgeBase}>
+              <Plus size={16} /> 新建
+            </button>
+          </label>
+        </div>
+        <label>
+          描述
+          <input
+            value={knowledgeDraft.description}
+            onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, description: event.target.value })}
+          />
+        </label>
+        <div className="kb-list">
+          {knowledgeBases.map((kb) => (
+            <button
+              className={selectedKnowledgeBaseId === kb.id ? "kb-item active" : "kb-item"}
+              key={kb.id}
+              onClick={() => setSelectedKnowledgeBaseId(kb.id)}
+            >
+              <strong>{kb.name}</strong>
+              <span>
+                {kb.locked ? "已锁定" : "未锁定"} · {kb.embedding_provider}/{kb.embedding_model} · {kb.embedding_dimension}
+              </span>
+            </button>
+          ))}
+        </div>
+        {selectedKnowledgeBase ? (
+          <>
+            <div className="actions-row">
+              <label className="upload upload-inline">
+                <FileUp size={16} />
+                上传文档
+                <input
+                  type="file"
+                  accept=".txt,.md,.py,.js,.jsx,.ts,.tsx,.java,.go,.json,.yaml,.yml,.csv,.html,.css,.pdf,.docx,.pptx,.xlsx,.xls"
+                  disabled={busy}
+                  onChange={(event) => uploadKnowledgeFile(event.target.files?.[0] ?? null)}
+                />
+              </label>
+              <button className="secondary inline-button" onClick={rebuildSelectedKnowledgeBase}>
+                重建
+              </button>
+            </div>
+            <div className="doc-list">
+              {knowledgeDocuments.map((document) => (
+                <div className="doc-item" key={document.id}>
+                  <strong>{document.filename}</strong>
+                  <span>
+                    {document.status}
+                    {document.error ? ` · ${document.error}` : ""}
+                  </span>
+                  <button className="icon-button" title="删除文档" onClick={() => deleteKnowledgeDocument(document.id)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="empty">先创建一个知识库。</p>
+        )}
+      </section>
+    );
+  }
+
+  function renderRetrievalNodeSettings() {
+    const queryEnhancementEnabled = Boolean(retrievalNodeModel.query_enhancement_enabled ?? false);
+    const selectedIds = Array.isArray(retrievalNodeModel.knowledge_base_ids) ? retrievalNodeModel.knowledge_base_ids : [];
     return (
       <>
         <label className="check">
           <input
             type="checkbox"
-            checked={Boolean(ragNodeModel.enabled ?? true)}
-            onChange={(event) => updateRagConfig("enabled", event.target.checked)}
+            checked={Boolean(retrievalNodeModel.enabled ?? true)}
+            onChange={(event) => updateRetrievalConfig("enabled", event.target.checked)}
           />
           <span>
-            <strong>启用 RAG</strong>
+            <strong>启用检索</strong>
             <small>关闭后 workflow 会跳过该节点</small>
           </span>
         </label>
+        <div className="sub-panel-title">知识库选择</div>
+        {knowledgeBases.map((kb) => (
+          <label className="check" key={kb.id}>
+            <input type="checkbox" checked={selectedIds.includes(kb.id)} onChange={() => toggleKnowledgeBaseInNode(kb.id)} />
+            <span>
+              <strong>{kb.name}</strong>
+              <small>{kb.description || kb.embedding_model}</small>
+            </span>
+          </label>
+        ))}
         <div className="grid-two">
           <label>
             召回 Top-K
             <input
               type="number"
-              value={Number(ragNodeModel.retrieval_top_k ?? 20)}
-              onChange={(event) => updateRagConfig("retrieval_top_k", Number(event.target.value))}
+              value={Number(retrievalNodeModel.retrieval_top_k ?? 20)}
+              onChange={(event) => updateRetrievalConfig("retrieval_top_k", Number(event.target.value))}
             />
           </label>
           <label>
-            返回 Top-N
-            <input
-              type="number"
-              value={Number(ragNodeModel.rerank_top_n ?? 5)}
-              onChange={(event) => updateRagConfig("rerank_top_n", Number(event.target.value))}
-            />
-          </label>
-        </div>
-        <label>
-          Rerank Provider
-          <select
-            value={String(ragNodeModel.rerank_provider ?? "passthrough")}
-            onChange={(event) => updateRagConfig("rerank_provider", event.target.value)}
-          >
-            {RERANK_PROVIDERS.map((provider) => (
-              <option key={provider} value={provider}>
-                {provider}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Rerank 凭据
-          <select
-            value={String(ragNodeModel.rerank_credential_id ?? "")}
-            onChange={(event) => updateRagConfig("rerank_credential_id", event.target.value)}
-          >
-            <option value="">未选择</option>
-            {credentials.map((credential) => (
-              <option key={credential.id} value={credential.id}>
-                {credential.name} · {credential.provider} · {credential.masked_api_key}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Rerank 模型
-          <input
-            placeholder="jina-reranker-v2 / rerank-multilingual-v3.0"
-            value={String(ragNodeModel.rerank_model ?? "")}
-            onChange={(event) => updateRagConfig("rerank_model", event.target.value)}
-          />
-        </label>
-        <label>
-          Rerank Base URL
-          <input
-            placeholder="默认使用 Jina / Cohere 官方地址"
-            value={String(ragNodeModel.rerank_base_url ?? "")}
-            onChange={(event) => updateRagConfig("rerank_base_url", event.target.value)}
-          />
-        </label>
-        <div className="sub-panel-title">Embedding</div>
-        <div className="grid-two">
-          <label>
-            提供方
+            Jina Rerank
             <select
-              value={String(ragNodeModel.embedding_provider ?? "")}
-              onChange={(event) => updateRagEmbeddingProvider(event.target.value)}
+              value={Boolean(retrievalNodeModel.rerank_enabled ?? false) ? "on" : "off"}
+              onChange={(event) => updateRetrievalConfig("rerank_enabled", event.target.value === "on")}
             >
-              {EMBEDDING_PROVIDERS.map((provider) => (
-                <option key={provider} value={provider}>
-                  {provider}
-                </option>
-              ))}
+              <option value="off">关闭</option>
+              <option value="on">开启</option>
             </select>
           </label>
-          <label>
-            维度
-            <input
-              type="number"
-              value={Number(ragNodeModel.embedding_dimension ?? 0)}
-              onChange={(event) => updateRagConfig("embedding_dimension", Number(event.target.value))}
-            />
-          </label>
         </div>
-        <label>
-          Embedding 模型
+        <label className="check">
           <input
-            value={String(ragNodeModel.embedding_model ?? "")}
-            onChange={(event) => updateRagConfig("embedding_model", event.target.value)}
+            type="checkbox"
+            checked={queryEnhancementEnabled}
+            onChange={(event) => updateRetrievalConfig("query_enhancement_enabled", event.target.checked)}
           />
+          <span>
+            <strong>Query Enhancement</strong>
+            <small>开启后必须配置独立的 Query LLM 凭据</small>
+          </span>
         </label>
-        <label>
-          Embedding 凭据
-          <select
-            value={String(ragNodeModel.embedding_credential_id ?? "")}
-            onChange={(event) => updateRagConfig("embedding_credential_id", event.target.value)}
-          >
-            <option value="">未选择</option>
-            {credentials.map((credential) => (
-              <option key={credential.id} value={credential.id}>
-                {credential.name} · {credential.provider} · {credential.masked_api_key}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Embedding Base URL
-          <input
-            value={String(ragNodeModel.embedding_base_url ?? "")}
-            onChange={(event) => updateRagConfig("embedding_base_url", event.target.value)}
-          />
-        </label>
-        <div className="grid-two">
-          <label>
-            Chunk Size
-            <input
-              type="number"
-              value={Number(ragNodeModel.chunk_size ?? 512)}
-              onChange={(event) => updateRagConfig("chunk_size", Number(event.target.value))}
-            />
-          </label>
-          <label>
-            Overlap
-            <input
-              type="number"
-              value={Number(ragNodeModel.chunk_overlap ?? 64)}
-              onChange={(event) => updateRagConfig("chunk_overlap", Number(event.target.value))}
-            />
-          </label>
-        </div>
+        {queryEnhancementEnabled ? (
+          <>
+            <div className="notice">
+              Query Enhancement 使用创建者单独选择的 LLM API 和 key，不复用 Agent 节点模型配置。
+            </div>
+            <label>
+              策略
+              <select
+                value={String(retrievalNodeModel.query_enhancement_strategy ?? "rewrite")}
+                onChange={(event) => updateRetrievalConfig("query_enhancement_strategy", event.target.value)}
+              >
+                {QUERY_ENHANCEMENT_STRATEGIES.map((strategy) => (
+                  <option key={strategy} value={strategy}>
+                    {strategy}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="grid-two">
+              <label>
+                Query LLM Provider
+                <select
+                  value={String(retrievalNodeModel.query_llm_provider ?? "")}
+                  onChange={(event) => updateRetrievalQueryLlmProvider(event.target.value)}
+                >
+                  <option value="">选择</option>
+                  {QUERY_LLM_PROVIDERS.map((provider) => (
+                    <option key={provider} value={provider}>
+                      {provider}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Temperature
+                <input
+                  type="number"
+                  step="0.1"
+                  value={Number(retrievalNodeModel.query_llm_temperature ?? 0.2)}
+                  onChange={(event) => updateRetrievalConfig("query_llm_temperature", Number(event.target.value))}
+                />
+              </label>
+            </div>
+            <label>
+              Query LLM Model
+              <input
+                placeholder="gpt-4o-mini / deepseek-chat / qwen-plus"
+                value={String(retrievalNodeModel.query_llm_model ?? "")}
+                onChange={(event) => updateRetrievalConfig("query_llm_model", event.target.value)}
+              />
+            </label>
+            <label>
+              Query LLM Credential
+              <select
+                value={String(retrievalNodeModel.query_llm_credential_id ?? "")}
+                onChange={(event) => updateRetrievalConfig("query_llm_credential_id", event.target.value)}
+              >
+                <option value="">选择 API 凭据</option>
+                {credentials.map((credential) => (
+                  <option key={credential.id} value={credential.id}>
+                    {credential.name} · {credential.provider} · {credential.masked_api_key}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Query LLM Base URL
+              <input
+                placeholder="openai_compatible / vllm 必填"
+                value={String(retrievalNodeModel.query_llm_base_url ?? "")}
+                onChange={(event) => updateRetrievalConfig("query_llm_base_url", event.target.value)}
+              />
+            </label>
+          </>
+        ) : null}
       </>
     );
   }
 
   function renderAgentNodeSettings() {
-    if (!selectedApp) return null;
+    if (!selectedOwnedApp) return null;
     return (
       <>
         <label>
           模型提供方
           <select
             value={String(agentNodeModel.provider ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "provider", event.target.value))}
+            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "provider", event.target.value))}
           >
             <option value="">继承 App</option>
             {MODEL_PROVIDERS.map((provider) => (
@@ -799,16 +932,16 @@ function App() {
         <label>
           模型名称
           <input
-            placeholder={selectedApp.model_name}
+            placeholder={selectedOwnedApp.model_name}
             value={String(agentNodeModel.model_name ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "model_name", event.target.value))}
+            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "model_name", event.target.value))}
           />
         </label>
         <label>
           模型凭据
           <select
             value={String(agentNodeModel.credential_id ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "credential_id", event.target.value))}
+            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "credential_id", event.target.value))}
           >
             <option value="">继承 App</option>
             {credentials.map((credential) => (
@@ -821,9 +954,9 @@ function App() {
         <label>
           Base URL
           <input
-            placeholder={selectedApp.model_base_url || "https://api.openai.com/v1"}
+            placeholder={selectedOwnedApp.model_base_url || "https://api.openai.com/v1"}
             value={String(agentNodeModel.base_url ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "base_url", event.target.value))}
+            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "base_url", event.target.value))}
           />
         </label>
         <div className="grid-two">
@@ -831,18 +964,18 @@ function App() {
             温度
             <input
               type="number"
-              placeholder={String(selectedApp.temperature)}
+              placeholder={String(selectedOwnedApp.temperature)}
               value={String(agentNodeModel.temperature ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "temperature", event.target.value))}
+              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "temperature", event.target.value))}
             />
           </label>
           <label>
             Top P
             <input
               type="number"
-              placeholder={String(selectedApp.top_p)}
+              placeholder={String(selectedOwnedApp.top_p)}
               value={String(agentNodeModel.top_p ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "top_p", event.target.value))}
+              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "top_p", event.target.value))}
             />
           </label>
         </div>
@@ -850,19 +983,51 @@ function App() {
           Max Tokens
           <input
             type="number"
-            placeholder={String(selectedApp.max_tokens)}
+            placeholder={String(selectedOwnedApp.max_tokens)}
             value={String(agentNodeModel.max_tokens ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedApp, "max_tokens", event.target.value))}
+            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "max_tokens", event.target.value))}
+          />
+        </label>
+        <div className="sub-panel-title">Agent Context</div>
+        <div className="grid-two">
+          <label>
+            Context Window
+            <input
+              type="number"
+              placeholder="8192"
+              value={String(agentNodeModel.model_context_window ?? "")}
+              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "model_context_window", event.target.value))}
+            />
+          </label>
+          <label>
+            Safety
+            <input
+              type="number"
+              placeholder="400"
+              value={String(agentNodeModel.context_safety_margin ?? "")}
+              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "context_safety_margin", event.target.value))}
+            />
+          </label>
+        </div>
+        <label>
+          Reserved Output Tokens
+          <input
+            type="number"
+            placeholder="1024"
+            value={String(agentNodeModel.context_reserved_output_tokens ?? "")}
+            onChange={(event) =>
+              setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "context_reserved_output_tokens", event.target.value))
+            }
           />
         </label>
         <div className="sub-panel-title">App 默认模型</div>
         <label>
           模型提供方
           <select
-            value={selectedApp.model_provider}
+            value={selectedOwnedApp.model_provider}
             onChange={(event) => {
               const provider = event.target.value;
-              setSelectedApp({ ...selectedApp, model_provider: provider });
+              setSelectedApp({ ...selectedOwnedApp, model_provider: provider });
               setCredentialDraft({ ...credentialDraft, provider: defaultCredentialProvider(provider) });
             }}
           >
@@ -875,13 +1040,13 @@ function App() {
         </label>
         <label>
           模型名称
-          <input value={selectedApp.model_name} onChange={(event) => setSelectedApp({ ...selectedApp, model_name: event.target.value })} />
+          <input value={selectedOwnedApp.model_name} onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_name: event.target.value })} />
         </label>
         <label>
           模型凭据
           <select
-            value={selectedApp.model_credential_id}
-            onChange={(event) => setSelectedApp({ ...selectedApp, model_credential_id: event.target.value })}
+            value={selectedOwnedApp.model_credential_id}
+            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_credential_id: event.target.value })}
           >
             <option value="">未选择</option>
             {credentials.map((credential) => (
@@ -895,8 +1060,8 @@ function App() {
           Base URL
           <input
             placeholder="https://api.openai.com/v1"
-            value={selectedApp.model_base_url}
-            onChange={(event) => setSelectedApp({ ...selectedApp, model_base_url: event.target.value })}
+            value={selectedOwnedApp.model_base_url}
+            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_base_url: event.target.value })}
           />
         </label>
         <div className="grid-two">
@@ -904,16 +1069,16 @@ function App() {
             温度
             <input
               type="number"
-              value={selectedApp.temperature}
-              onChange={(event) => setSelectedApp({ ...selectedApp, temperature: Number(event.target.value) })}
+              value={selectedOwnedApp.temperature}
+              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, temperature: Number(event.target.value) })}
             />
           </label>
           <label>
             Top P
             <input
               type="number"
-              value={selectedApp.top_p}
-              onChange={(event) => setSelectedApp({ ...selectedApp, top_p: Number(event.target.value) })}
+              value={selectedOwnedApp.top_p}
+              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, top_p: Number(event.target.value) })}
             />
           </label>
         </div>
@@ -921,8 +1086,8 @@ function App() {
           Max Tokens
           <input
             type="number"
-            value={selectedApp.max_tokens}
-            onChange={(event) => setSelectedApp({ ...selectedApp, max_tokens: Number(event.target.value) })}
+            value={selectedOwnedApp.max_tokens}
+            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, max_tokens: Number(event.target.value) })}
           />
         </label>
         <div className="sub-panel-title">工具</div>
@@ -940,60 +1105,92 @@ function App() {
   }
 
   function renderSelectedNodeSettings() {
-    if (!selectedApp || !selectedWorkflowNode) return null;
+    if (!selectedOwnedApp || !selectedWorkflowNode) return null;
     const nodeIndex = workflowNodes.indexOf(selectedWorkflowNode);
     const title = getWorkflowNodeLabel(selectedWorkflowNode, Math.max(nodeIndex, 0));
     const id = getWorkflowNodeId(selectedWorkflowNode, Math.max(nodeIndex, 0));
-    const selectedIsRagNode = isRagNode(selectedWorkflowNode);
+    const selectedIsRetrievalNode = isRetrievalNode(selectedWorkflowNode);
     const isAgentNode = id === "agent" || selectedWorkflowNodeType === "agent" || selectedWorkflowNodeType === "react_agent";
     return (
       <section className="panel node-inspector">
         <div className="panel-title">
-          {renderWorkflowNodeIcon(selectedWorkflowNodeType)} {title} 节点
+          {renderWorkflowNodeIcon(selectedWorkflowNodeType)} {title}
         </div>
         <div className="node-meta">
           <span>{id}</span>
           <span>{selectedWorkflowNodeType}</span>
         </div>
-        {selectedIsRagNode ? renderRagNodeSettings() : null}
+        {selectedIsRetrievalNode ? renderRetrievalNodeSettings() : null}
         {isAgentNode ? renderAgentNodeSettings() : null}
-        {!selectedIsRagNode && !isAgentNode ? (
+        {!selectedIsRetrievalNode && !isAgentNode ? (
           <div className="readonly-node">
             <strong>{renderWorkflowNodeSummary(selectedWorkflowNode)}</strong>
-            <small>当前节点只从后端 workflow 定义展示，暂时没有可编辑配置。</small>
+            <small>当前节点只展示运行结构。</small>
           </div>
         ) : null}
       </section>
     );
   }
 
-  function renderPlaygroundRuntimeFiles() {
+  function renderCredentialPanel() {
+    if (!canEditSelectedApp) return null;
     return (
-      <div className="playground-rag-files">
-        <label className="upload upload-inline">
-          <FileUp size={16} />
-          上传会话文件
+      <section className="panel">
+        <div className="panel-title">
+          <KeyRound size={16} /> 模型凭据
+        </div>
+        <div className="grid-two">
+          <label>
+            提供方
+            <select value={credentialDraft.provider} onChange={(event) => setCredentialDraft({ ...credentialDraft, provider: event.target.value })}>
+              {CREDENTIAL_PROVIDERS.map((provider) => (
+                <option key={provider} value={provider}>
+                  {provider}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            名称
+            <input value={credentialDraft.name} onChange={(event) => setCredentialDraft({ ...credentialDraft, name: event.target.value })} />
+          </label>
+        </div>
+        <label>
+          API Key
           <input
-            type="file"
-            accept=".txt,.md,.py,.js,.jsx,.ts,.tsx,.java,.go,.json,.yaml,.yml,.csv,.html,.css,.pdf,.docx"
-            disabled={!selectedApp || !ragUploadEnabled || busy}
-            onChange={(event) => uploadRuntimeRagFile(event.target.files?.[0] ?? null)}
+            type="password"
+            value={credentialDraft.api_key}
+            onChange={(event) => setCredentialDraft({ ...credentialDraft, api_key: event.target.value })}
           />
         </label>
-        {runtimeKnowledgeDocuments.length ? (
-          <div className="runtime-doc-list">
-            {runtimeKnowledgeDocuments.map((document) => (
-              <div className="runtime-doc-item" key={document.id}>
-                <strong>{document.filename}</strong>
-                <span>
-                  {document.status}
-                  {document.error ? ` · ${document.error}` : ""}
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
-      </div>
+        <button className="secondary" disabled={!credentialDraft.api_key.trim()} onClick={createCredential}>
+          <Plus size={16} /> 新建凭据
+        </button>
+        <div className="credential-list">
+          {credentials.map((credential) => (
+            <div
+              className={
+                credential.id === selectedOwnedApp?.model_credential_id ||
+                credential.id === String(agentNodeModel.credential_id ?? "") ||
+                credential.id === String(retrievalNodeModel.query_llm_credential_id ?? "")
+                  ? "credential-item active"
+                  : "credential-item"
+              }
+              key={credential.id}
+            >
+              <span>
+                <strong>{credential.name}</strong>
+                <small>
+                  {credential.provider} · {credential.masked_api_key}
+                </small>
+              </span>
+              <button className="icon-button" title="删除凭据" onClick={() => deleteCredential(credential.id)}>
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
     );
   }
 
@@ -1021,7 +1218,7 @@ function App() {
             <Bot size={22} />
             <div>
               <h1>Dify-like</h1>
-              <p>AgentScope MVP Demo</p>
+              <p>知识库与检索节点工作台</p>
             </div>
           </div>
           <label>
@@ -1065,7 +1262,7 @@ function App() {
           <Bot size={22} />
           <div>
             <h1>Dify-like</h1>
-            <p>AgentScope MVP Demo</p>
+            <p>知识库与检索节点</p>
           </div>
         </div>
         <div className="session">
@@ -1078,9 +1275,10 @@ function App() {
           </button>
         </div>
         <button className="primary" onClick={createDemoApp}>
-          <Play size={16} /> 创建电商客服 Agent
+          <Play size={16} /> 创建应用
         </button>
         <div className="app-list">
+          <div className="app-section-title">我的应用</div>
           {apps.map((app) => (
             <button
               key={app.id}
@@ -1091,99 +1289,69 @@ function App() {
               <span>{app.status}</span>
             </button>
           ))}
+          <div className="app-section-title">已发布应用</div>
+          {publishedApps.map((app) => {
+            const ownedApp = apps.find((item) => item.id === app.id);
+            return (
+              <button
+                key={app.id}
+                className={selectedApp?.id === app.id ? "app-item active" : "app-item"}
+                onClick={() => selectApp(ownedApp ?? app)}
+              >
+                <strong>{app.name}</strong>
+                <span>{app.owned ? "我发布的" : "可使用"}</span>
+              </button>
+            );
+          })}
         </div>
       </aside>
 
       <section className="config">
         <header>
           <GitBranch size={18} />
-          <h2>Workflow 配置</h2>
+          <h2>{canEditSelectedApp ? "创建者配置" : "使用模式"}</h2>
         </header>
-
-        <section className="panel">
-          <div className="panel-title">
-            <KeyRound size={16} /> 模型凭据
-          </div>
-          <div className="grid-two">
-            <label>
-              提供方
-              <select
-                value={credentialDraft.provider}
-                onChange={(event) => setCredentialDraft({ ...credentialDraft, provider: event.target.value })}
-              >
-                {CREDENTIAL_PROVIDERS.map((provider) => (
-                  <option key={provider} value={provider}>
-                    {provider}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              名称
-              <input
-                value={credentialDraft.name}
-                onChange={(event) => setCredentialDraft({ ...credentialDraft, name: event.target.value })}
-              />
-            </label>
-          </div>
-          <label>
-            API Key
-            <input
-              type="password"
-              value={credentialDraft.api_key}
-              onChange={(event) => setCredentialDraft({ ...credentialDraft, api_key: event.target.value })}
-            />
-          </label>
-          <button className="secondary" disabled={!credentialDraft.api_key.trim()} onClick={createCredential}>
-            <Plus size={16} /> 新建凭据
-          </button>
-          <div className="credential-list">
-            {credentials.map((credential) => (
-              <div
-                className={
-                  credential.id === selectedApp?.model_credential_id ||
-                  credential.id === String(agentNodeModel.credential_id ?? "")
-                    ? "credential-item active"
-                    : "credential-item"
-                }
-                key={credential.id}
-              >
-                <span>
-                  <strong>{credential.name}</strong>
-                  <small>
-                    {credential.provider} · {credential.masked_api_key}
-                  </small>
-                </span>
-                <button className="icon-button" title="删除凭据" onClick={() => deleteCredential(credential.id)}>
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        {selectedApp ? (
+        {statusMessage ? <div className="notice">{statusMessage}</div> : null}
+        {canEditSelectedApp ? (
           <>
+            {renderKnowledgeDatabasePanel()}
+            {renderCredentialPanel()}
             {renderAppSettings()}
             {renderWorkflowCanvas()}
             {renderSelectedNodeSettings()}
-            <button className="secondary" onClick={saveConfig}>
-              <Save size={16} /> 保存配置
-            </button>
+            <div className="actions-row">
+              <button className="secondary inline-button" onClick={saveConfig}>
+                <Save size={16} /> 保存
+              </button>
+              {selectedOwnedApp?.status === "published" ? (
+                <button className="secondary inline-button" onClick={unpublishSelectedApp}>
+                  取消发布
+                </button>
+              ) : (
+                <button className="secondary inline-button" onClick={publishSelectedApp}>
+                  发布
+                </button>
+              )}
+            </div>
           </>
         ) : (
-          <p className="empty">先创建一个 Agent 应用。</p>
+          <section className="panel">
+            <div className="panel-title">
+              <MessageSquare size={16} /> 只读使用
+            </div>
+            <p className="empty">你可以对已发布应用提问，不能修改节点、知识库、工具或凭据。</p>
+          </section>
         )}
       </section>
 
       <section className="chat">
         <header>
           <MessageSquare size={18} />
-          <h2>Playground</h2>
+          <h2>Chat</h2>
         </header>
         <div className="messages">
           {messages.length === 0 ? (
-            <div className="empty">试试知识库问答、订单查询或工具调用。</div>
+            <div className="empty">选择一个应用后开始提问。</div>
           ) : (
             messages.map((message, index) => (
               <div key={`${message.role}-${index}`} className={`message ${message.role}`}>
@@ -1192,7 +1360,6 @@ function App() {
             ))
           )}
         </div>
-        {renderPlaygroundRuntimeFiles()}
         <div className="composer">
           <input
             value={input}
@@ -1216,15 +1383,17 @@ function App() {
           <div className="panel-title">当前 Trace</div>
           <pre>{trace.length ? JSON.stringify(trace, null, 2) : "暂无 trace"}</pre>
         </section>
-        <section className="panel">
-          <div className="panel-title">最近 Runs</div>
-          {runs.map((run) => (
-            <div className="run" key={run.id}>
-              <strong>{run.status}</strong>
-              <span>{run.latency_ms} ms</span>
-            </div>
-          ))}
-        </section>
+        {canEditSelectedApp ? (
+          <section className="panel">
+            <div className="panel-title">最近 Runs</div>
+            {runs.map((run) => (
+              <div className="run" key={run.id}>
+                <strong>{run.status}</strong>
+                <span>{run.latency_ms} ms</span>
+              </div>
+            ))}
+          </section>
+        ) : null}
       </aside>
     </main>
   );
