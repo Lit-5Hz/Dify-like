@@ -36,6 +36,7 @@ const MODEL_PROVIDERS = ["mock", "openai", "openai_compatible", "deepseek", "das
 const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "mock");
 const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
 const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
+const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
 
 type SelectedApp = AppItem | PublishedAppItem;
 
@@ -389,6 +390,31 @@ function App() {
       setKnowledgeDocuments([]);
     });
   }, [canEditSelectedApp, selectedKnowledgeBaseId]);
+
+  useEffect(() => {
+    if (!canEditSelectedApp || !selectedKnowledgeBaseId) return;
+    const hasProcessingDocument = knowledgeDocuments.some((document) =>
+      PROCESSING_DOCUMENT_STATUSES.has(String(document.status || "").toLowerCase()),
+    );
+    if (!hasProcessingDocument) return;
+
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      api
+        .listKnowledgeDocuments(selectedKnowledgeBaseId)
+        .then((documents) => {
+          if (!cancelled) setKnowledgeDocuments(documents);
+        })
+        .catch((error) => {
+          console.error(error);
+        });
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [canEditSelectedApp, knowledgeDocuments, selectedKnowledgeBaseId]);
 
   useEffect(() => {
     if (!selectedOwnedApp) return;
