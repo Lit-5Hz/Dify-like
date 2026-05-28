@@ -1,63 +1,86 @@
-from fastapi import APIRouter, Depends, HTTPException  # 导入路由器、依赖注入和异常类
-from sqlalchemy.orm import Session  # 导入 SQLAlchemy 的数据库会话类型
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
 from app.db.models import User
-from app.db.session import get_db  # 导入获取数据库会话的依赖函数
-from app.schemas import AppCreate, AppOut, AppUpdate  # 导入请求和响应的数据结构
-from app.services.app_service import create_app, delete_app, get_app, list_apps, update_app  # 导入应用服务层函数
+from app.db.session import get_db
+from app.schemas import AppCreate, AppOut, AppUpdate
+from app.services.app_service import (
+    create_app,
+    delete_app,
+    get_owned_app,
+    list_apps,
+    list_published_apps,
+    publish_app,
+    unpublish_app,
+    update_app,
+)
 
-router = APIRouter(prefix="/apps", tags=["apps"])  # 创建 /apps 路由分组
+router = APIRouter(tags=["apps"])
 
-"""
-前端点击“创建电商客服 Agent”
--> main.tsx 里的 createDemoApp()
--> api.createApp()
--> POST http://localhost:8000/api/apps
--> body 是 JSON.stringify({...})
--> 后端 FastAPI 自动解析成 payload: AppCreate
--> create_app(db, payload, current_user.id)
-"""
-@router.post("", response_model=AppOut)  # 创建应用接口，返回应用详情
-def create(
-    payload: AppCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
-):  # 接收创建参数，并注入数据库会话(接口的请求体按 AppCreate 的结构来解析)
+
+@router.post("/apps", response_model=AppOut)
+def create(payload: AppCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     try:
-        return create_app(db, payload, current_user.id)  # 调用服务层，把应用写入数据库
+        return create_app(db, payload, current_user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.get("", response_model=list[AppOut])  # 查询应用列表接口
-def list_all(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):  # 注入数据库会话
-    return list_apps(db, current_user.id)  # 从数据库中按创建时间倒序取出所有应用
+@router.get("/apps", response_model=list[AppOut])
+def list_owned(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return list_apps(db, current_user.id)
 
 
-@router.get("/{app_id}", response_model=AppOut)  # 根据 app_id 查询单个应用
-def get_one(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):  # 接收路径参数并注入数据库会话
-    app = get_app(db, app_id, current_user.id)  # 先去数据库里查这个应用是否存在
-    if not app:  # 如果查不到返回 404
+@router.get("/published-apps")
+def list_public(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    return list_published_apps(db, current_user.id)
+
+
+@router.get("/apps/{app_id}", response_model=AppOut)
+def get_one(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    app = get_owned_app(db, app_id, current_user.id)
+    if not app:
         raise HTTPException(status_code=404, detail="App not found")
     return app
 
 
-@router.patch("/{app_id}", response_model=AppOut)  # 局部更新某个应用
+@router.patch("/apps/{app_id}", response_model=AppOut)
 def update(
-    app_id: str, payload: AppUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
-):  # 接收更新内容和数据库会话
-    app = get_app(db, app_id, current_user.id)  # 先查应用
-    if not app:  # 如果不存在
-        raise HTTPException(status_code=404, detail="App not found")  # 返回 404
+    app_id: str,
+    payload: AppUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    app = get_owned_app(db, app_id, current_user.id)
+    if not app:
+        raise HTTPException(status_code=404, detail="App not found")
     try:
-        return update_app(db, app, payload, current_user.id)  # 调用服务层更新并保存
+        return update_app(db, app, payload, current_user.id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.delete("/{app_id}")  # 删除某个应用
-def delete(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):  # 接收 app_id 和数据库会话
-    app = get_app(db, app_id, current_user.id)  # 先确认应用存在
-    if not app:  # 如果不存在
-        raise HTTPException(status_code=404, detail="App not found")  # 返回 404
-    delete_app(db, app)  # 删除数据库中的应用
-    return {"ok": True}  # 返回一个简单的成功结果
+@router.delete("/apps/{app_id}")
+def delete(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    app = get_owned_app(db, app_id, current_user.id)
+    if not app:
+        raise HTTPException(status_code=404, detail="App not found")
+    delete_app(db, app)
+    return {"ok": True}
+
+
+@router.post("/apps/{app_id}/publish", response_model=AppOut)
+def publish(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    app = get_owned_app(db, app_id, current_user.id)
+    if not app:
+        raise HTTPException(status_code=404, detail="App not found")
+    return publish_app(db, app)
+
+
+@router.post("/apps/{app_id}/unpublish", response_model=AppOut)
+def unpublish(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    app = get_owned_app(db, app_id, current_user.id)
+    if not app:
+        raise HTTPException(status_code=404, detail="App not found")
+    return unpublish_app(db, app)

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.credential_crypto import decrypt_secret, encrypt_secret, mask_secret
-from app.db.models import App, KnowledgeBase, ModelCredential
+from app.db.models import App, ModelCredential
 from app.schemas import ModelCredentialCreate
 
 
@@ -58,7 +58,7 @@ def create_model_credential(db: Session, payload: ModelCredentialCreate, owner_u
 
 def delete_model_credential(db: Session, credential: ModelCredential) -> None:
     if is_model_credential_in_use(db, credential.id):
-        raise ValueError("This model credential is still referenced by one or more apps, nodes, or knowledge bases.")
+        raise ValueError("This model credential is still referenced by one or more apps or nodes.")
     db.delete(credential)
     db.commit()
 
@@ -86,8 +86,6 @@ def to_model_credential_out(credential: ModelCredential) -> dict[str, Any]:
 
 
 def is_model_credential_in_use(db: Session, credential_id: str) -> bool:
-    if db.scalar(select(KnowledgeBase).where(KnowledgeBase.embedding_credential_id == credential_id)):
-        return True
     for app in db.scalars(select(App)).all():
         if getattr(app, "model_credential_id", "") == credential_id:
             return True
@@ -111,8 +109,6 @@ def _workflow_uses_credential(workflow_spec: Any, credential_id: str) -> bool:
             model = {}
         if str(model.get("credential_id") or "").strip() == credential_id:
             return True
-        if str(node.get("rerank_credential_id") or "").strip() == credential_id:
-            return True
-        if str(node.get("embedding_credential_id") or "").strip() == credential_id:
+        if str(node.get("query_llm_credential_id") or "").strip() == credential_id:
             return True
     return False

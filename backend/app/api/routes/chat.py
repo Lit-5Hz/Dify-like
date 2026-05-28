@@ -6,7 +6,7 @@ from app.api.dependencies import get_current_user
 from app.db.models import User
 from app.db.session import get_db
 from app.schemas import ChatRequest, ChatResponse
-from app.services.app_service import get_app
+from app.services.app_service import get_chat_accessible_app
 from app.services.chat_service import (
     chat_once,
     chat_stream,
@@ -24,7 +24,7 @@ async def chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    app = get_app(db, app_id, current_user.id)
+    app = get_chat_accessible_app(db, app_id, current_user.id)
     if not app:
         raise HTTPException(status_code=404, detail="App not found")
     if payload.stream:
