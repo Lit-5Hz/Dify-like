@@ -6,26 +6,29 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.services.retrieval_defaults import DEFAULT_DENSE_TOP_K, DEFAULT_QUERY_LLM_TEMPERATURE
+
+
+DEFAULT_RETRIEVAL_NODE = {
+    "id": "retrieval",
+    "type": "retrieval",
+    "enabled": True,
+    "knowledge_base_ids": [],
+    "retrieval_top_k": DEFAULT_DENSE_TOP_K,
+    "rerank_enabled": False,
+    "query_enhancement_enabled": False,
+    "query_enhancement_strategy": "rewrite",
+    "query_llm_provider": "",
+    "query_llm_model": "",
+    "query_llm_credential_id": "",
+    "query_llm_base_url": "",
+    "query_llm_temperature": DEFAULT_QUERY_LLM_TEMPERATURE,
+}
 
 DEFAULT_WORKFLOW_SPEC = {
     "nodes": [
         {"id": "start", "type": "start"},
-        {
-            "id": "rag",
-            "type": "rag",
-            "enabled": True,
-            "retrieval_top_k": 20,
-            "rerank_provider": "passthrough",
-            "rerank_top_n": 5,
-            "embedding_provider": "",
-            "embedding_model": "",
-            "embedding_dimension": 0,
-            "embedding_credential_id": "",
-            "embedding_base_url": "",
-            "chunk_size": 512,
-            "chunk_overlap": 64,
-            "chunk_strategy": "auto",
-        },
+        deepcopy(DEFAULT_RETRIEVAL_NODE),
         {
             "id": "agent",
             "type": "react_agent",
@@ -33,26 +36,22 @@ DEFAULT_WORKFLOW_SPEC = {
         },
         {"id": "end", "type": "end"},
     ],
-    "edges": [["start", "rag"], ["rag", "agent"], ["agent", "end"]],
+    "edges": [["start", "retrieval"], ["retrieval", "agent"], ["agent", "end"]],
 }
 
 
 class AppCreate(BaseModel):
-    # 这是“创建 App 请求体”的数据结构，不是数据库对象本身。
-    # FastAPI 会根据它校验前端传来的 JSON，并在缺省字段时自动补上这里的默认值。
-    # 目前这些默认值是 MVP 阶段的创建页预设，用来快速生成一个可运行的 demo app。
-    # 等产品成熟后，默认值通常应来自前端模板、产品配置或创建向导，而不是长期硬编码在 schema 里。
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
-    system_prompt: str = "你是一个专业、耐心的电商客服智能体。"  # MVP 默认 prompt，后续可改成模板/配置驱动
-    model_provider: str = "mock"  # MVP 默认模型提供方，后续应由用户选择或从配置读取
-    model_name: str = "mock-react"  # MVP 默认模型名，后续应由用户选择或从配置读取
-    model_credential_id: str = ""  # 模型凭据引用；App 只保存凭据 id，不保存密钥本身
-    model_base_url: str = ""  # OpenAI-compatible / vLLM / DeepSeek 等服务的 base URL
-    temperature: int = 70  # MVP 默认采样参数；运行时会把 70 这类百分比值换算成 0.7
-    top_p: int = 100  # MVP 默认采样参数；运行时会把 100 换算成 1.0
-    max_tokens: int = 1024  # MVP 默认输出长度限制
-    workflow_spec: dict[str, Any] = Field(default_factory=lambda: deepcopy(DEFAULT_WORKFLOW_SPEC))  # MVP 默认 workflow，后续可改为模板或可视化编辑结果
+    system_prompt: str = "你是一个专业、耐心、简洁的智能体。"
+    model_provider: str = "mock"
+    model_name: str = "mock-react"
+    model_credential_id: str = ""
+    model_base_url: str = ""
+    temperature: int = 70
+    top_p: int = 100
+    max_tokens: int = 1024
+    workflow_spec: dict[str, Any] = Field(default_factory=lambda: deepcopy(DEFAULT_WORKFLOW_SPEC))
 
 
 class AppUpdate(BaseModel):
@@ -72,6 +71,7 @@ class AppUpdate(BaseModel):
 
 class AppOut(BaseModel):
     id: str
+    owner_user_id: str
     name: str
     description: str
     status: str
@@ -155,6 +155,16 @@ class ChatResponse(BaseModel):
     retrieved_chunks: list[dict[str, Any]]
 
 
+class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+
+
+class KnowledgeBaseUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+
+
 class KnowledgeBaseOut(BaseModel):
     id: str
     owner_user_id: str
@@ -193,12 +203,6 @@ class KnowledgeDocumentOut(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-class RuntimeKnowledgeDocumentUploadOut(BaseModel):
-    conversation_id: str
-    knowledge_base: KnowledgeBaseOut
-    document: KnowledgeDocumentOut
 
 
 class RunOut(BaseModel):

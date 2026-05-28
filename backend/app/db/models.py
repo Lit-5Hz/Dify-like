@@ -69,7 +69,7 @@ class KnowledgeBase(Base):
 
     id: Mapped[str] = uuid_pk()
     owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
-    scope: Mapped[str] = mapped_column(String(32), default="runtime", index=True)
+    scope: Mapped[str] = mapped_column(String(32), default="creator", index=True)
     app_id: Mapped[str] = mapped_column(String(120), default="", index=True)
     conversation_id: Mapped[str] = mapped_column(String(120), default="", index=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)

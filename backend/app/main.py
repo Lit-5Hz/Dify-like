@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import apps, auth, chat, model_credentials, rag, runs, tools
+from app.api.routes import apps, auth, chat, knowledge_bases, model_credentials, retrieval, runs, tools
 from app.core.config import get_settings
 from app.db.session import init_db
 
@@ -23,7 +23,8 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(model_credentials.router, prefix="/api")
 app.include_router(tools.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
-app.include_router(rag.router, prefix="/api")
+app.include_router(knowledge_bases.router, prefix="/api")
+app.include_router(retrieval.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")
 
 

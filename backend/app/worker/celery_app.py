@@ -10,8 +10,8 @@ celery_app = Celery("dify_like", broker=settings.redis_url, backend=settings.red
 app = celery_app
 
 
-@celery_app.task(name="rag.process_document")
+@celery_app.task(name="knowledge_database.process_document")
 def process_knowledge_document(document_id: str) -> None:
-    from app.services.rag_service import process_knowledge_document_sync
+    from app.services.knowledge_database_service import process_knowledge_document_sync
 
     process_knowledge_document_sync(document_id)
