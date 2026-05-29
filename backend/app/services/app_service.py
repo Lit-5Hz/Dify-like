@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db.models import App, AppTool, KnowledgeBase
 from app.schemas import AppCreate, AppUpdate, DEFAULT_RETRIEVAL_NODE, DEFAULT_WORKFLOW_SPEC
 from app.services.model_credential_service import get_model_credential
-from app.services.retrieval_defaults import DEFAULT_DENSE_TOP_K, DEFAULT_QUERY_LLM_TEMPERATURE
+from app.services.retrieval_defaults import DEFAULT_QUERY_LLM_TEMPERATURE, DEFAULT_RETRIEVAL_TOP_K
 
 
 LEGACY_NODE_TYPE = "".join(["r", "a", "g"])
@@ -191,7 +191,7 @@ def _normalize_retrieval_node(node: dict[str, Any]) -> dict[str, Any]:
         "type": "retrieval",
         "enabled": bool(next_node.get("enabled", True)),
         "knowledge_base_ids": knowledge_base_ids,
-        "retrieval_top_k": max(_to_int(next_node.get("retrieval_top_k"), DEFAULT_DENSE_TOP_K), 0),
+        "retrieval_top_k": max(_to_int(next_node.get("retrieval_top_k"), DEFAULT_RETRIEVAL_TOP_K), 0),
         "rerank_enabled": bool(next_node.get("rerank_enabled", False)),
         "query_enhancement_enabled": bool(next_node.get("query_enhancement_enabled", strategy != "none")),
         "query_enhancement_strategy": strategy if strategy in {"rewrite", "hyde", "multi_query"} else "rewrite",

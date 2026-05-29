@@ -8,7 +8,6 @@ import httpx
 from app.core.config import get_settings
 from app.db.models import KnowledgeBase
 from app.services.retrieval_defaults import (
-    DEFAULT_RERANK_TOP_N,
     JINA_FALLBACK_PROVIDER,
     JINA_RERANK_TIMEOUT,
 )
@@ -122,7 +121,7 @@ def rerank_chunks(
     query: str,
     chunks: list[dict[str, Any]],
     enabled: bool,
-    top_n: int = DEFAULT_RERANK_TOP_N,
+    top_n: int,
 ) -> tuple[list[dict[str, Any]], str, list[str]]:
     warnings: list[str] = []
     if not enabled:

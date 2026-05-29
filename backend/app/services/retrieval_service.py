@@ -16,14 +16,20 @@ from app.services.knowledge_database_service import _assert_embedding_config_not
 from app.services.model_credential_service import resolve_model_api_key
 from app.services.qdrant_service import ensure_collection, search_knowledge_chunks, search_sparse_knowledge_chunks
 from app.services.retrieval_defaults import (
-    DEFAULT_DENSE_TOP_K,
+    DEFAULT_DENSE_CANDIDATE_TOP_K,
+    DEFAULT_DENSE_MIN_SCORE,
+    DEFAULT_FUSION_CANDIDATE_TOP_K,
+    DEFAULT_PER_KB_SAFETY_CAP,
     DEFAULT_QUERY_LLM_MAX_TOKENS,
     DEFAULT_QUERY_LLM_TEMPERATURE,
     DEFAULT_QUERY_LLM_TIMEOUT,
-    DEFAULT_RERANK_TOP_N,
     DEFAULT_RETRIEVAL_STRATEGY,
+    DEFAULT_RETRIEVAL_TOP_K,
+    DEFAULT_RRF_DENSE_WEIGHT,
     DEFAULT_RRF_K,
-    DEFAULT_SPARSE_TOP_K,
+    DEFAULT_RRF_SPARSE_WEIGHT,
+    DEFAULT_SPARSE_CANDIDATE_TOP_K,
+    DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
     QUERY_ENHANCEMENT_STRATEGIES,
 )
 from app.services.retrieval_providers import (
@@ -45,9 +51,18 @@ def get_capabilities() -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION,
         "retrieval_strategy": DEFAULT_RETRIEVAL_STRATEGY,
-        "dense_top_k": DEFAULT_DENSE_TOP_K,
-        "sparse_top_k": DEFAULT_SPARSE_TOP_K,
+        "default_retrieval_top_k": DEFAULT_RETRIEVAL_TOP_K,
+        "dense_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
+        "sparse_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+        "dense_candidate_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
+        "sparse_candidate_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+        "dense_min_score": DEFAULT_DENSE_MIN_SCORE,
+        "sparse_min_token_overlap": DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+        "rrf_dense_weight": DEFAULT_RRF_DENSE_WEIGHT,
+        "rrf_sparse_weight": DEFAULT_RRF_SPARSE_WEIGHT,
         "rrf_k": DEFAULT_RRF_K,
+        "per_kb_safety_cap": DEFAULT_PER_KB_SAFETY_CAP,
+        "fusion_candidate_top_k": DEFAULT_FUSION_CANDIDATE_TOP_K,
         "rerank_provider": "jina",
         "rerank_fallback": "passthrough",
         "query_enhancement_strategies": QUERY_ENHANCEMENT_STRATEGIES,
@@ -67,7 +82,7 @@ def retrieve_chunks(
     if not enabled:
         return {"chunks": [], "metadata": metadata}
 
-    top_k = max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_DENSE_TOP_K), 0)
+    top_k = max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_RETRIEVAL_TOP_K), 0)
     kb_ids = _normalize_kb_ids(retrieval_node.get("knowledge_base_ids"))
     metadata["knowledge_base_ids"] = kb_ids
     metadata["retrieval_top_k"] = top_k
@@ -85,38 +100,68 @@ def retrieve_chunks(
         metadata["retrieval_mode"] = "hybrid+passthrough"
         return {"chunks": [], "metadata": metadata}
 
-    dense_candidates: list[dict[str, Any]] = []
-    sparse_candidates: list[dict[str, Any]] = []
+    dense_raw_count = 0
+    sparse_raw_count = 0
+    dense_candidates_count = 0
+    sparse_candidates_count = 0
+    kb_ranked_lists: list[list[dict[str, Any]]] = []
+    query_terms = _tokenize_for_sparse(query_plan["standard_query"])
     for kb in knowledge_bases:
         _assert_embedding_config_not_drifted(kb)
         ensure_collection(kb)
         embedding_provider = build_embedding_provider(kb)
-        dense_candidates.extend(
-            _search_dense_candidates(
-                kb=kb,
-                embedding_provider=embedding_provider,
-                query_variants=query_plan["query_variants"],
-                top_k=top_k,
-            )
+        dense_raw = _search_dense_candidates(
+            kb=kb,
+            embedding_provider=embedding_provider,
+            query_variants=query_plan["query_variants"],
+            top_k=DEFAULT_DENSE_CANDIDATE_TOP_K,
         )
-        sparse_candidates.extend(
-            _search_sparse_candidates(
-                db=db,
-                kb=kb,
-                query=query_plan["standard_query"],
-                limit=DEFAULT_SPARSE_TOP_K,
-            )
+        sparse_raw = _search_sparse_candidates(
+            db=db,
+            kb=kb,
+            query=query_plan["standard_query"],
+            limit=DEFAULT_SPARSE_CANDIDATE_TOP_K,
         )
+        dense_raw_count += len(dense_raw)
+        sparse_raw_count += len(sparse_raw)
+        dense_candidates = _filter_dense_candidates(dense_raw, DEFAULT_DENSE_MIN_SCORE)
+        sparse_candidates = _filter_sparse_candidates(
+            sparse_raw,
+            query_terms,
+            DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+        )
+        dense_candidates_count += len(dense_candidates)
+        sparse_candidates_count += len(sparse_candidates)
+        local_fused = _weighted_rrf_channels(
+            [
+                {
+                    "name": "dense",
+                    "weight": DEFAULT_RRF_DENSE_WEIGHT,
+                    "chunks": dense_candidates,
+                },
+                {
+                    "name": "sparse",
+                    "weight": DEFAULT_RRF_SPARSE_WEIGHT,
+                    "chunks": sparse_candidates,
+                },
+            ],
+            limit=DEFAULT_PER_KB_SAFETY_CAP,
+            rrf_k=DEFAULT_RRF_K,
+        )
+        if local_fused:
+            kb_ranked_lists.append(local_fused)
 
     fused = _rrf_fuse(
-        [_dedupe_ranked_chunks(dense_candidates, top_k), _dedupe_ranked_chunks(sparse_candidates, DEFAULT_SPARSE_TOP_K)],
-        top_k,
+        kb_ranked_lists,
+        DEFAULT_FUSION_CANDIDATE_TOP_K,
         DEFAULT_RRF_K,
     )
+    for chunk in fused:
+        chunk["global_rrf_score"] = float(chunk.get("score", 0.0) or 0.0)
     expanded = _expand_parent_chunks(db, knowledge_bases, fused)
 
     rerank_enabled = bool(retrieval_node.get("rerank_enabled", False))
-    rerank_top_n = DEFAULT_RERANK_TOP_N if rerank_enabled else top_k
+    rerank_top_n = top_k
     ranked, rerank_provider, rerank_warnings = rerank_chunks(
         query=query_plan["standard_query"],
         chunks=expanded,
@@ -126,11 +171,15 @@ def retrieve_chunks(
     metadata.update(
         {
             "retrieval_mode": "hybrid+jina_rerank" if rerank_provider == "jina" else "hybrid+passthrough",
-            "dense_retrieved": len(dense_candidates),
-            "sparse_retrieved": len(sparse_candidates),
+            "dense_retrieved": dense_candidates_count,
+            "sparse_retrieved": sparse_candidates_count,
+            "dense_raw_retrieved": dense_raw_count,
+            "sparse_raw_retrieved": sparse_raw_count,
+            "kb_ranked_lists": len(kb_ranked_lists),
             "total_retrieved": len(expanded),
             "total_returned": len(ranked),
             "rerank_enabled": rerank_enabled,
+            "rerank_top_n": rerank_top_n,
             "rerank_provider": rerank_provider,
             "warnings": [*metadata.get("warnings", []), *rerank_warnings],
         }
@@ -405,14 +454,27 @@ def _default_metadata(query: str, retrieval_node: dict[str, Any], query_plan: di
         "contract_version": CONTRACT_VERSION,
         "knowledge_base_ids": _normalize_kb_ids(retrieval_node.get("knowledge_base_ids")),
         "retrieval_mode": "disabled",
-        "retrieval_top_k": max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_DENSE_TOP_K), 0),
+        "retrieval_top_k": max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_RETRIEVAL_TOP_K), 0),
         "dense_retrieved": 0,
         "sparse_retrieved": 0,
-        "sparse_top_k": DEFAULT_SPARSE_TOP_K,
+        "dense_raw_retrieved": 0,
+        "sparse_raw_retrieved": 0,
+        "dense_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
+        "sparse_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+        "dense_candidate_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
+        "sparse_candidate_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+        "dense_min_score": DEFAULT_DENSE_MIN_SCORE,
+        "sparse_min_token_overlap": DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+        "rrf_dense_weight": DEFAULT_RRF_DENSE_WEIGHT,
+        "rrf_sparse_weight": DEFAULT_RRF_SPARSE_WEIGHT,
         "rrf_k": DEFAULT_RRF_K,
+        "per_kb_safety_cap": DEFAULT_PER_KB_SAFETY_CAP,
+        "fusion_candidate_top_k": DEFAULT_FUSION_CANDIDATE_TOP_K,
+        "kb_ranked_lists": 0,
         "total_retrieved": 0,
         "total_returned": 0,
         "rerank_enabled": bool(retrieval_node.get("rerank_enabled", False)),
+        "rerank_top_n": max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_RETRIEVAL_TOP_K), 0),
         "rerank_provider": "passthrough",
         "original_query": query_plan["original_query"] or query,
         "standard_query": query_plan["standard_query"],
@@ -478,6 +540,46 @@ def _search_sparse_candidates(db: Session, kb: KnowledgeBase, query: str, limit:
     scores = _lexical_scores(query_terms, chunks)
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [_chunk_to_candidate(chunk, score, "sparse_local", kb) for chunk, score in ranked[:limit] if score > 0]
+
+
+def _filter_dense_candidates(chunks: list[dict[str, Any]], min_score: float) -> list[dict[str, Any]]:
+    if min_score <= 0:
+        return chunks
+    return [chunk for chunk in chunks if _dense_original_score(chunk) >= min_score]
+
+
+def _dense_original_score(chunk: dict[str, Any]) -> float:
+    scores = dict(chunk.get("scores") or {})
+    if "dense" in scores:
+        return _to_float(scores.get("dense"), 0.0)
+    if str(chunk.get("retrieval_source") or "") == "dense":
+        return _to_float(chunk.get("score"), 0.0)
+    return 0.0
+
+
+def _filter_sparse_candidates(
+    chunks: list[dict[str, Any]],
+    query_terms: list[str],
+    min_token_overlap: int,
+) -> list[dict[str, Any]]:
+    if min_token_overlap <= 0:
+        return chunks
+    filtered: list[dict[str, Any]] = []
+    for chunk in chunks:
+        overlap = _token_overlap_count(query_terms, str(chunk.get("content") or ""))
+        if overlap < min_token_overlap:
+            continue
+        next_chunk = dict(chunk)
+        next_chunk["sparse_token_overlap"] = overlap
+        filtered.append(next_chunk)
+    return filtered
+
+
+def _token_overlap_count(query_terms: list[str], text: str) -> int:
+    query_tokens = set(query_terms)
+    if not query_tokens:
+        return 0
+    return len(query_tokens.intersection(_tokenize_for_sparse(text)))
 
 
 def _is_retrievable_chunk(chunk: KnowledgeChunk) -> bool:
@@ -600,6 +702,49 @@ def _dedupe_ranked_chunks(chunks: list[dict[str, Any]], limit: int) -> list[dict
     return ranked[: max(limit, 0)]
 
 
+def _weighted_rrf_channels(channels: list[dict[str, Any]], limit: int, rrf_k: int) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    for channel in channels:
+        name = str(channel.get("name") or "unknown")
+        weight = _to_float(channel.get("weight"), 1.0)
+        ranked_list = channel.get("chunks")
+        if not isinstance(ranked_list, list) or weight <= 0:
+            continue
+        for rank, chunk in enumerate(ranked_list, start=1):
+            if not isinstance(chunk, dict):
+                continue
+            key = str(chunk.get("chunk_id") or chunk.get("content") or "")
+            if not key:
+                continue
+            rrf_score = weight * (1.0 / (rrf_k + rank))
+            current = fused.get(key)
+            if not current:
+                current = dict(chunk)
+                current["score"] = 0.0
+                current["scores"] = dict(chunk.get("scores") or {})
+                current["retrieval_source"] = "hybrid_local"
+                fused[key] = current
+            current["score"] = float(current.get("score", 0.0) or 0.0) + rrf_score
+            channel_scores = dict(current.get("scores") or {})
+            for score_name, score_value in dict(chunk.get("scores") or {}).items():
+                channel_scores[str(score_name)] = max(
+                    _to_float(channel_scores.get(str(score_name)), 0.0),
+                    _to_float(score_value, 0.0),
+                )
+            rrf_channel_scores = dict(current.get("rrf_channel_scores") or {})
+            rrf_channel_scores[name] = max(
+                _to_float(rrf_channel_scores.get(name), 0.0),
+                rrf_score,
+            )
+            current["scores"] = channel_scores
+            current["rrf_channel_scores"] = rrf_channel_scores
+
+    ranked = sorted(fused.values(), key=lambda item: float(item.get("score", 0.0) or 0.0), reverse=True)
+    for chunk in ranked:
+        chunk["local_rrf_score"] = float(chunk.get("score", 0.0) or 0.0)
+    return ranked[: max(limit, 0)]
+
+
 def _rrf_fuse(ranked_lists: list[list[dict[str, Any]]], limit: int, rrf_k: int) -> list[dict[str, Any]]:
     fused: dict[str, dict[str, Any]] = {}
     for ranked_list in ranked_lists:
@@ -660,6 +805,10 @@ def _expand_parent_chunks(
             child_id = str(chunk.get("chunk_id") or "")
             if current:
                 current["score"] = max(float(current.get("score", 0.0) or 0.0), float(chunk.get("score", 0.0) or 0.0))
+                current["global_rrf_score"] = max(
+                    float(current.get("global_rrf_score", 0.0) or 0.0),
+                    float(chunk.get("global_rrf_score", 0.0) or 0.0),
+                )
                 current.setdefault("matched_child_chunk_ids", [])
                 if child_id and child_id not in current["matched_child_chunk_ids"]:
                     current["matched_child_chunk_ids"].append(child_id)

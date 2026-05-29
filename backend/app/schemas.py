@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.services.retrieval_defaults import DEFAULT_DENSE_TOP_K, DEFAULT_QUERY_LLM_TEMPERATURE
+from app.services.retrieval_defaults import DEFAULT_QUERY_LLM_TEMPERATURE, DEFAULT_RETRIEVAL_TOP_K
 
 
 DEFAULT_RETRIEVAL_NODE = {
@@ -14,7 +14,7 @@ DEFAULT_RETRIEVAL_NODE = {
     "type": "retrieval",
     "enabled": True,
     "knowledge_base_ids": [],
-    "retrieval_top_k": DEFAULT_DENSE_TOP_K,
+    "retrieval_top_k": DEFAULT_RETRIEVAL_TOP_K,
     "rerank_enabled": False,
     "query_enhancement_enabled": False,
     "query_enhancement_strategy": "rewrite",

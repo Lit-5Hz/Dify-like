@@ -9,6 +9,12 @@ from sqlalchemy.orm import Session
 
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
 from app.services.model_credential_service import resolve_model_api_key
+from app.services.retrieval_defaults import (
+    DEFAULT_FUSION_CANDIDATE_TOP_K,
+    DEFAULT_RETRIEVAL_TOP_K,
+    DEFAULT_RRF_K,
+    DEFAULT_SPARSE_CANDIDATE_TOP_K,
+)
 from app.services.retrieval_service import retrieve_chunks
 from app.services.run_log_service import add_step
 
@@ -79,14 +85,20 @@ class WorkflowExecutor:
                     "contract_version": "retrieval.v1",
                     "knowledge_base_ids": [],
                     "retrieval_mode": "disabled",
-                    "retrieval_top_k": int(node.get("retrieval_top_k", 20) or 20),
+                    "retrieval_top_k": int(
+                        node.get("retrieval_top_k", DEFAULT_RETRIEVAL_TOP_K) or DEFAULT_RETRIEVAL_TOP_K
+                    ),
                     "dense_retrieved": 0,
                     "sparse_retrieved": 0,
-                    "sparse_top_k": 20,
-                    "rrf_k": 60,
+                    "sparse_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+                    "rrf_k": DEFAULT_RRF_K,
+                    "fusion_candidate_top_k": DEFAULT_FUSION_CANDIDATE_TOP_K,
                     "total_retrieved": 0,
                     "total_returned": 0,
                     "rerank_enabled": False,
+                    "rerank_top_n": int(
+                        node.get("retrieval_top_k", DEFAULT_RETRIEVAL_TOP_K) or DEFAULT_RETRIEVAL_TOP_K
+                    ),
                     "rerank_provider": "passthrough",
                     "query_enhancement": {},
                     "warnings": [],
@@ -221,7 +233,12 @@ class WorkflowExecutor:
         if not nodes:
             return [
                 {"id": "start", "type": "start"},
-                {"id": "retrieval", "type": "retrieval", "enabled": True, "retrieval_top_k": 20},
+                {
+                    "id": "retrieval",
+                    "type": "retrieval",
+                    "enabled": True,
+                    "retrieval_top_k": DEFAULT_RETRIEVAL_TOP_K,
+                },
                 {"id": "agent", "type": "react_agent", "model": {}},
                 {"id": "end", "type": "end"},
             ]
