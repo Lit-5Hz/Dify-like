@@ -105,6 +105,14 @@ python -m pip install -e .
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
+启动 Celery worker：
+
+```
+cd F:\my_folder\Work\LLM\Project\Dify-like\backend
+conda activate dify
+celery -A app.worker.celery_app worker --loglevel=info --pool=solo
+```
+
 健康检查：
 
 ```text
