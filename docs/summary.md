@@ -3,42 +3,40 @@
 ## 一、数据库表关系
 
 ```
-User ───1:N──→ ModelCredential            owner_user_id FK → users.id
+User ───1:N──→ ModelCredential              owner_user_id → users.id
 
-User ───1:N──→ App                         owner_user_id FK → apps.id
+User ───1:N──→ App                          owner_user_id → users.id
                  │
-                 ├──1:N──→ AppTool          app_id FK → apps.id
+                 ├──1:N──→ AppTool           app_id FK → apps.id
                  │
-                 ├──1:N──→ Document         app_id FK → apps.id
+                 ├──1:N──→ Conversation      app_id FK → apps.id
                  │            │
-                 │            └──1:N──→ DocumentChunk   document_id FK → documents.id
+                 │            └──1:N──→ Message          conversation_id FK → conversations.id
                  │
-                 └──1:N──→ Conversation     app_id FK → apps.id
+                 └──1:N──→ Run               app_id FK → apps.id
+                              │               conversation_id FK → conversations.id
+                              │               input_message_id → messages.id
+                              │               output_message_id → messages.id
                               │
-                              ├──1:N──→ Message         conversation_id FK → conversations.id
-                              │
-                              └──1:N──→ Run             conversation_id FK → conversations.id
-                                          │               app_id FK → apps.id
-                                          │               input_message_id FK → messages.id
-                                          │               output_message_id FK → messages.id
-                                          │
-                                          └──1:N──→ RunStep  run_id FK → runs.id
+                              └──1:N──→ RunStep           run_id FK → runs.id
+
+
+User ───1:N──→ KnowledgeBase                owner_user_id → users.id
+                 │
+                 ├──1:N──→ KnowledgeDocument knowledge_base_id FK → knowledge_bases.id
+                 │            │
+                 │            └──1:N──→ KnowledgeChunk    document_id FK → knowledge_documents.id
+                 │
+                 └──1:N──→ KnowledgeChunk    knowledge_base_id FK → knowledge_bases.id
+
 ```
 
 ### 表间关系说明
 
-- **User → App**：一个用户拥有多个应用。
-- **User → ModelCredential**：一个用户持有多个加密的模型 API Key，按 provider 区分。
-- **App → AppTool**：一个应用启用哪些内置工具。
-- **App → Document → DocumentChunk**：一个应用上传多份文档，每份文档被切分成多个块。
-- **App → Conversation**：一个应用下有多段对话。
-- **Conversation → Message**：一段对话包含多条消息（user / assistant）。
-- **Conversation → Run**：一段对话中每条用户消息触发一次 Run（一次 workflow 执行）。
-- **Run → RunStep**：一次 Run 包含多个执行步骤（start → retrieval → tool_call → agent → end），即前端的 trace。
 - **Run 的双 FK**：Run 同时持有 `conversation_id` 和 `app_id`。`app_id` 虽然可以通过 `Run → Conversation → App` 间接拿到，但直接存储免去每次按 App 查 Run 时多 JOIN 一张表。
 - **Run 的 message FK**：`input_message_id` 指向触发本次执行的用户消息，`output_message_id` 指向本次执行产出的 assistant 消息，实现 Run 与具体 Message 的双向追溯。
 - **权限隔离**：Message 查询时 JOIN Conversation 校验 `user_id`，确保用户只能看到自己所属会话的消息。
-
+- **chunk**：因为 KnowledgeChunk 同时需要回答两个问题：这个 chunk 属于哪个文档？这个 chunk 属于哪个知识库？所以它同时保存了 knowledge_base_id 和 document_id
 ---
 
 ## 二、回调机制 — AgentScope 工具注册与执行链路
