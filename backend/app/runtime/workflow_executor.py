@@ -10,10 +10,16 @@ from sqlalchemy.orm import Session
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
 from app.services.model_credential_service import resolve_model_api_key
 from app.services.retrieval_defaults import (
+    DEFAULT_BM25_B,
+    DEFAULT_BM25_K1,
     DEFAULT_FUSION_CANDIDATE_TOP_K,
     DEFAULT_RETRIEVAL_TOP_K,
     DEFAULT_RRF_K,
     DEFAULT_SPARSE_CANDIDATE_TOP_K,
+    DEFAULT_SPARSE_MIN_SCORE,
+    DEFAULT_SPARSE_STOPWORDS_ENABLED,
+    DEFAULT_SPARSE_TOKENIZER,
+    DEFAULT_SPARSE_WEIGHTING,
 )
 from app.services.retrieval_service import retrieve_chunks
 from app.services.run_log_service import add_step
@@ -91,6 +97,12 @@ class WorkflowExecutor:
                     "dense_retrieved": 0,
                     "sparse_retrieved": 0,
                     "sparse_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
+                    "sparse_min_score": DEFAULT_SPARSE_MIN_SCORE,
+                    "sparse_weighting": DEFAULT_SPARSE_WEIGHTING,
+                    "sparse_tokenizer": DEFAULT_SPARSE_TOKENIZER,
+                    "sparse_stopwords_enabled": DEFAULT_SPARSE_STOPWORDS_ENABLED,
+                    "bm25_k1": DEFAULT_BM25_K1,
+                    "bm25_b": DEFAULT_BM25_B,
                     "rrf_k": DEFAULT_RRF_K,
                     "fusion_candidate_top_k": DEFAULT_FUSION_CANDIDATE_TOP_K,
                     "total_retrieved": 0,

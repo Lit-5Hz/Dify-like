@@ -22,6 +22,8 @@ dependencies = [
   "python-docx>=1.1.2",
   "langchain-text-splitters>=0.3.0",
   "tiktoken>=0.7.0",
+  "jieba>=0.42.1",
+  "unstructured[pdf,docx,pptx,xlsx]>=0.18.0",
 ]
 
 [project.optional-dependencies]

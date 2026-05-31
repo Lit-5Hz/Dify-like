@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import math
 import re
-from collections import Counter
 from typing import Any
 
 import httpx
@@ -18,6 +15,8 @@ from app.services.qdrant_service import ensure_collection, search_knowledge_chun
 from app.services.retrieval_defaults import (
     DEFAULT_DENSE_CANDIDATE_TOP_K,
     DEFAULT_DENSE_MIN_SCORE,
+    DEFAULT_BM25_B,
+    DEFAULT_BM25_K1,
     DEFAULT_FUSION_CANDIDATE_TOP_K,
     DEFAULT_PER_KB_SAFETY_CAP,
     DEFAULT_QUERY_LLM_MAX_TOKENS,
@@ -29,7 +28,10 @@ from app.services.retrieval_defaults import (
     DEFAULT_RRF_K,
     DEFAULT_RRF_SPARSE_WEIGHT,
     DEFAULT_SPARSE_CANDIDATE_TOP_K,
-    DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+    DEFAULT_SPARSE_MIN_SCORE,
+    DEFAULT_SPARSE_STOPWORDS_ENABLED,
+    DEFAULT_SPARSE_TOKENIZER,
+    DEFAULT_SPARSE_WEIGHTING,
     QUERY_ENHANCEMENT_STRATEGIES,
 )
 from app.services.retrieval_providers import (
@@ -38,6 +40,7 @@ from app.services.retrieval_providers import (
     rerank_chunks,
     validate_embedding_dimensions,
 )
+from app.services.sparse_bm25 import bm25_query_sparse_vector, bm25_scores_for_contents, tokenize_for_sparse
 
 
 CONTRACT_VERSION = "retrieval.v1"
@@ -57,7 +60,12 @@ def get_capabilities() -> dict[str, Any]:
         "dense_candidate_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
         "sparse_candidate_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
         "dense_min_score": DEFAULT_DENSE_MIN_SCORE,
-        "sparse_min_token_overlap": DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+        "sparse_min_score": DEFAULT_SPARSE_MIN_SCORE,
+        "sparse_weighting": DEFAULT_SPARSE_WEIGHTING,
+        "sparse_tokenizer": DEFAULT_SPARSE_TOKENIZER,
+        "sparse_stopwords_enabled": DEFAULT_SPARSE_STOPWORDS_ENABLED,
+        "bm25_k1": DEFAULT_BM25_K1,
+        "bm25_b": DEFAULT_BM25_B,
         "rrf_dense_weight": DEFAULT_RRF_DENSE_WEIGHT,
         "rrf_sparse_weight": DEFAULT_RRF_SPARSE_WEIGHT,
         "rrf_k": DEFAULT_RRF_K,
@@ -105,7 +113,6 @@ def retrieve_chunks(
     dense_candidates_count = 0
     sparse_candidates_count = 0
     kb_ranked_lists: list[list[dict[str, Any]]] = []
-    query_terms = _tokenize_for_sparse(query_plan["standard_query"])
     for kb in knowledge_bases:
         _assert_embedding_config_not_drifted(kb)
         ensure_collection(kb)
@@ -125,11 +132,7 @@ def retrieve_chunks(
         dense_raw_count += len(dense_raw)
         sparse_raw_count += len(sparse_raw)
         dense_candidates = _filter_dense_candidates(dense_raw, DEFAULT_DENSE_MIN_SCORE)
-        sparse_candidates = _filter_sparse_candidates(
-            sparse_raw,
-            query_terms,
-            DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
-        )
+        sparse_candidates = _filter_sparse_candidates(sparse_raw, DEFAULT_SPARSE_MIN_SCORE)
         dense_candidates_count += len(dense_candidates)
         sparse_candidates_count += len(sparse_candidates)
         local_fused = _weighted_rrf_channels(
@@ -439,7 +442,7 @@ def _fallback_query_enhancement(strategy: str, standard_query: str) -> tuple[lis
         variants.append(hyde_query)
         generated.append({"type": "local_hyde", "query": hyde_query})
     elif strategy == "multi_query":
-        keyword_query = " ".join(_tokenize_for_sparse(standard_query)[:12])
+        keyword_query = " ".join(tokenize_for_sparse(standard_query)[:12])
         if keyword_query and keyword_query != standard_query:
             variants.append(keyword_query)
             generated.append({"type": "local_keyword", "query": keyword_query})
@@ -464,7 +467,12 @@ def _default_metadata(query: str, retrieval_node: dict[str, Any], query_plan: di
         "dense_candidate_top_k": DEFAULT_DENSE_CANDIDATE_TOP_K,
         "sparse_candidate_top_k": DEFAULT_SPARSE_CANDIDATE_TOP_K,
         "dense_min_score": DEFAULT_DENSE_MIN_SCORE,
-        "sparse_min_token_overlap": DEFAULT_SPARSE_MIN_TOKEN_OVERLAP,
+        "sparse_min_score": DEFAULT_SPARSE_MIN_SCORE,
+        "sparse_weighting": DEFAULT_SPARSE_WEIGHTING,
+        "sparse_tokenizer": DEFAULT_SPARSE_TOKENIZER,
+        "sparse_stopwords_enabled": DEFAULT_SPARSE_STOPWORDS_ENABLED,
+        "bm25_k1": DEFAULT_BM25_K1,
+        "bm25_b": DEFAULT_BM25_B,
         "rrf_dense_weight": DEFAULT_RRF_DENSE_WEIGHT,
         "rrf_sparse_weight": DEFAULT_RRF_SPARSE_WEIGHT,
         "rrf_k": DEFAULT_RRF_K,
@@ -518,10 +526,9 @@ def _search_dense_candidates(
 def _search_sparse_candidates(db: Session, kb: KnowledgeBase, query: str, limit: int) -> list[dict[str, Any]]:
     if limit <= 0:
         return []
-    query_terms = _tokenize_for_sparse(query)
-    if not query_terms:
+    if not tokenize_for_sparse(query):
         return []
-    sparse_vector = _sparse_vectorize(query)
+    sparse_vector = bm25_query_sparse_vector(query)
     try:
         raw_hits = search_sparse_knowledge_chunks(kb, sparse_vector, limit)
         if raw_hits:
@@ -537,7 +544,7 @@ def _search_sparse_candidates(db: Session, kb: KnowledgeBase, query: str, limit:
     if not chunks:
         return []
 
-    scores = _lexical_scores(query_terms, chunks)
+    scores = dict(zip(chunks, bm25_scores_for_contents(query, [chunk.content for chunk in chunks])))
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [_chunk_to_candidate(chunk, score, "sparse_local", kb) for chunk, score in ranked[:limit] if score > 0]
 
@@ -557,93 +564,23 @@ def _dense_original_score(chunk: dict[str, Any]) -> float:
     return 0.0
 
 
-def _filter_sparse_candidates(
-    chunks: list[dict[str, Any]],
-    query_terms: list[str],
-    min_token_overlap: int,
-) -> list[dict[str, Any]]:
-    if min_token_overlap <= 0:
-        return chunks
-    filtered: list[dict[str, Any]] = []
-    for chunk in chunks:
-        overlap = _token_overlap_count(query_terms, str(chunk.get("content") or ""))
-        if overlap < min_token_overlap:
-            continue
-        next_chunk = dict(chunk)
-        next_chunk["sparse_token_overlap"] = overlap
-        filtered.append(next_chunk)
-    return filtered
+def _filter_sparse_candidates(chunks: list[dict[str, Any]], min_score: float) -> list[dict[str, Any]]:
+    return [chunk for chunk in chunks if _sparse_original_score(chunk) > min_score]
 
 
-def _token_overlap_count(query_terms: list[str], text: str) -> int:
-    query_tokens = set(query_terms)
-    if not query_tokens:
-        return 0
-    return len(query_tokens.intersection(_tokenize_for_sparse(text)))
+def _sparse_original_score(chunk: dict[str, Any]) -> float:
+    scores = dict(chunk.get("scores") or {})
+    for name in ("sparse_qdrant", "sparse_local", "sparse"):
+        if name in scores:
+            return _to_float(scores.get(name), 0.0)
+    if str(chunk.get("retrieval_source") or "").startswith("sparse"):
+        return _to_float(chunk.get("score"), 0.0)
+    return 0.0
 
 
 def _is_retrievable_chunk(chunk: KnowledgeChunk) -> bool:
     metadata = dict(chunk.metadata_json or {})
     return metadata.get("chunk_type") != "parent" and bool(chunk.qdrant_point_id or chunk.content)
-
-
-def _lexical_scores(query_terms: list[str], chunks: list[KnowledgeChunk]) -> dict[KnowledgeChunk, float]:
-    tokenized_docs = {chunk: _tokenize_for_sparse(chunk.content) for chunk in chunks}
-    lengths = {chunk: len(tokens) for chunk, tokens in tokenized_docs.items()}
-    avg_length = sum(lengths.values()) / max(len(lengths), 1)
-    doc_count = len(chunks)
-    document_frequencies: dict[str, int] = {}
-    for tokens in tokenized_docs.values():
-        for token in set(tokens):
-            document_frequencies[token] = document_frequencies.get(token, 0) + 1
-
-    k1 = 1.5
-    b = 0.75
-    scores: dict[KnowledgeChunk, float] = {}
-    for chunk, tokens in tokenized_docs.items():
-        if not tokens:
-            scores[chunk] = 0.0
-            continue
-        score = 0.0
-        for term in query_terms:
-            frequency = tokens.count(term)
-            if not frequency:
-                continue
-            df = document_frequencies.get(term, 0)
-            idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
-            denominator = frequency + k1 * (1 - b + b * lengths[chunk] / max(avg_length, 1))
-            score += idf * (frequency * (k1 + 1) / denominator)
-        scores[chunk] = score
-    return scores
-
-
-def _tokenize_for_sparse(text: str) -> list[str]:
-    value = str(text or "").lower()
-    word_tokens = re.findall(r"[a-z0-9_]+", value)
-    cjk_tokens = re.findall(r"[\u4e00-\u9fff]", value)
-    return [*word_tokens, *cjk_tokens]
-
-
-def _sparse_vectorize(text: str) -> dict[str, list[int] | list[float]]:
-    tokens = _tokenize_for_sparse(text)
-    if not tokens:
-        return {"indices": [], "values": []}
-    counts = Counter(tokens)
-    pairs = sorted(
-        (_stable_sparse_token_id(token), 1.0 + math.log(float(count))) for token, count in counts.items()
-    )
-    merged: dict[int, float] = {}
-    for index, value in pairs:
-        merged[index] = merged.get(index, 0.0) + value
-    return {
-        "indices": list(merged.keys()),
-        "values": list(merged.values()),
-    }
-
-
-def _stable_sparse_token_id(token: str) -> int:
-    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big") & 0x7FFFFFFF
 
 
 def _chunk_to_candidate(chunk: KnowledgeChunk, score: float, source: str, kb: KnowledgeBase) -> dict[str, Any]:

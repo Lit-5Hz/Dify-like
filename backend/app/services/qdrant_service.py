@@ -103,6 +103,49 @@ def upsert_knowledge_chunks(
         client.upsert(collection_name=kb.qdrant_collection, points=legacy_points, wait=True)
 
 
+def update_knowledge_sparse_vectors(
+    kb: KnowledgeBase,
+    chunks: list[KnowledgeChunk],
+    sparse_vectors: list[dict[str, list[int] | list[float]]],
+) -> None:
+    if not chunks:
+        return
+    if len(chunks) != len(sparse_vectors):
+        raise ValueError(f"Sparse vector count mismatch: {len(chunks)} chunks, {len(sparse_vectors)} vectors.")
+    try:
+        from qdrant_client.http.models import PointVectors, SparseVector
+    except ImportError as exc:
+        raise RuntimeError("qdrant-client is not installed. Run `pip install -e .` in backend first.") from exc
+
+    client = get_qdrant_client()
+    points = []
+    empty_point_ids: list[str] = []
+    for chunk, sparse_payload in zip(chunks, sparse_vectors):
+        point_id = chunk.qdrant_point_id or chunk.id
+        indices = [int(index) for index in sparse_payload.get("indices", [])]
+        values = [float(value) for value in sparse_payload.get("values", [])]
+        if not indices:
+            empty_point_ids.append(point_id)
+            continue
+        points.append(
+            PointVectors(
+                id=point_id,
+                vector={
+                    SPARSE_VECTOR_NAME: SparseVector(indices=indices, values=values),
+                },
+            )
+        )
+    if points:
+        client.update_vectors(collection_name=kb.qdrant_collection, points=points, wait=True)
+    if empty_point_ids:
+        client.delete_vectors(
+            collection_name=kb.qdrant_collection,
+            vectors=[SPARSE_VECTOR_NAME],
+            points=empty_point_ids,
+            wait=True,
+        )
+
+
 def search_knowledge_chunks(kb: KnowledgeBase, query_vector: list[float], limit: int) -> list[dict[str, Any]]:
     if not query_vector or limit <= 0:
         return []
