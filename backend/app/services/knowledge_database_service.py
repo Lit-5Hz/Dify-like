@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
-import math
 import re
-from collections import Counter
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,13 +13,22 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import KnowledgeBase, KnowledgeChunk, KnowledgeDocument
+from app.db.models import App, KnowledgeBase, KnowledgeChunk, KnowledgeDocument
 from app.db.session import SessionLocal
 from app.schemas import KnowledgeBaseCreate, KnowledgeBaseUpdate
-from app.services.qdrant_service import delete_collection, delete_knowledge_points, ensure_collection, upsert_knowledge_chunks
+from app.services.qdrant_service import (
+    delete_collection,
+    delete_knowledge_points,
+    ensure_collection,
+    update_knowledge_sparse_vectors,
+    upsert_knowledge_chunks,
+)
 from app.services.retrieval_defaults import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_SPARSE_STOPWORDS_ENABLED,
+    DEFAULT_SPARSE_TOKENIZER,
+    DEFAULT_SPARSE_WEIGHTING,
     DEFAULT_PARENT_CHILD_ENABLED,
     DEFAULT_PARENT_CHUNK_OVERLAP,
     DEFAULT_PARENT_CHUNK_SIZE,
@@ -32,6 +38,7 @@ from app.services.retrieval_providers import (
     normalize_provider,
     validate_embedding_dimensions,
 )
+from app.services.sparse_bm25 import build_bm25_sparse_vectors
 
 
 DIRECT_TEXT_SUFFIXES = {
@@ -99,6 +106,9 @@ def create_knowledge_base(db: Session, payload: KnowledgeBaseCreate, owner_user_
             "parent_chunk_size": DEFAULT_PARENT_CHUNK_SIZE,
             "parent_chunk_overlap": DEFAULT_PARENT_CHUNK_OVERLAP,
             "qdrant_sparse_enabled": True,
+            "sparse_weighting": DEFAULT_SPARSE_WEIGHTING,
+            "sparse_tokenizer": DEFAULT_SPARSE_TOKENIZER,
+            "sparse_stopwords_enabled": DEFAULT_SPARSE_STOPWORDS_ENABLED,
         },
     )
     db.add(kb)
@@ -125,6 +135,7 @@ def delete_knowledge_base(db: Session, kb: KnowledgeBase) -> None:
         delete_collection(kb)
     except Exception:
         pass
+    _remove_knowledge_base_from_app_workflows(db, kb)
     db.delete(kb)
     db.commit()
 
@@ -184,6 +195,7 @@ def delete_knowledge_document(db: Session, kb: KnowledgeBase, document_id: str) 
         pass
     db.delete(document)
     db.commit()
+    _refresh_knowledge_sparse_vectors(db, kb)
     return True
 
 
@@ -253,7 +265,19 @@ def _process_knowledge_document(db: Session, document_id: str) -> None:
             chunk.qdrant_point_id = chunk.id
         db.flush()
         ensure_collection(kb)
-        upsert_knowledge_chunks(kb, chunks, vectors, [_sparse_vectorize(chunk.content) for chunk in chunks])
+        sparse_vectors_by_chunk_id = _build_sparse_vectors_by_chunk_id(db, kb)
+        upsert_knowledge_chunks(
+            kb,
+            chunks,
+            vectors,
+            [sparse_vectors_by_chunk_id.get(chunk.id, {"indices": [], "values": []}) for chunk in chunks],
+        )
+        _refresh_knowledge_sparse_vectors(
+            db,
+            kb,
+            skip_chunk_ids={chunk.id for chunk in chunks},
+            sparse_vectors_by_chunk_id=sparse_vectors_by_chunk_id,
+        )
 
         document.status = "ready"
         document.error = ""
@@ -263,6 +287,85 @@ def _process_knowledge_document(db: Session, document_id: str) -> None:
         document.status = "failed"
         document.error = str(exc)
         db.commit()
+
+
+def _build_sparse_vectors_by_chunk_id(
+    db: Session,
+    kb: KnowledgeBase,
+) -> dict[str, dict[str, list[int] | list[float]]]:
+    chunks = _list_sparse_index_chunks(db, kb)
+    sparse_vectors = build_bm25_sparse_vectors([chunk.content for chunk in chunks])
+    return {chunk.id: sparse_vector for chunk, sparse_vector in zip(chunks, sparse_vectors)}
+
+
+def _refresh_knowledge_sparse_vectors(
+    db: Session,
+    kb: KnowledgeBase,
+    skip_chunk_ids: set[str] | None = None,
+    sparse_vectors_by_chunk_id: dict[str, dict[str, list[int] | list[float]]] | None = None,
+) -> None:
+    chunks = _list_sparse_index_chunks(db, kb)
+    if not chunks:
+        return
+    skipped = skip_chunk_ids or set()
+    if sparse_vectors_by_chunk_id is None:
+        sparse_vectors_by_chunk_id = _build_sparse_vectors_by_chunk_id(db, kb)
+    refresh_chunks = [chunk for chunk in chunks if chunk.id not in skipped]
+    if not refresh_chunks:
+        return
+    update_knowledge_sparse_vectors(
+        kb,
+        refresh_chunks,
+        [sparse_vectors_by_chunk_id.get(chunk.id, {"indices": [], "values": []}) for chunk in refresh_chunks],
+    )
+
+
+def _remove_knowledge_base_from_app_workflows(db: Session, kb: KnowledgeBase) -> None:
+    apps = list(db.scalars(select(App).where(App.owner_user_id == kb.owner_user_id)))
+    for app in apps:
+        spec = dict(app.workflow_spec or {})
+        nodes = spec.get("nodes")
+        if not isinstance(nodes, list):
+            continue
+        changed = False
+        next_nodes: list[Any] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                next_nodes.append(node)
+                continue
+            next_node = dict(node)
+            ids = next_node.get("knowledge_base_ids")
+            if isinstance(ids, list):
+                next_ids = [str(item) for item in ids if str(item) != kb.id]
+                if next_ids != ids:
+                    next_node["knowledge_base_ids"] = next_ids
+                    changed = True
+            if str(next_node.get("kb_id") or "") == kb.id:
+                next_node.pop("kb_id", None)
+                changed = True
+            next_nodes.append(next_node)
+        if changed:
+            app.workflow_spec = {**spec, "nodes": next_nodes}
+
+
+def _list_sparse_index_chunks(db: Session, kb: KnowledgeBase) -> list[KnowledgeChunk]:
+    chunks = list(
+        db.scalars(
+            select(KnowledgeChunk)
+            .where(KnowledgeChunk.knowledge_base_id == kb.id)
+            .order_by(KnowledgeChunk.chunk_index.asc())
+        )
+    )
+    return [chunk for chunk in chunks if _is_sparse_indexable_chunk(chunk)]
+
+
+def _is_sparse_indexable_chunk(chunk: KnowledgeChunk) -> bool:
+    metadata = dict(chunk.metadata_json or {})
+    return (
+        metadata.get("chunk_type") != "parent"
+        and bool(str(chunk.content or "").strip())
+        and bool(chunk.qdrant_point_id)
+    )
 
 
 def _update_document_status(db: Session, document: KnowledgeDocument, status: str) -> None:
@@ -953,35 +1056,6 @@ def _fallback_split_text(text: str, chunk_size: int, chunk_overlap: int) -> list
             break
         start = max(end - overlap, start + 1)
     return chunks
-
-
-def _tokenize_for_sparse(text: str) -> list[str]:
-    value = str(text or "").lower()
-    word_tokens = re.findall(r"[a-z0-9_]+", value)
-    cjk_tokens = re.findall(r"[\u4e00-\u9fff]", value)
-    return [*word_tokens, *cjk_tokens]
-
-
-def _sparse_vectorize(text: str) -> dict[str, list[int] | list[float]]:
-    tokens = _tokenize_for_sparse(text)
-    if not tokens:
-        return {"indices": [], "values": []}
-    counts = Counter(tokens)
-    pairs = sorted(
-        (_stable_sparse_token_id(token), 1.0 + math.log(float(count))) for token, count in counts.items()
-    )
-    merged: dict[int, float] = {}
-    for index, value in pairs:
-        merged[index] = merged.get(index, 0.0) + value
-    return {
-        "indices": list(merged.keys()),
-        "values": list(merged.values()),
-    }
-
-
-def _stable_sparse_token_id(token: str) -> int:
-    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, "big") & 0x7FFFFFFF
 
 
 def _to_int(value: Any, default: int) -> int:
