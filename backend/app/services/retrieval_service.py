@@ -44,6 +44,7 @@ from app.services.sparse_bm25 import bm25_query_sparse_vector, bm25_scores_for_c
 
 
 CONTRACT_VERSION = "retrieval.v1"
+RETRIEVAL_STRATEGIES = {"dense", "sparse", "hybrid"}
 
 
 class QueryEnhancementConfigError(ValueError):
@@ -85,6 +86,7 @@ def retrieve_chunks(
     retrieval_node: dict[str, Any],
 ) -> dict[str, Any]:
     enabled = bool(retrieval_node.get("enabled", True))
+    retrieval_strategy = _normalize_retrieval_strategy(retrieval_node.get("retrieval_strategy"))
     query_plan = _build_query_plan(db, owner_user_id, query, retrieval_node)
     metadata = _default_metadata(query, retrieval_node, query_plan)
     if not enabled:
@@ -95,7 +97,7 @@ def retrieve_chunks(
     metadata["knowledge_base_ids"] = kb_ids
     metadata["retrieval_top_k"] = top_k
     if not kb_ids:
-        metadata["retrieval_mode"] = "hybrid+passthrough"
+        metadata["retrieval_mode"] = f"{retrieval_strategy}+passthrough"
         metadata["warnings"].append("No knowledge database is selected for this retrieval node.")
         return {"chunks": [], "metadata": metadata}
 
@@ -105,7 +107,7 @@ def retrieve_chunks(
     if missing_ids:
         metadata["warnings"].append(f"Some selected knowledge databases are missing or not owned by this app creator: {missing_ids}.")
     if not knowledge_bases:
-        metadata["retrieval_mode"] = "hybrid+passthrough"
+        metadata["retrieval_mode"] = f"{retrieval_strategy}+passthrough"
         return {"chunks": [], "metadata": metadata}
 
     dense_raw_count = 0
@@ -116,43 +118,52 @@ def retrieve_chunks(
     for kb in knowledge_bases:
         _assert_embedding_config_not_drifted(kb)
         ensure_collection(kb)
-        embedding_provider = build_embedding_provider(kb)
-        dense_raw = _search_dense_candidates(
-            kb=kb,
-            embedding_provider=embedding_provider,
-            query_variants=query_plan["query_variants"],
-            top_k=DEFAULT_DENSE_CANDIDATE_TOP_K,
-        )
-        sparse_raw = _search_sparse_candidates(
-            db=db,
-            kb=kb,
-            query=query_plan["standard_query"],
-            limit=DEFAULT_SPARSE_CANDIDATE_TOP_K,
-        )
+        dense_raw: list[dict[str, Any]] = []
+        sparse_raw: list[dict[str, Any]] = []
+        if retrieval_strategy in {"dense", "hybrid"}:
+            embedding_provider = build_embedding_provider(kb)
+            dense_raw = _search_dense_candidates(
+                kb=kb,
+                embedding_provider=embedding_provider,
+                query_variants=query_plan["query_variants"],
+                top_k=DEFAULT_DENSE_CANDIDATE_TOP_K,
+            )
+        if retrieval_strategy in {"sparse", "hybrid"}:
+            sparse_raw = _search_sparse_candidates(
+                db=db,
+                kb=kb,
+                query=query_plan["standard_query"],
+                limit=DEFAULT_SPARSE_CANDIDATE_TOP_K,
+            )
         dense_raw_count += len(dense_raw)
         sparse_raw_count += len(sparse_raw)
         dense_candidates = _filter_dense_candidates(dense_raw, DEFAULT_DENSE_MIN_SCORE)
         sparse_candidates = _filter_sparse_candidates(sparse_raw, DEFAULT_SPARSE_MIN_SCORE)
         dense_candidates_count += len(dense_candidates)
         sparse_candidates_count += len(sparse_candidates)
-        local_fused = _weighted_rrf_channels(
-            [
-                {
-                    "name": "dense",
-                    "weight": DEFAULT_RRF_DENSE_WEIGHT,
-                    "chunks": dense_candidates,
-                },
-                {
-                    "name": "sparse",
-                    "weight": DEFAULT_RRF_SPARSE_WEIGHT,
-                    "chunks": sparse_candidates,
-                },
-            ],
-            limit=DEFAULT_PER_KB_SAFETY_CAP,
-            rrf_k=DEFAULT_RRF_K,
-        )
-        if local_fused:
-            kb_ranked_lists.append(local_fused)
+        if retrieval_strategy == "dense":
+            local_ranked = _dedupe_ranked_chunks(dense_candidates, DEFAULT_PER_KB_SAFETY_CAP)
+        elif retrieval_strategy == "sparse":
+            local_ranked = _dedupe_ranked_chunks(sparse_candidates, DEFAULT_PER_KB_SAFETY_CAP)
+        else:
+            local_ranked = _weighted_rrf_channels(
+                [
+                    {
+                        "name": "dense",
+                        "weight": DEFAULT_RRF_DENSE_WEIGHT,
+                        "chunks": dense_candidates,
+                    },
+                    {
+                        "name": "sparse",
+                        "weight": DEFAULT_RRF_SPARSE_WEIGHT,
+                        "chunks": sparse_candidates,
+                    },
+                ],
+                limit=DEFAULT_PER_KB_SAFETY_CAP,
+                rrf_k=DEFAULT_RRF_K,
+            )
+        if local_ranked:
+            kb_ranked_lists.append(local_ranked)
 
     fused = _rrf_fuse(
         kb_ranked_lists,
@@ -173,7 +184,7 @@ def retrieve_chunks(
     )
     metadata.update(
         {
-            "retrieval_mode": "hybrid+jina_rerank" if rerank_provider == "jina" else "hybrid+passthrough",
+            "retrieval_mode": f"{retrieval_strategy}+jina_rerank" if rerank_provider == "jina" else f"{retrieval_strategy}+passthrough",
             "dense_retrieved": dense_candidates_count,
             "sparse_retrieved": sparse_candidates_count,
             "dense_raw_retrieved": dense_raw_count,
@@ -202,6 +213,13 @@ def _normalize_kb_ids(value: Any) -> list[str]:
         if item and item not in normalized:
             normalized.append(item)
     return normalized
+
+
+def _normalize_retrieval_strategy(value: Any) -> str:
+    strategy = str(value or DEFAULT_RETRIEVAL_STRATEGY).strip().lower()
+    if strategy in RETRIEVAL_STRATEGIES:
+        return strategy
+    return DEFAULT_RETRIEVAL_STRATEGY
 
 
 def _load_knowledge_bases(db: Session, owner_user_id: str, kb_ids: list[str]) -> list[KnowledgeBase]:
@@ -453,9 +471,11 @@ def _fallback_query_enhancement(strategy: str, standard_query: str) -> tuple[lis
 
 
 def _default_metadata(query: str, retrieval_node: dict[str, Any], query_plan: dict[str, Any]) -> dict[str, Any]:
+    retrieval_strategy = _normalize_retrieval_strategy(retrieval_node.get("retrieval_strategy"))
     return {
         "contract_version": CONTRACT_VERSION,
         "knowledge_base_ids": _normalize_kb_ids(retrieval_node.get("knowledge_base_ids")),
+        "retrieval_strategy": retrieval_strategy,
         "retrieval_mode": "disabled",
         "retrieval_top_k": max(_to_int(retrieval_node.get("retrieval_top_k"), DEFAULT_RETRIEVAL_TOP_K), 0),
         "dense_retrieved": 0,
