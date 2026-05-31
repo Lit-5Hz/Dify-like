@@ -188,6 +188,28 @@ function updateRetrievalNode(app: AppItem, key: keyof RetrievalNodeModel, value:
   };
 }
 
+function pruneRetrievalKnowledgeBaseIds(app: AppItem, knowledgeBases: KnowledgeBase[]): AppItem {
+  const validIds = new Set(knowledgeBases.map((item) => item.id));
+  const spec = app.workflow_spec ?? {};
+  const nextNodes = getWorkflowNodes(app).map((item) => {
+    if (!isRetrievalNode(item)) return item;
+    const ids = Array.isArray(item.knowledge_base_ids) ? item.knowledge_base_ids : [];
+    return {
+      ...item,
+      id: "retrieval",
+      type: "retrieval",
+      knowledge_base_ids: ids.map((id) => String(id)).filter((id) => validIds.has(id)),
+    };
+  });
+  return {
+    ...app,
+    workflow_spec: {
+      ...spec,
+      nodes: nextNodes,
+    },
+  };
+}
+
 function App() {
   const [user, setUser] = useState<UserItem | null>(null);
   const [authForm, setAuthForm] = useState({ email: "", password: "" });
@@ -460,10 +482,15 @@ function App() {
 
   async function saveConfig() {
     if (!selectedOwnedApp) return;
-    const updated = await api.updateApp(selectedOwnedApp.id, selectedOwnedApp);
-    await api.updateAppTools(updated.id, enabledToolNames);
-    await refresh(updated.id);
-    setStatusMessage("配置已保存。");
+    try {
+      const appToSave = pruneRetrievalKnowledgeBaseIds(selectedOwnedApp, knowledgeBases);
+      const updated = await api.updateApp(appToSave.id, appToSave);
+      await api.updateAppTools(updated.id, enabledToolNames);
+      await refresh(updated.id);
+      setStatusMessage("配置已保存。");
+    } catch (error) {
+      setStatusMessage(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function publishSelectedApp() {
@@ -571,7 +598,10 @@ function App() {
   }
 
   function toggleKnowledgeBaseInNode(kbId: string) {
-    const currentIds = Array.isArray(retrievalNodeModel.knowledge_base_ids) ? retrievalNodeModel.knowledge_base_ids : [];
+    const validIds = new Set(knowledgeBases.map((item) => item.id));
+    const currentIds = Array.isArray(retrievalNodeModel.knowledge_base_ids)
+      ? retrievalNodeModel.knowledge_base_ids.filter((item) => validIds.has(item))
+      : [];
     const nextIds = currentIds.includes(kbId) ? currentIds.filter((item) => item !== kbId) : [...currentIds, kbId];
     updateRetrievalConfig("knowledge_base_ids", nextIds);
   }
@@ -803,7 +833,10 @@ function App() {
 
   function renderRetrievalNodeSettings() {
     const queryEnhancementEnabled = Boolean(retrievalNodeModel.query_enhancement_enabled ?? false);
-    const selectedIds = Array.isArray(retrievalNodeModel.knowledge_base_ids) ? retrievalNodeModel.knowledge_base_ids : [];
+    const validIds = new Set(knowledgeBases.map((item) => item.id));
+    const selectedIds = Array.isArray(retrievalNodeModel.knowledge_base_ids)
+      ? retrievalNodeModel.knowledge_base_ids.filter((item) => validIds.has(item))
+      : [];
     return (
       <>
         <label className="check">
