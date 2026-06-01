@@ -822,3 +822,680 @@ chat_stream 也不需要知道底层是哪个框架
 ```
 
 这就是 adapter 层的价值。
+
+---
+
+## 五、当前 Sparse 方案与完整检索流程
+
+这一节记录当前代码里的真实实现，主要对应：
+
+- `backend/app/services/retrieval_service.py`
+- `backend/app/services/retrieval_defaults.py`
+- `backend/app/services/sparse_bm25.py`
+- `backend/app/services/knowledge_database_service.py`
+- `backend/app/services/qdrant_service.py`
+
+### 1. Sparse 总体方案
+
+当前 sparse 采用后端固定的 BM25-like sparse vector 方案：
+
+```text
+BM25-like sparse vector
++ jieba 中文分词
++ 英文/数字正则 token
++ 内置停用词表
++ Qdrant native sparse index
++ Postgres 本地 BM25-like fallback
+```
+
+它走词项匹配路线，依赖本地 tokenizer、停用词表和 BM25-like 权重；文档侧 sparse vector 存入 Qdrant sparse index，检索侧用 query sparse vector 做词项匹配。
+
+当前固定默认值在 `retrieval_defaults.py`：
+
+```python
+DEFAULT_SPARSE_WEIGHTING = "bm25_like"
+DEFAULT_SPARSE_TOKENIZER = "jieba_v1"
+DEFAULT_SPARSE_STOPWORDS_ENABLED = True
+DEFAULT_BM25_K1 = 1.5
+DEFAULT_BM25_B = 0.75
+DEFAULT_SPARSE_MIN_SCORE = 0.0
+DEFAULT_SPARSE_CANDIDATE_TOP_K = 50
+DEFAULT_RRF_SPARSE_WEIGHT = 0.3
+```
+
+这些值是后端固定策略，不从 workflow retrieval node 暴露给用户配置。
+
+### 2. Sparse tokenization
+
+统一入口是 `tokenize_for_sparse(text)`。
+
+处理流程是：
+
+```text
+原始文本
+-> str(text or "").lower()
+-> 英文/数字/下划线：正则 [a-z0-9_]+ 提取
+-> 如果文本里有中文字符：jieba.lcut(value, HMM=True)
+-> token 两侧标点清理
+-> 过滤空 token
+-> 过滤内置中英文停用词
+-> 过滤不含英文、数字、下划线或中文字符的 token
+-> 返回 token list
+```
+
+英文、数字 token 会继续保留，例如代码文档里的 `postgres`、`qdrant`、`embedding_3`、`api` 这类词都可以进入 sparse。
+
+中文使用 `jieba.lcut(..., HMM=True)` 做词级切分。例如“数学建模课程总结”会尽量产生“数学建模 / 课程 / 总结”这类词级 token。
+
+### 3. 文档侧 BM25-like sparse vector
+
+文档入库时，只有可检索 chunk 参与 sparse index：
+
+```text
+chunk_type != "parent"
++ content 非空
++ chunk 有 qdrant_point_id
+```
+
+parent chunk 不参与 sparse index。parent-child 开启时，检索先命中 child/text chunk，后面再做 parent expansion。
+
+文档侧 sparse vector 的计算流程是：
+
+```text
+当前 KB 下所有可 sparse 检索 chunks
+-> 对每个 chunk 做 tokenize_for_sparse()
+-> 统计 KB 级 corpus stats:
+   - N: 文档/chunk 数
+   - df: 每个 token 出现在多少个 chunk 中
+   - avgdl: 平均 chunk token 长度
+-> 对每个 chunk 计算 BM25-like token 权重
+-> token 通过 blake2b 稳定 hash 成 Qdrant sparse index
+-> 写入 Qdrant sparse vector
+```
+
+文档侧权重公式是：
+
+```text
+idf = log(1 + (N - df + 0.5) / (df + 0.5))
+
+value =
+  idf * (tf * (k1 + 1))
+  / (tf + k1 * (1 - b + b * dl / avgdl))
+```
+
+其中：
+
+```text
+k1 = 1.5
+b = 0.75
+tf = 当前 token 在当前 chunk 中出现次数
+df = 当前 token 在多少个 chunk 中出现
+dl = 当前 chunk token 数
+avgdl = 当前 KB 下可检索 chunks 的平均 token 数
+N = 当前 KB 下可检索 chunks 总数
+```
+
+直观理解：
+
+```text
+idf       让稀有词更重要，高频泛词权重更低
+tf        让同一个词出现更多次时权重上升，但不是线性无限上升
+b / avgdl 负责长度归一化，避免长 chunk 因为词多天然占便宜
+```
+
+### 4. Query 侧 sparse vector
+
+sparse 查询入口固定为 `standard_query`。`query_variants` 留给 dense 路径使用。
+
+当前规则是：
+
+```text
+standard_query
+-> tokenize_for_sparse()
+-> token 去重
+-> 每个 query token 的 value 固定为 1.0
+-> token hash 成 Qdrant sparse indices
+-> 查 Qdrant sparse vector
+```
+
+这意味着：
+
+- rewrite 策略如果改写了 `standard_query`，会影响 sparse。
+- HyDE 生成的 hypothetical document 主要服务 dense 语义召回。
+- multi-query 生成的多个 query variants 主要服务 dense 多路召回。
+- sparse 保持一个明确、干净、词项稳定的 query。
+
+这样可以让 sparse 维持稳定的关键词检索语义，同时让 dense 承担更多语义扩展。
+
+### 5. Sparse 入库刷新机制
+
+BM25-like sparse 有一个重要工程点：新增/删除文档会改变当前 KB 的 `N / df / avgdl`，所以已有 chunk 的 sparse 权重也可能变化。
+
+当前新增文档成功处理时：
+
+```text
+解析文档
+-> 切 chunk
+-> 生成 dense embedding
+-> 给新 chunks 设置 qdrant_point_id
+-> 读取当前 KB 下所有可 sparse 检索 chunks
+-> 重新计算 KB 级 BM25 stats
+-> 新 chunks: upsert dense vector + BM25 sparse vector 到 Qdrant
+-> 已存在 chunks: 只刷新 Qdrant sparse vector，不重新 embedding
+-> document.status = ready
+```
+
+删除文档时：
+
+```text
+删除该文档对应 Qdrant points
+-> 删除 KnowledgeDocument / KnowledgeChunk 数据
+-> 基于剩余 chunks 重新计算 BM25 stats
+-> 刷新剩余 chunks 的 Qdrant sparse vector
+```
+
+所以 dense embedding 是按 chunk 内容生成的，新增/删除其他文档不会影响它；sparse BM25 权重依赖 KB 级统计量，所以需要刷新。
+
+### 6. Qdrant 中的向量结构
+
+Qdrant collection 优先使用 named vectors：
+
+```text
+dense  : cosine dense vector
+sparse : Qdrant sparse vector
+```
+
+创建 collection 时会尝试同时创建 dense 和 sparse index。如果当前 Qdrant 客户端或服务端不支持 sparse 配置，代码会降级创建 legacy dense collection。
+
+upsert chunk 时：
+
+```text
+payload = chunk metadata + content
+vector.dense = dense embedding
+vector.sparse = BM25-like sparse vector，前提是 sparse indices 非空
+```
+
+sparse 检索时调用 Qdrant：
+
+```text
+query_points(
+  query=SparseVector(indices=[...], values=[...]),
+  using="sparse",
+  limit=50,
+  with_payload=True,
+)
+```
+
+如果 Qdrant sparse 查询失败，或者没有返回结果，会走 Postgres 本地 fallback。
+
+### 7. Sparse fallback
+
+fallback 发生在 `_search_sparse_candidates()`：
+
+```text
+Qdrant sparse 返回结果
+-> 使用 Qdrant 结果
+
+Qdrant sparse 抛错或没有结果
+-> 从 Postgres 读取当前 KB 下 retrievable chunks
+-> 使用同一个 tokenize_for_sparse()
+-> 基于这些 chunks 临时计算 BM25 stats
+-> 计算 query 对每个 chunk 的 BM25-like score
+-> 按 score 降序取 top 50
+-> 只保留 score > 0 的结果
+```
+
+也就是说，Qdrant sparse 和本地 fallback 使用同一套 tokenizer、停用词和 BM25 参数。
+
+### 8. Sparse 分数过滤
+
+sparse 候选过滤基于原始 sparse 分数：
+
+```text
+DEFAULT_SPARSE_MIN_SCORE = 0.0
+只保留 sparse 原始分数 > 0.0 的候选
+```
+
+因此 retrieval trace 里应该看：
+
+```text
+sparse_weighting: "bm25_like"
+sparse_tokenizer: "jieba_v1"
+sparse_stopwords_enabled: true
+sparse_min_score: 0.0
+bm25_k1: 1.5
+bm25_b: 0.75
+```
+
+trace 中使用 `sparse_min_score` 表达当前过滤策略。
+
+### 9. 从 query 开始的完整检索路径
+
+当前 retrieval node 的主链路是：
+
+```text
+用户 query
+-> Query Enhancement
+-> 读取 retrieval node 选择的多个 KB
+-> 每个 KB 内分别召回 dense top 50 和 sparse top 50
+-> dense / sparse 原始分数过滤
+-> KB 内 dense/sparse Weighted RRF
+-> 每 KB safety cap 80
+-> 多 KB ranked lists 做全局 RRF
+-> 全局候选 top 50
+-> parent expansion
+-> 可选 Jina rerank
+-> retrieval.v1 chunks + metadata
+```
+
+更细一点：
+
+```text
+1. WorkflowExecutor 执行 retrieval node
+   -> 调用 retrieve_chunks(db, owner_user_id, query, retrieval_node)
+
+2. normalize retrieval strategy
+   -> 默认 hybrid
+   -> 可选 dense / sparse / hybrid
+
+3. build query plan
+   -> original_query = 用户原始输入
+   -> standard_query = 压缩空白后的 query
+   -> query_variants = [standard_query]
+
+   如果 query_enhancement_enabled:
+     - rewrite:
+       LLM 生成 1-3 个改写 query
+       standard_query = 第一个 rewrite
+       query_variants = 所有 rewrite
+
+     - hyde:
+       standard_query 保持原 query
+       query_variants = [standard_query, hypothetical_document]
+
+     - multi_query:
+       standard_query 保持原 query
+       query_variants = [standard_query, variant1, variant2, ...]
+
+   如果 Query Enhancement LLM 失败:
+     -> 降级到本地 fallback query expansion
+     -> metadata.warnings 记录降级原因
+
+4. 读取 retrieval_top_k
+   -> 默认 DEFAULT_RETRIEVAL_TOP_K = 20
+   -> 控制最终返回规模倾向
+   -> dense/sparse 原始召回池使用固定 candidate top_k
+   -> rerank_top_n = retrieval_top_k
+
+5. 读取 knowledge_base_ids
+   -> 没选 KB:
+      chunks = []
+      warnings += "No knowledge database is selected..."
+
+   -> 有 KB:
+      按 owner_user_id + scope=creator 校验
+      丢弃不存在或不属于当前 creator 的 KB
+
+6. 遍历每个 KB
+   -> 检查 embedding snapshot 是否漂移
+   -> ensure_collection(kb)
+
+7. KB 内 dense 召回
+   条件: retrieval_strategy in {"dense", "hybrid"}
+
+   对每个 query_variant:
+     -> embed_query(query_variant)
+     -> 校验 embedding dimension
+     -> Qdrant dense search top 50
+     -> 每个 hit 转成 chunk candidate
+        retrieval_source = "dense"
+        query_index = 当前 query variant 下标
+        scores.dense = Qdrant cosine score
+
+   如果只有一个 query_variant:
+     -> 按 chunk_id 去重，保留原始分数更高的
+
+   如果多个 query_variants:
+     -> 用通用 _rrf_fuse() 融合多个 dense ranked list
+     -> 这里是 dense 内部多 query variant 的 RRF
+
+8. KB 内 sparse 召回
+   条件: retrieval_strategy in {"sparse", "hybrid"}
+
+   使用 query_plan["standard_query"]；query_variants 留在 dense 路径。
+
+   standard_query
+   -> tokenize_for_sparse()
+   -> 空 token 直接返回 []
+   -> bm25_query_sparse_vector()
+      - token 去重
+      - value = 1.0
+      - token hash 成 sparse indices
+   -> Qdrant sparse search top 50
+   -> hit 转成 chunk candidate
+      retrieval_source = "sparse_qdrant"
+      scores.sparse_qdrant = Qdrant sparse score
+
+   如果 Qdrant sparse 失败或无结果:
+   -> Postgres local fallback
+   -> retrieval_source = "sparse_local"
+   -> scores.sparse_local = 本地 BM25-like score
+
+9. KB 内原始候选计数
+   -> dense_raw_retrieved += dense_raw 数量
+   -> sparse_raw_retrieved += sparse_raw 数量
+
+10. KB 内候选过滤
+    dense:
+      -> 使用原始 dense cosine
+      -> 优先读 scores["dense"]
+      -> 分数要求 >= DEFAULT_DENSE_MIN_SCORE
+      -> 当前 DEFAULT_DENSE_MIN_SCORE = 0.1
+
+    sparse:
+      -> 使用 sparse 原始分数
+      -> 优先读 scores["sparse_qdrant"] / scores["sparse_local"] / scores["sparse"]
+      -> 分数要求 > DEFAULT_SPARSE_MIN_SCORE
+      -> 当前 DEFAULT_SPARSE_MIN_SCORE = 0.0
+
+11. KB 内排序
+    如果 retrieval_strategy == "dense":
+      -> dense_candidates 去重后取 DEFAULT_PER_KB_SAFETY_CAP
+
+    如果 retrieval_strategy == "sparse":
+      -> sparse_candidates 去重后取 DEFAULT_PER_KB_SAFETY_CAP
+
+    如果 retrieval_strategy == "hybrid":
+      -> _weighted_rrf_channels()
+      -> dense channel weight = 1.0
+      -> sparse channel weight = 0.3
+      -> rrf_k = 60
+      -> 写入:
+         scores: 保留原始 dense / sparse 分数
+         rrf_channel_scores: dense/sparse 各自 RRF 贡献
+         local_rrf_score: KB 内融合分数
+         retrieval_source = "hybrid_local"
+      -> 最多保留 DEFAULT_PER_KB_SAFETY_CAP = 80
+
+12. 多 KB 全局融合
+    每个 KB 产出一个 local ranked list。
+
+    多个 KB 的 local ranked lists 交给通用 _rrf_fuse():
+      -> 不使用 KB 质量权重
+      -> 不强制每个 KB 都贡献结果
+      -> 只融合实际有结果的 KB ranked list
+      -> rrf_k = 60
+      -> 截断 DEFAULT_FUSION_CANDIDATE_TOP_K = 50
+      -> 写入 global_rrf_score
+
+13. parent expansion
+    如果 KB 没有 enable_parent_child:
+      -> child/text chunk 原样返回
+
+    如果 KB 开启 enable_parent_child:
+      -> 对命中的 child chunk 读取 parent_id
+      -> 从 Postgres 查询 parent chunk
+      -> 最终返回 parent.content
+      -> 保留匹配信息:
+         matched_chunk_id
+         matched_child_chunk_ids
+         matched_content
+      -> 多个 child 命中同一个 parent 时合并
+      -> parent 的 score/global_rrf_score 取命中 child 中较高值
+
+14. rerank
+    rerank_enabled 来自 retrieval node。
+
+    如果关闭:
+      -> passthrough
+      -> 按前面排序直接截断 top_k
+
+    如果开启:
+      -> 调用 Jina rerank
+      -> query 使用 standard_query
+      -> chunks 使用 parent expansion 后的候选
+      -> top_n = retrieval_top_k
+      -> Jina 超时或失败时降级 passthrough
+      -> warnings 记录 fallback 原因
+
+15. 输出 retrieval.v1
+    chunks:
+      -> content
+      -> score
+      -> source_file
+      -> page_num
+      -> chunk_type
+      -> chunk_id
+      -> parent_id
+      -> section
+      -> kb_id
+      -> scope
+      -> retrieval_source
+      -> scores
+      -> rrf_channel_scores
+      -> local_rrf_score
+      -> global_rrf_score
+      -> matched_child_chunk_ids / matched_content，若发生 parent expansion
+
+    metadata:
+      -> contract_version = "retrieval.v1"
+      -> knowledge_base_ids
+      -> retrieval_mode
+      -> retrieval_top_k
+      -> dense_retrieved / sparse_retrieved
+      -> dense_raw_retrieved / sparse_raw_retrieved
+      -> dense_candidate_top_k = 50
+      -> sparse_candidate_top_k = 50
+      -> dense_min_score = 0.1
+      -> sparse_min_score = 0.0
+      -> sparse_weighting = "bm25_like"
+      -> sparse_tokenizer = "jieba_v1"
+      -> sparse_stopwords_enabled = true
+      -> bm25_k1 = 1.5
+      -> bm25_b = 0.75
+      -> rrf_dense_weight = 1.0
+      -> rrf_sparse_weight = 0.3
+      -> rrf_k = 60
+      -> per_kb_safety_cap = 80
+      -> fusion_candidate_top_k = 50
+      -> kb_ranked_lists
+      -> total_retrieved
+      -> total_returned
+      -> rerank_enabled
+      -> rerank_top_n
+      -> rerank_provider
+      -> original_query
+      -> standard_query
+      -> query_variants
+      -> query_enhancement
+      -> warnings
+```
+
+### 10. 一句话版本
+
+当前检索链路可以压缩成：
+
+```text
+Query Enhancement
+-> 每个 KB 内 dense variants top 50 + sparse standard_query BM25-like top 50
+-> dense cosine >= 0.1 / sparse score > 0.0
+-> KB 内 dense/sparse Weighted RRF
+-> 每 KB 最多 80 个
+-> 多 KB 全局 RRF 取 50 个
+-> parent expansion
+-> Jina rerank 或 passthrough
+-> retrieval.v1
+```
+
+---
+
+## 十一、离线检索实验总结
+
+### 1. 实验目的
+
+本次实验的目标不是做完整 C-MTEB benchmark，而是用公开 retrieval 数据集构造一个可重复的离线评估流程，验证当前知识库检索链路中各核心模块是否有必要。
+
+重点回答三个问题：
+
+- dense 向量检索是否是主力召回能力来源。
+- sparse/BM25 检索是否能为 dense 提供增量收益。
+- hybrid 融合、rerank、sparse 权重等设计是否适合作为默认检索配置。
+
+### 2. 实验设置
+
+使用 `testretrieval/test_retrieval.py` 复用后端真实检索链路 `retrieve_chunks(...)`，不走文件上传 API，不启动 workflow，不调用 LLM 回答。
+
+| 项目 | 设置 |
+|---|---|
+| 数据集 | `T2Retrieval`、`MMarcoRetrieval`、`DuRetrieval` |
+| 样本规模 | 每个数据集 50 个 query |
+| 干扰文档 | 每个数据集 500 个 negative docs |
+| 检索返回 | `top_k=10` |
+| 指标 | `Recall@K`、`Precision@K`、`MRR@K`、`nDCG@K` |
+| 主要观察指标 | `Recall@10`、`nDCG@10`、`MRR@10`、`Precision@1`、平均延迟 |
+| embedding | `zhipu/embedding-3`，维度 2048 |
+| qrels 粒度 | 文档级相关性，不是 chunk 级相关性 |
+
+本实验中的知识库构建流程会复用平台现有 chunk、embedding、sparse vector、Qdrant 写入逻辑；查询阶段复用平台现有检索函数。因此结果更接近平台真实链路，而不是单独评估 embedding 模型。
+
+#### 实验逻辑
+
+1. 从每个数据集抽取 N 个 query
+2. 收集这些 query 在 qrels 中的所有 positive documents
+3. 额外采样 M 个 negative documents
+4. 将 positive + negative documents 导入平台知识库
+5. 平台按自身 chunk 策略切分并建立索引
+6. 对每个 query 调用检索节点
+7. 将返回 chunk 映射回 document
+8. 计算 Recall@K / Precision@K / MRR@K / nDCG@K
+
+在 50 query / 500 negative 的核心实验中，每个 query 的 positive docs 占总文档数约 0.5% - 2%。
+扩大样本验证实验中，这一比例进一步降低到约 0.05% - 0.20%，见第 6 节。
+增加 query 数可以让指标更稳定。
+
+### 3. Sparse 权重实验
+
+对 sparse 优化后的 hybrid 检索链路，比较不同 `DEFAULT_RRF_SPARSE_WEIGHT` 的效果。
+
+| 配置 | Recall@10 | Precision@1 | MRR@10 | nDCG@10 | 平均延迟 |
+|---|---:|---:|---:|---:|---:|
+| sparse weight 0.6 | 0.9140 | 0.9200 | 0.9388 | 0.9041 | 820.6ms |
+| sparse weight 0.4 | 0.9185 | 0.9333 | 0.9458 | 0.9111 | 822.4ms |
+| sparse weight 0.3 | 0.9241 | 0.9333 | 0.9441 | 0.9125 | 817.0ms |
+
+结论：
+
+- `0.3` 的 `Recall@10` 和 `nDCG@10` 最好，说明它更适合当前 RAG 检索场景。
+- `0.4` 的 `MRR@10` 略高，但差距很小。
+- `0.6` 给 sparse 的权重偏高，整体排序质量不如 `0.3` 和 `0.4`。
+
+因此，当前更推荐将 `DEFAULT_RRF_SPARSE_WEIGHT` 固定为 `0.3`。
+
+### 4. Rerank 对照实验
+
+在 `DEFAULT_RRF_SPARSE_WEIGHT = 0.3` 的基础上，比较是否开启 rerank。
+
+| 配置 | Recall@10 | Precision@1 | MRR@10 | nDCG@10 | 平均延迟 |
+|---|---:|---:|---:|---:|---:|
+| 不启用 rerank | 0.9241 | 0.9333 | 0.9441 | 0.9125 | 817.0ms |
+| 启用 rerank | 0.9174 | 0.9400 | 0.9527 | 0.9091 | 2823.9ms |
+
+结论：
+
+- rerank 提升了 `Precision@1` 和 `MRR@10`，说明它有能力把部分相关结果提前。
+- 但 `Recall@10` 和 `nDCG@10` 略降，说明它没有稳定改善整体 Top10 检索质量。
+- 平均延迟从约 817ms 增加到约 2824ms，成本约为原来的 3.5 倍。
+
+因此，rerank 当前不适合作为默认开启项。它更适合作为高精度模式、用户可选项，或在更强 reranker / 更大候选池策略下重新评估。
+
+### 5. 核心检索模块消融
+
+本组实验只改变检索模式，其他设置保持一致。
+
+| 模式 | Recall@10 | Precision@1 | MRR@10 | nDCG@10 | 平均延迟 |
+|---|---:|---:|---:|---:|---:|
+| hybrid | 0.9241 | 0.9333 | 0.9441 | 0.9125 | 813.6ms |
+| dense only | 0.8999 | 0.9000 | 0.9193 | 0.8863 | 711.0ms |
+| sparse only | 0.8102 | 0.8733 | 0.8963 | 0.8176 | 233.0ms |
+
+结论：
+
+- dense-only 明显优于 sparse-only，说明 dense 向量检索仍然是当前系统的主力召回通道。
+- sparse-only 延迟最低，但质量下降明显，更适合作为低成本 fallback 或辅助能力，而不是默认主检索。
+- hybrid 相比 dense-only 在 `Recall@10`、`Precision@1`、`MRR@10`、`nDCG@10` 上均有提升，说明 sparse 通道虽然单独不强，但与 dense 融合后能提供有效增量。
+
+分数据集看，hybrid 在 `T2Retrieval` 和 `MMarcoRetrieval` 上优于 dense-only；`DuRetrieval` 上 dense-only 略高于 hybrid，但差距较小。整体上，hybrid 的收益更稳定，适合作为默认检索策略。
+
+### 6. 扩大样本验证实验
+
+在完成核心消融后，又使用更大规模配置单独验证默认 hybrid 方案的稳定性。
+
+| 项目 | 设置 |
+|---|---|
+| 数据集 | `T2Retrieval`、`MMarcoRetrieval`、`DuRetrieval` |
+| 样本规模 | 每个数据集 100 个 query，总计 300 个 query |
+| 干扰文档 | 每个数据集 2000 个 negative docs |
+| 检索模式 | `hybrid` |
+| 检索返回 | `top_k=10` |
+| rerank | 关闭 |
+
+此时，对某一个 query 来说，positive docs 占整个库的比例约为：
+
+| 数据集 | 总文档数 | 平均每 query 相关文档数 | 每 query positive docs 占比 |
+|---|---:|---:|---:|
+| T2Retrieval | 2448 | 4.48 | 0.183% |
+| MMarcoRetrieval | 2106 | 1.06 | 0.050% |
+| DuRetrieval | 2480 | 4.81 | 0.194% |
+
+这里的比例指的是单个 query 的相关文档数除以当前评估库总文档数。它比“所有 query 的 unique positive docs 占比”更能反映单次检索难度。
+
+扩大样本后的结果如下：
+
+| 数据集 | Recall@10 | Precision@1 | MRR@10 | nDCG@10 | 平均延迟 |
+|---|---:|---:|---:|---:|---:|
+| T2Retrieval | 0.7750 | 0.8700 | 0.8870 | 0.7934 | 811.1ms |
+| MMarcoRetrieval | 0.9600 | 0.8900 | 0.9162 | 0.9240 | 849.2ms |
+| DuRetrieval | 0.8995 | 0.9500 | 0.9633 | 0.9067 | 899.9ms |
+| overall | 0.8782 | 0.9033 | 0.9222 | 0.8747 | 853.4ms |
+
+与 50 query / 500 negative 的小样本实验相比，扩大样本后 `Recall@10` 和 `nDCG@10` 有所下降，这是预期内的：库更大、干扰文档更多、单个 query 的 positive docs 占比更低，检索难度明显提高。
+
+但整体结果仍然稳定：
+
+- `Recall@10 = 0.8782`，说明 Top10 仍能覆盖大部分相关文档。
+- `Precision@1 = 0.9033`，说明第一条结果大概率相关。
+- `MRR@10 = 0.9222`，说明相关文档通常排在靠前位置。
+- 平均延迟约 853ms，相比小样本实验没有明显恶化。
+
+因此，扩大样本验证说明当前 hybrid 默认方案不是只在小规模评估库中表现较好；在更低 positive 占比和更多干扰文档下，它仍然保持了较好的检索质量和可接受的响应延迟。
+
+### 7. 最终建议
+
+当前推荐默认配置：
+
+```text
+retrieval strategy: hybrid
+DEFAULT_RRF_SPARSE_WEIGHT: 0.3
+rerank: disabled by default
+top_k: 10
+```
+
+实验支持以下结论：
+
+- dense 检索是必要模块，承担主要语义召回能力。
+- sparse 检索是必要补充，尤其对关键词匹配、短查询、实体词和字面匹配有价值。
+- hybrid 融合模块是必要的，它能在较小延迟增加下稳定提升整体检索质量。
+- rerank 当前收益不足以覆盖延迟成本，不建议默认开启。
+
+### 8. 局限性
+
+本实验适合做工程消融，不适合作为正式排行榜分数。
+
+主要局限：
+
+- 核心消融实验样本规模仍然偏小，每个数据集只抽取 50 个 query；扩大样本验证只跑了 hybrid 默认方案，没有重新跑 dense-only / sparse-only。
+- negative docs 为抽样负例，不一定包含足够多 hard negative。
+- qrels 是文档级，而系统实际返回 chunk，因此指标会受到 chunk 到 doc 映射影响。
+- 本轮没有加入 metadata、query enhancement、parent-child 等变量。
+
+因此，本实验最适合支撑“模块是否有必要”的相对结论，而不是声称系统在 C-MTEB 上达到了某个通用绝对水平。
