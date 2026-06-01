@@ -81,7 +81,7 @@ def build_agent_context(invocation: AgentInvocation) -> tuple[str, dict[str, Any
         "used_chunk_ids": [str(chunk.get("chunk_id") or "") for chunk in reordered],
         "dropped_chunk_ids": [str(chunk.get("chunk_id") or "") for chunk in dropped],
         "reorder": "lost_in_the_middle",
-        "source_label_format": "[source_file | page page_num | chunk_type | chunk_id]",
+        "source_label_format": "[source_file | page page_num | chunk_type | chunk_role | chunk_id]",
     }
     return context_block, metadata
 
@@ -123,10 +123,11 @@ def _format_context_chunk(chunk: dict[str, Any]) -> str:
     page_num = chunk.get("page_num")
     page_label = f"page {page_num}" if page_num not in {None, "", 0} else "page unknown"
     chunk_type = str(chunk.get("chunk_type") or "text")
+    chunk_role = str(chunk.get("chunk_role") or "standalone")
     chunk_id = str(chunk.get("chunk_id") or "unknown")
     section = str(chunk.get("section") or "").strip()
     section_line = f"Section: {section}\n" if section else ""
-    return f"[{source_file} | {page_label} | {chunk_type} | {chunk_id}]\n{section_line}{chunk.get('content', '')}"
+    return f"[{source_file} | {page_label} | {chunk_type} | {chunk_role} | {chunk_id}]\n{section_line}{chunk.get('content', '')}"
 
 
 def _lost_in_the_middle_reorder(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:

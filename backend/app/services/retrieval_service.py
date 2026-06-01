@@ -600,7 +600,7 @@ def _sparse_original_score(chunk: dict[str, Any]) -> float:
 
 def _is_retrievable_chunk(chunk: KnowledgeChunk) -> bool:
     metadata = dict(chunk.metadata_json or {})
-    return metadata.get("chunk_type") != "parent" and bool(chunk.qdrant_point_id or chunk.content)
+    return metadata.get("chunk_role") != "parent" and bool(chunk.qdrant_point_id or chunk.content)
 
 
 def _chunk_to_candidate(chunk: KnowledgeChunk, score: float, source: str, kb: KnowledgeBase) -> dict[str, Any]:
@@ -611,6 +611,8 @@ def _chunk_to_candidate(chunk: KnowledgeChunk, score: float, source: str, kb: Kn
         "source_file": metadata.get("source_file", ""),
         "page_num": metadata.get("page_num"),
         "chunk_type": metadata.get("chunk_type", "text"),
+        "chunk_role": metadata.get("chunk_role", "standalone"),
+        "element_type": metadata.get("element_type"),
         "chunk_id": metadata.get("chunk_id") or chunk.id,
         "parent_id": metadata.get("parent_id"),
         "section": metadata.get("section"),
@@ -635,6 +637,8 @@ def _hit_to_chunk(
         "source_file": payload.get("source_file", ""),
         "page_num": payload.get("page_num"),
         "chunk_type": payload.get("chunk_type", "text"),
+        "chunk_role": payload.get("chunk_role", "standalone"),
+        "element_type": payload.get("element_type"),
         "chunk_id": payload.get("chunk_id") or hit.get("id", ""),
         "parent_id": payload.get("parent_id"),
         "section": payload.get("section"),
@@ -774,7 +778,9 @@ def _expand_parent_chunks(
                 **chunk,
                 "content": parent.content,
                 "chunk_id": parent.id,
-                "chunk_type": "parent",
+                "chunk_type": parent_metadata.get("chunk_type", chunk.get("chunk_type", "text")),
+                "chunk_role": "parent",
+                "element_type": parent_metadata.get("element_type", chunk.get("element_type")),
                 "parent_id": parent.id,
                 "matched_chunk_id": child_id,
                 "matched_child_chunk_ids": [child_id] if child_id else [],

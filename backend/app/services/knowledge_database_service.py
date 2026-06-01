@@ -362,7 +362,7 @@ def _list_sparse_index_chunks(db: Session, kb: KnowledgeBase) -> list[KnowledgeC
 def _is_sparse_indexable_chunk(chunk: KnowledgeChunk) -> bool:
     metadata = dict(chunk.metadata_json or {})
     return (
-        metadata.get("chunk_type") != "parent"
+        metadata.get("chunk_role") != "parent"
         and bool(str(chunk.content or "").strip())
         and bool(chunk.qdrant_point_id)
     )
@@ -810,7 +810,13 @@ def _store_chunks(
                 document=document,
                 index=index,
                 content=content,
-                metadata=_base_chunk_metadata(kb, document, element, chunk_type=element.get("chunk_type") or "text"),
+                metadata=_base_chunk_metadata(
+                    kb,
+                    document,
+                    element,
+                    chunk_type=str(element.get("chunk_type") or "text"),
+                    chunk_role="standalone",
+                ),
             )
             db.add(chunk)
             vector_chunks.append(chunk)
@@ -845,18 +851,28 @@ def _store_parent_child_chunks(
             document=document,
             index=index,
             content=parent_content,
-            metadata=_base_chunk_metadata(kb, document, element, chunk_type="parent"),
+            metadata=_base_chunk_metadata(
+                kb,
+                document,
+                element,
+                chunk_type=str(element.get("chunk_type") or "text"),
+                chunk_role="parent",
+            ),
         )
         db.add(parent_chunk)
         db.flush()
         _fill_chunk_id(parent_chunk)
         index += 1
 
-        source_type = str(element.get("chunk_type") or "text")
         for child_content in _split_element_text(element, parent_content, kb.chunk_size, kb.chunk_overlap):
-            metadata = _base_chunk_metadata(kb, document, element, chunk_type="child")
+            metadata = _base_chunk_metadata(
+                kb,
+                document,
+                element,
+                chunk_type=str(element.get("chunk_type") or "text"),
+                chunk_role="child",
+            )
             metadata["parent_id"] = parent_chunk.id
-            metadata["source_chunk_type"] = source_type
             child_chunk = _new_knowledge_chunk(
                 kb=kb,
                 document=document,
@@ -892,12 +908,14 @@ def _base_chunk_metadata(
     document: KnowledgeDocument,
     element: dict[str, Any],
     chunk_type: str,
+    chunk_role: str,
 ) -> dict[str, Any]:
     return {
         "source_file": document.filename,
         "chunk_id": "",
         "parent_id": None,
         "chunk_type": chunk_type,
+        "chunk_role": chunk_role,
         "element_type": element.get("element_type"),
         "section": element.get("section"),
         "page_num": element.get("page_num"),
