@@ -1,15 +1,16 @@
 import type {
   AppItem,
-  AppTool,
   AuthResponse,
   KnowledgeBase,
   KnowledgeDocument,
   MessageItem,
   ModelCredential,
-  PublishedAppItem,
   RunItem,
+  RunStepItem,
   ToolItem,
   UserItem,
+  WorkflowItem,
+  WorkflowVersionItem,
 } from "./types";
 
 const API_BASE = "http://localhost:8000/api";
@@ -76,7 +77,6 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   listApps: () => request<AppItem[]>("/apps"),
-  listPublishedApps: () => request<PublishedAppItem[]>("/published-apps"),
   createApp: () =>
     request<AppItem>("/apps", {
       method: "POST",
@@ -102,14 +102,27 @@ export const api = {
     request<{ ok: boolean }>(`/apps/${appId}`, {
       method: "DELETE",
     }),
-  publishApp: (appId: string) =>
-    request<AppItem>(`/apps/${appId}/publish`, {
+  listWorkflows: (appId: string) => request<WorkflowItem[]>(`/apps/${appId}/workflows`),
+  createWorkflow: (appId: string, payload: { name: string; description?: string; draft_spec?: Record<string, unknown> }) =>
+    request<WorkflowItem>(`/apps/${appId}/workflows`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getWorkflow: (workflowId: string) => request<WorkflowItem>(`/workflows/${workflowId}`),
+  updateWorkflow: (workflowId: string, payload: Partial<Pick<WorkflowItem, "name" | "description" | "draft_spec">>) =>
+    request<WorkflowItem>(`/workflows/${workflowId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteWorkflow: (workflowId: string) =>
+    request<{ ok: boolean }>(`/workflows/${workflowId}`, {
+      method: "DELETE",
+    }),
+  publishWorkflow: (workflowId: string) =>
+    request<WorkflowVersionItem>(`/workflows/${workflowId}/publish`, {
       method: "POST",
     }),
-  unpublishApp: (appId: string) =>
-    request<AppItem>(`/apps/${appId}/unpublish`, {
-      method: "POST",
-    }),
+  listWorkflowVersions: (workflowId: string) => request<WorkflowVersionItem[]>(`/workflows/${workflowId}/versions`),
   listKnowledgeBases: () => request<KnowledgeBase[]>("/knowledge-bases"),
   createKnowledgeBase: (payload: { name: string; description: string }) =>
     request<KnowledgeBase>("/knowledge-bases", {
@@ -160,24 +173,19 @@ export const api = {
     request<{ ok: boolean }>(`/model-credentials/${credentialId}`, {
       method: "DELETE",
     }),
-  listAppTools: (appId: string) => request<AppTool[]>(`/apps/${appId}/tools`),
-  updateAppTools: (appId: string, toolNames: string[]) =>
-    request<AppTool[]>(`/apps/${appId}/tools`, {
-      method: "PUT",
-      body: JSON.stringify({ tool_names: toolNames }),
-    }),
-  listRuns: (appId: string) => request<RunItem[]>(`/apps/${appId}/runs`),
+  listWorkflowRuns: (workflowId: string) => request<RunItem[]>(`/workflows/${workflowId}/runs`),
+  listRunSteps: (runId: string) => request<RunStepItem[]>(`/runs/${runId}/steps`),
   listMessages: (conversationId: string) => request<MessageItem[]>(`/conversations/${conversationId}/messages`),
 };
 
 export async function streamChat(
-  appId: string,
+  workflowId: string,
   query: string,
   conversationId: string | null,
   onEvent: (event: string, data: Record<string, unknown>) => void,
 ) {
   const headers = getRequestHeaders();
-  const response = await fetch(`${API_BASE}/apps/${appId}/chat`, {
+  const response = await fetch(`${API_BASE}/workflows/${workflowId}/chat`, {
     method: "POST",
     headers: {
       ...Object.fromEntries(headers.entries()),

@@ -20,15 +20,16 @@ import {
 import { api, streamChat } from "./api";
 import type {
   AppItem,
-  AppTool,
   ChatMessage,
   KnowledgeBase,
   KnowledgeDocument,
   ModelCredential,
-  PublishedAppItem,
   RunItem,
+  RunStepItem,
   ToolItem,
   UserItem,
+  WorkflowItem,
+  WorkflowVersionItem,
 } from "./types";
 import "./styles.css";
 
@@ -37,8 +38,6 @@ const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "m
 const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
 const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
 const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
-
-type SelectedApp = AppItem | PublishedAppItem;
 
 type AgentNodeModel = {
   provider?: string;
@@ -67,6 +66,13 @@ type RetrievalNodeModel = {
   query_llm_temperature?: string | number;
 };
 
+type AgentToolConfig = {
+  type: string;
+  name: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+};
+
 type WorkflowNode = Record<string, unknown>;
 
 type WorkflowEdge = {
@@ -80,10 +86,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isFullApp(app: SelectedApp | null): app is AppItem {
-  return Boolean(app && "workflow_spec" in app);
-}
-
 function defaultCredentialProvider(provider: string) {
   return provider && provider !== "mock" ? provider : "openai_compatible";
 }
@@ -95,13 +97,13 @@ function defaultQueryLlmBaseUrl(provider: string) {
   return "";
 }
 
-function getWorkflowNodes(app: AppItem): WorkflowNode[] {
-  const nodes = app.workflow_spec.nodes;
+function getWorkflowNodes(workflow: WorkflowItem): WorkflowNode[] {
+  const nodes = workflow.draft_spec.nodes;
   return Array.isArray(nodes) ? nodes.filter(isRecord) : [];
 }
 
-function getWorkflowEdges(app: AppItem): WorkflowEdge[] {
-  const edges = app.workflow_spec.edges;
+function getWorkflowEdges(workflow: WorkflowItem): WorkflowEdge[] {
+  const edges = workflow.draft_spec.edges;
   if (!Array.isArray(edges)) return [];
   return edges.flatMap((edge) => {
     if (Array.isArray(edge) && edge.length >= 2) {
@@ -137,21 +139,77 @@ function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
   return id;
 }
 
-function getAgentNodeModel(app: AppItem): AgentNodeModel {
-  const node = getWorkflowNodes(app).find((item) => {
+function getAgentNodeModel(workflow: WorkflowItem): AgentNodeModel {
+  const node = getWorkflowNodes(workflow).find((item) => {
     const type = getWorkflowNodeType(item);
     return item.id === "agent" || type === "agent" || type === "react_agent";
   });
   return isRecord(node?.model) ? (node.model as AgentNodeModel) : {};
 }
 
-function getRetrievalNode(app: AppItem): WorkflowNode {
-  return getWorkflowNodes(app).find((item) => isRetrievalNode(item)) ?? {};
+function getRetrievalNode(workflow: WorkflowItem): WorkflowNode {
+  return getWorkflowNodes(workflow).find((item) => isRetrievalNode(item)) ?? {};
 }
 
-function updateAgentNodeModel(app: AppItem, key: keyof AgentNodeModel, value: string | number): AppItem {
-  const spec = app.workflow_spec ?? {};
-  const nextNodes = getWorkflowNodes(app).map((item) => {
+function getAgentNodeTools(node: WorkflowNode | null): AgentToolConfig[] {
+  const tools = node?.tools;
+  if (!Array.isArray(tools)) return [];
+  return tools.filter(isRecord).flatMap((tool) => {
+    const name = typeof tool.name === "string" ? tool.name.trim() : "";
+    if (!name) return [];
+    return [
+      {
+        type: typeof tool.type === "string" && tool.type.trim() ? tool.type.trim() : "builtin",
+        name,
+        enabled: tool.enabled !== false,
+        config: isRecord(tool.config) ? tool.config : {},
+      },
+    ];
+  });
+}
+
+function getEnabledAgentToolNames(node: WorkflowNode | null): string[] {
+  return getAgentNodeTools(node)
+    .filter((tool) => tool.type === "builtin" && tool.enabled)
+    .map((tool) => tool.name);
+}
+
+function isAgentNode(node: WorkflowNode) {
+  const type = getWorkflowNodeType(node);
+  return node.id === "agent" || type === "agent" || type === "react_agent";
+}
+
+function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolNames: string[]): WorkflowItem {
+  const nodes = getWorkflowNodes(workflow);
+  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
+  const existingTools = getAgentNodeTools(targetNode);
+  const uniqueToolNames = Array.from(new Set(toolNames));
+  const nextTools = uniqueToolNames.map((name) => {
+    const existingTool = existingTools.find((tool) => tool.type === "builtin" && tool.name === name);
+    return {
+      type: "builtin",
+      name,
+      enabled: true,
+      config: existingTool?.config ?? {},
+    };
+  });
+  const nextNodes = nodes.map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
+    return { ...node, tools: nextTools };
+  });
+  return {
+    ...workflow,
+    draft_spec: {
+      ...(workflow.draft_spec ?? {}),
+      nodes: nextNodes,
+    },
+  };
+}
+
+function updateAgentNodeModel(workflow: WorkflowItem, key: keyof AgentNodeModel, value: string | number): WorkflowItem {
+  const spec = workflow.draft_spec ?? {};
+  const nextNodes = getWorkflowNodes(workflow).map((item) => {
     const type = getWorkflowNodeType(item);
     const isAgentNode = item.id === "agent" || type === "agent" || type === "react_agent";
     if (!isAgentNode) return item;
@@ -165,33 +223,37 @@ function updateAgentNodeModel(app: AppItem, key: keyof AgentNodeModel, value: st
     };
   });
   return {
-    ...app,
-    workflow_spec: {
+    ...workflow,
+    draft_spec: {
       ...spec,
       nodes: nextNodes,
     },
   };
 }
 
-function updateRetrievalNode(app: AppItem, key: keyof RetrievalNodeModel, value: string | number | boolean | string[]): AppItem {
-  const spec = app.workflow_spec ?? {};
-  const nextNodes = getWorkflowNodes(app).map((item) => {
+function updateRetrievalNode(
+  workflow: WorkflowItem,
+  key: keyof RetrievalNodeModel,
+  value: string | number | boolean | string[],
+): WorkflowItem {
+  const spec = workflow.draft_spec ?? {};
+  const nextNodes = getWorkflowNodes(workflow).map((item) => {
     if (!isRetrievalNode(item)) return item;
     return { ...item, id: "retrieval", type: "retrieval", [key]: value };
   });
   return {
-    ...app,
-    workflow_spec: {
+    ...workflow,
+    draft_spec: {
       ...spec,
       nodes: nextNodes,
     },
   };
 }
 
-function pruneRetrievalKnowledgeBaseIds(app: AppItem, knowledgeBases: KnowledgeBase[]): AppItem {
+function pruneRetrievalKnowledgeBaseIds(workflow: WorkflowItem, knowledgeBases: KnowledgeBase[]): WorkflowItem {
   const validIds = new Set(knowledgeBases.map((item) => item.id));
-  const spec = app.workflow_spec ?? {};
-  const nextNodes = getWorkflowNodes(app).map((item) => {
+  const spec = workflow.draft_spec ?? {};
+  const nextNodes = getWorkflowNodes(workflow).map((item) => {
     if (!isRetrievalNode(item)) return item;
     const ids = Array.isArray(item.knowledge_base_ids) ? item.knowledge_base_ids : [];
     return {
@@ -202,8 +264,8 @@ function pruneRetrievalKnowledgeBaseIds(app: AppItem, knowledgeBases: KnowledgeB
     };
   });
   return {
-    ...app,
-    workflow_spec: {
+    ...workflow,
+    draft_spec: {
       ...spec,
       nodes: nextNodes,
     },
@@ -217,8 +279,12 @@ function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [authBusy, setAuthBusy] = useState(false);
   const [apps, setApps] = useState<AppItem[]>([]);
-  const [publishedApps, setPublishedApps] = useState<PublishedAppItem[]>([]);
-  const [selectedApp, setSelectedApp] = useState<SelectedApp | null>(null);
+  const [selectedApp, setSelectedApp] = useState<AppItem | null>(null);
+  const [workflows, setWorkflows] = useState<WorkflowItem[]>([]);
+  const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowItem | null>(null);
+  const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersionItem[]>([]);
+  const [draftSpecText, setDraftSpecText] = useState("");
+  const [draftSpecError, setDraftSpecError] = useState("");
   const [credentials, setCredentials] = useState<ModelCredential[]>([]);
   const [credentialDraft, setCredentialDraft] = useState({
     provider: "openai_compatible",
@@ -230,8 +296,9 @@ function App() {
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
   const [knowledgeDraft, setKnowledgeDraft] = useState({ name: "", description: "" });
   const [tools, setTools] = useState<ToolItem[]>([]);
-  const [appTools, setAppTools] = useState<AppTool[]>([]);
   const [runs, setRuns] = useState<RunItem[]>([]);
+  const [runSteps, setRunSteps] = useState<RunStepItem[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const conversationIdRef = useRef<string | null>(null);
@@ -241,23 +308,24 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
 
-  const selectedOwnedApp = isFullApp(selectedApp) && selectedApp.owner_user_id === user?.id ? selectedApp : null;
+  const selectedOwnedApp = selectedApp?.owner_user_id === user?.id ? selectedApp : null;
+  const selectedWorkflowId = selectedWorkflow?.id ?? "";
+  const selectedWorkflowPublished = Boolean(selectedWorkflow?.published_version_id);
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
   const canEditSelectedApp = Boolean(selectedOwnedApp);
-  const enabledToolNames = useMemo(
-    () => appTools.filter((item) => item.enabled).map((item) => item.tool_name),
-    [appTools],
-  );
-  const agentNodeModel = useMemo(() => (selectedOwnedApp ? getAgentNodeModel(selectedOwnedApp) : {}), [selectedOwnedApp]);
-  const retrievalNode = useMemo(() => (selectedOwnedApp ? getRetrievalNode(selectedOwnedApp) : {}), [selectedOwnedApp]);
+  const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
+  const agentNodeModel = useMemo(() => (selectedWorkflow ? getAgentNodeModel(selectedWorkflow) : {}), [selectedWorkflow]);
+  const retrievalNode = useMemo(() => (selectedWorkflow ? getRetrievalNode(selectedWorkflow) : {}), [selectedWorkflow]);
   const retrievalNodeModel = retrievalNode as RetrievalNodeModel;
-  const workflowNodes = useMemo(() => (selectedOwnedApp ? getWorkflowNodes(selectedOwnedApp) : []), [selectedOwnedApp]);
-  const workflowEdges = useMemo(() => (selectedOwnedApp ? getWorkflowEdges(selectedOwnedApp) : []), [selectedOwnedApp]);
+  const workflowNodes = useMemo(() => (selectedWorkflow ? getWorkflowNodes(selectedWorkflow) : []), [selectedWorkflow]);
+  const workflowEdges = useMemo(() => (selectedWorkflow ? getWorkflowEdges(selectedWorkflow) : []), [selectedWorkflow]);
   const selectedWorkflowNode = useMemo(() => {
     const node = workflowNodes.find((item, index) => getWorkflowNodeId(item, index) === selectedWorkflowNodeId);
     return node ?? workflowNodes[0] ?? null;
   }, [selectedWorkflowNodeId, workflowNodes]);
   const selectedWorkflowNodeType = selectedWorkflowNode ? getWorkflowNodeType(selectedWorkflowNode) : "";
+  const selectedWorkflowNodeIsAgent = Boolean(selectedWorkflowNode && isAgentNode(selectedWorkflowNode));
+  const enabledAgentToolNames = useMemo(() => getEnabledAgentToolNames(selectedWorkflowNode), [selectedWorkflowNode]);
 
   function setActiveConversationId(nextConversationId: string | null) {
     conversationIdRef.current = nextConversationId;
@@ -266,15 +334,20 @@ function App() {
 
   function resetWorkspace() {
     setApps([]);
-    setPublishedApps([]);
+    setWorkflows([]);
     setSelectedApp(null);
+    setSelectedWorkflow(null);
+    setWorkflowVersions([]);
+    setDraftSpecText("");
+    setDraftSpecError("");
     setCredentials([]);
     setKnowledgeBases([]);
     setSelectedKnowledgeBaseId("");
     setKnowledgeDocuments([]);
     setTools([]);
-    setAppTools([]);
     setRuns([]);
+    setRunSteps([]);
+    setSelectedRunId("");
     setMessages([]);
     setTrace([]);
     setActiveConversationId(null);
@@ -282,29 +355,40 @@ function App() {
     setBusy(false);
   }
 
-  async function selectApp(app: SelectedApp | null) {
-    setSelectedApp(app);
+  async function selectRun(run: RunItem | null) {
+    setSelectedRunId(run?.id ?? "");
+    if (!run) {
+      setRunSteps([]);
+      return;
+    }
+    try {
+      setRunSteps(await api.listRunSteps(run.id));
+    } catch (error) {
+      console.warn(error);
+      setRunSteps([]);
+    }
+  }
+
+  async function selectWorkflow(workflow: WorkflowItem | null) {
+    setSelectedWorkflow(workflow);
+    setWorkflowVersions([]);
+    setDraftSpecText("");
+    setDraftSpecError("");
+    setRuns([]);
+    setRunSteps([]);
+    setSelectedRunId("");
     setMessages([]);
     setTrace([]);
     setActiveConversationId(null);
-    setStatusMessage("");
-    if (!app) {
-      setAppTools([]);
-      setRuns([]);
-      setSelectedWorkflowNodeId("");
-      return;
-    }
-    if (!isFullApp(app) || app.owner_user_id !== user?.id) {
-      setAppTools([]);
-      setRuns([]);
-      setSelectedWorkflowNodeId("");
-      return;
-    }
+    setSelectedWorkflowNodeId("");
+    if (!workflow) return;
 
-    const [appToolList, runList] = await Promise.all([api.listAppTools(app.id), api.listRuns(app.id)]);
-    setAppTools(appToolList);
+    const [versionList, runList] = await Promise.all([api.listWorkflowVersions(workflow.id), api.listWorkflowRuns(workflow.id)]);
+    setWorkflowVersions(versionList);
     setRuns(runList);
-    const latestConversationId = runList[0]?.conversation_id ?? null;
+    const latestRun = runList[0] ?? null;
+    await selectRun(latestRun);
+    const latestConversationId = latestRun?.conversation_id ?? null;
     setActiveConversationId(latestConversationId);
     if (!latestConversationId) return;
     try {
@@ -324,17 +408,43 @@ function App() {
     }
   }
 
-  async function refresh(preferredAppId?: string | null) {
+  async function selectApp(app: AppItem | null, preferredWorkflowId?: string | null) {
+    setSelectedApp(app);
+    setWorkflows([]);
+    setSelectedWorkflow(null);
+    setWorkflowVersions([]);
+    setMessages([]);
+    setTrace([]);
+    setActiveConversationId(null);
+    setStatusMessage("");
+    if (!app) {
+      setRuns([]);
+      setRunSteps([]);
+      setSelectedRunId("");
+      setSelectedWorkflowNodeId("");
+      return;
+    }
+
+    const workflowList = await api.listWorkflows(app.id);
+    setWorkflows(workflowList);
+    const currentWorkflowId = selectedWorkflow?.app_id === app.id ? selectedWorkflow.id : null;
+    const workflow =
+      workflowList.find((item) => item.id === preferredWorkflowId) ??
+      workflowList.find((item) => item.id === currentWorkflowId) ??
+      workflowList[0] ??
+      null;
+    await selectWorkflow(workflow);
+  }
+
+  async function refresh(preferredAppId?: string | null, preferredWorkflowId?: string | null) {
     if (!user) return;
-    const [appList, publishedList, toolList, credentialList, kbList] = await Promise.all([
+    const [appList, toolList, credentialList, kbList] = await Promise.all([
       api.listApps(),
-      api.listPublishedApps(),
       api.listTools(),
       api.listModelCredentials(),
       api.listKnowledgeBases(),
     ]);
     setApps(appList);
-    setPublishedApps(publishedList);
     setTools(toolList);
     setCredentials(credentialList);
     setKnowledgeBases(kbList);
@@ -346,12 +456,9 @@ function App() {
     const app =
       appList.find((item) => item.id === preferredAppId) ??
       appList.find((item) => item.id === currentId) ??
-      publishedList.find((item) => item.id === preferredAppId) ??
-      publishedList.find((item) => item.id === currentId) ??
       appList[0] ??
-      publishedList[0] ??
       null;
-    await selectApp(app);
+    await selectApp(app, preferredWorkflowId);
   }
 
   useEffect(() => {
@@ -401,6 +508,16 @@ function App() {
       }) ?? workflowNodes[0];
     setSelectedWorkflowNodeId(getWorkflowNodeId(defaultNode, workflowNodes.indexOf(defaultNode)));
   }, [selectedWorkflowNodeId, workflowNodes]);
+
+  useEffect(() => {
+    if (!selectedWorkflow) {
+      setDraftSpecText("");
+      setDraftSpecError("");
+      return;
+    }
+    setDraftSpecText(JSON.stringify(selectedWorkflow.draft_spec ?? {}, null, 2));
+    setDraftSpecError("");
+  }, [selectedWorkflow?.id, selectedWorkflow?.draft_spec]);
 
   useEffect(() => {
     if (!canEditSelectedApp || !selectedKnowledgeBaseId) {
@@ -480,30 +597,70 @@ function App() {
     await refresh(app.id);
   }
 
+  async function createWorkflow() {
+    if (!selectedOwnedApp) return;
+    const workflow = await api.createWorkflow(selectedOwnedApp.id, {
+      name: `Workflow ${workflows.length + 1}`,
+      description: "",
+    });
+    await refresh(selectedOwnedApp.id, workflow.id);
+    setStatusMessage("Workflow created.");
+  }
+
+  async function persistCurrentConfig() {
+    if (!selectedOwnedApp) return null;
+    if (draftSpecError) {
+      throw new Error("Draft spec JSON is invalid.");
+    }
+    const updatedApp = await api.updateApp(selectedOwnedApp.id, {
+      name: selectedOwnedApp.name,
+      description: selectedOwnedApp.description,
+      system_prompt: selectedOwnedApp.system_prompt,
+      model_provider: selectedOwnedApp.model_provider,
+      model_name: selectedOwnedApp.model_name,
+      model_credential_id: selectedOwnedApp.model_credential_id,
+      model_base_url: selectedOwnedApp.model_base_url,
+      temperature: selectedOwnedApp.temperature,
+      top_p: selectedOwnedApp.top_p,
+      max_tokens: selectedOwnedApp.max_tokens,
+    });
+    let updatedWorkflow: WorkflowItem | null = null;
+    if (selectedWorkflow) {
+      const workflowToSave = pruneRetrievalKnowledgeBaseIds(selectedWorkflow, knowledgeBases);
+      updatedWorkflow = await api.updateWorkflow(workflowToSave.id, {
+        name: workflowToSave.name,
+        description: workflowToSave.description,
+        draft_spec: workflowToSave.draft_spec,
+      });
+    }
+    return { app: updatedApp, workflow: updatedWorkflow };
+  }
+
   async function saveConfig() {
     if (!selectedOwnedApp) return;
     try {
-      const appToSave = pruneRetrievalKnowledgeBaseIds(selectedOwnedApp, knowledgeBases);
-      const updated = await api.updateApp(appToSave.id, appToSave);
-      await api.updateAppTools(updated.id, enabledToolNames);
-      await refresh(updated.id);
+      const saved = await persistCurrentConfig();
+      if (!saved) return;
+      await refresh(saved.app.id, saved.workflow?.id ?? selectedWorkflow?.id);
       setStatusMessage("配置已保存。");
     } catch (error) {
       setStatusMessage(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  async function publishSelectedApp() {
-    if (!selectedOwnedApp) return;
-    const updated = await api.publishApp(selectedOwnedApp.id);
-    await refresh(updated.id);
+  async function publishSelectedWorkflow() {
+    if (!selectedOwnedApp || !selectedWorkflow) return;
+    const saved = await persistCurrentConfig();
+    const workflowId = saved?.workflow?.id ?? selectedWorkflow.id;
+    const version = await api.publishWorkflow(workflowId);
+    await refresh(selectedOwnedApp.id, workflowId);
     setStatusMessage("应用已发布。");
   }
 
-  async function unpublishSelectedApp() {
-    if (!selectedOwnedApp) return;
-    const updated = await api.unpublishApp(selectedOwnedApp.id);
-    await refresh(updated.id);
+  async function deleteSelectedWorkflow() {
+    if (!selectedOwnedApp || !selectedWorkflow) return;
+    await api.deleteWorkflow(selectedWorkflow.id);
+    await refresh(selectedOwnedApp.id);
     setStatusMessage("应用已取消发布。");
   }
 
@@ -561,7 +718,7 @@ function App() {
       api_key: "",
     });
     setSelectedApp((current) => {
-      if (!isFullApp(current)) return current;
+      if (!current) return current;
       return current.model_credential_id ? current : { ...current, model_credential_id: credential.id };
     });
   }
@@ -574,27 +731,30 @@ function App() {
     if (selectedOwnedApp.model_credential_id === credentialId) {
       nextApp = { ...nextApp, model_credential_id: "" };
     }
+    let nextWorkflow = selectedWorkflow;
     if (String(agentNodeModel.credential_id ?? "") === credentialId) {
-      nextApp = updateAgentNodeModel(nextApp, "credential_id", "");
+      nextWorkflow = nextWorkflow ? updateAgentNodeModel(nextWorkflow, "credential_id", "") : nextWorkflow;
     }
     if (String(retrievalNodeModel.query_llm_credential_id ?? "") === credentialId) {
-      nextApp = updateRetrievalNode(nextApp, "query_llm_credential_id", "");
+      nextWorkflow = nextWorkflow ? updateRetrievalNode(nextWorkflow, "query_llm_credential_id", "") : nextWorkflow;
     }
     setSelectedApp(nextApp);
+    setSelectedWorkflow(nextWorkflow);
   }
 
-  async function toggleTool(toolName: string) {
-    if (!selectedOwnedApp) return;
-    const next = appTools.some((item) => item.tool_name === toolName && item.enabled)
-      ? enabledToolNames.filter((name) => name !== toolName)
-      : [...enabledToolNames, toolName];
-    const updated = await api.updateAppTools(selectedOwnedApp.id, next);
-    setAppTools(updated);
+  function toggleTool(toolName: string) {
+    if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
+    const agentNodeId = selectedWorkflowNodeId || (selectedWorkflowNode ? getWorkflowNodeId(selectedWorkflowNode, 0) : "");
+    if (!agentNodeId) return;
+    const next = enabledAgentToolNames.includes(toolName)
+      ? enabledAgentToolNames.filter((name) => name !== toolName)
+      : [...enabledAgentToolNames, toolName];
+    setSelectedWorkflow(updateAgentNodeTools(selectedWorkflow, agentNodeId, next));
   }
 
   function updateRetrievalConfig(key: keyof RetrievalNodeModel, value: string | number | boolean | string[]) {
-    if (!selectedOwnedApp) return;
-    setSelectedApp(updateRetrievalNode(selectedOwnedApp, key, value));
+    if (!selectedWorkflow) return;
+    setSelectedWorkflow(updateRetrievalNode(selectedWorkflow, key, value));
   }
 
   function toggleKnowledgeBaseInNode(kbId: string) {
@@ -607,14 +767,29 @@ function App() {
   }
 
   function updateRetrievalQueryLlmProvider(provider: string) {
-    if (!selectedOwnedApp) return;
-    let nextApp = updateRetrievalNode(selectedOwnedApp, "query_llm_provider", provider);
-    nextApp = updateRetrievalNode(nextApp, "query_llm_base_url", defaultQueryLlmBaseUrl(provider));
-    setSelectedApp(nextApp);
+    if (!selectedWorkflow) return;
+    let nextWorkflow = updateRetrievalNode(selectedWorkflow, "query_llm_provider", provider);
+    nextWorkflow = updateRetrievalNode(nextWorkflow, "query_llm_base_url", defaultQueryLlmBaseUrl(provider));
+    setSelectedWorkflow(nextWorkflow);
+  }
+
+  function updateDraftSpecText(value: string) {
+    setDraftSpecText(value);
+    if (!selectedWorkflow) return;
+    try {
+      const parsed = JSON.parse(value);
+      if (!isRecord(parsed)) {
+        throw new Error("draft_spec must be a JSON object");
+      }
+      setSelectedWorkflow({ ...selectedWorkflow, draft_spec: parsed });
+      setDraftSpecError("");
+    } catch (error) {
+      setDraftSpecError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function sendMessage() {
-    if (!selectedApp || !input.trim()) return;
+    if (!selectedWorkflow || !selectedWorkflowPublished || !input.trim()) return;
     const query = input.trim();
     setInput("");
     setBusy(true);
@@ -622,7 +797,7 @@ function App() {
     setMessages((items) => [...items, { role: "user", content: query }, { role: "assistant", content: "" }]);
 
     try {
-      await streamChat(selectedApp.id, query, conversationIdRef.current, (event, data) => {
+      await streamChat(selectedWorkflow.id, query, conversationIdRef.current, (event, data) => {
         if (event === "run_started") {
           setActiveConversationId(String(data.conversation_id));
         }
@@ -653,8 +828,10 @@ function App() {
           setTrace((items) => [...items, { event, ...data }]);
         }
       });
-      if (selectedOwnedApp) {
-        setRuns(await api.listRuns(selectedOwnedApp.id));
+      if (selectedWorkflow) {
+        const runList = await api.listWorkflowRuns(selectedWorkflow.id);
+        setRuns(runList);
+        await selectRun(runList[0] ?? null);
       }
     } finally {
       setBusy(false);
@@ -683,7 +860,16 @@ function App() {
   }
 
   function renderWorkflowCanvas() {
-    if (!selectedOwnedApp) return null;
+    if (!selectedWorkflow) {
+      return (
+        <section className="panel">
+          <div className="panel-title">
+            <GitBranch size={16} /> Workflow
+          </div>
+          <p className="empty">Select or create a Workflow.</p>
+        </section>
+      );
+    }
     return (
       <section className="panel">
         <div className="panel-title">
@@ -749,6 +935,96 @@ function App() {
             onChange={(event) => setSelectedApp({ ...selectedOwnedApp, system_prompt: event.target.value })}
           />
         </label>
+      </section>
+    );
+  }
+
+  function renderWorkflowListPanel() {
+    if (!selectedOwnedApp) return null;
+    return (
+      <section className="panel">
+        <div className="panel-title panel-title-between">
+          <span>
+            <GitBranch size={16} /> Workflows
+          </span>
+          <button className="icon-button" title="Create workflow" onClick={createWorkflow}>
+            <Plus size={14} />
+          </button>
+        </div>
+        <div className="workflow-list">
+          {workflows.map((workflow) => (
+            <button
+              className={selectedWorkflowId === workflow.id ? "workflow-list-item active" : "workflow-list-item"}
+              key={workflow.id}
+              onClick={() => selectWorkflow(workflow)}
+            >
+              <span>
+                <strong>{workflow.name}</strong>
+                <small>{workflow.description || workflow.id}</small>
+              </span>
+              <small className={workflow.published_version_id ? "status-pill published" : "status-pill"}>
+                {workflow.published_version_id ? "Published" : "Draft only"}
+              </small>
+            </button>
+          ))}
+          {workflows.length === 0 ? <p className="empty">No workflows found for this App.</p> : null}
+        </div>
+      </section>
+    );
+  }
+
+  function renderWorkflowSettings() {
+    if (!selectedWorkflow) return null;
+    return (
+      <section className="panel">
+        <div className="panel-title">
+          <GitBranch size={16} /> Workflow Detail
+        </div>
+        <label>
+          Name
+          <input
+            value={selectedWorkflow.name}
+            onChange={(event) => setSelectedWorkflow({ ...selectedWorkflow, name: event.target.value })}
+          />
+        </label>
+        <label>
+          Description
+          <textarea
+            rows={2}
+            value={selectedWorkflow.description}
+            onChange={(event) => setSelectedWorkflow({ ...selectedWorkflow, description: event.target.value })}
+          />
+        </label>
+        <div className="readonly-node">
+          <strong>{selectedWorkflow.published_version_id || "Workflow is not published"}</strong>
+          <small>published_version_id</small>
+        </div>
+        {workflowVersions.length ? (
+          <div className="version-list">
+            {workflowVersions.map((version) => (
+              <div className="version-item" key={version.id}>
+                <strong>v{version.version_number}</strong>
+                <span>{version.id}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="empty">No published versions yet.</p>
+        )}
+        <label>
+          draft_spec JSON
+          <textarea
+            className="json-editor"
+            rows={12}
+            spellCheck={false}
+            value={draftSpecText}
+            onChange={(event) => updateDraftSpecText(event.target.value)}
+          />
+        </label>
+        {draftSpecError ? <div className="error-notice">{draftSpecError}</div> : null}
+        <button className="secondary danger" disabled={workflows.length <= 1} onClick={deleteSelectedWorkflow}>
+          <Trash2 size={16} /> Delete Workflow
+        </button>
       </section>
     );
   }
@@ -971,14 +1247,14 @@ function App() {
   }
 
   function renderAgentNodeSettings() {
-    if (!selectedOwnedApp) return null;
+    if (!selectedOwnedApp || !selectedWorkflow) return null;
     return (
       <>
         <label>
           模型提供方
           <select
             value={String(agentNodeModel.provider ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "provider", event.target.value))}
+            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "provider", event.target.value))}
           >
             <option value="">继承 App</option>
             {MODEL_PROVIDERS.map((provider) => (
@@ -993,14 +1269,14 @@ function App() {
           <input
             placeholder={selectedOwnedApp.model_name}
             value={String(agentNodeModel.model_name ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "model_name", event.target.value))}
+            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "model_name", event.target.value))}
           />
         </label>
         <label>
           模型凭据
           <select
             value={String(agentNodeModel.credential_id ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "credential_id", event.target.value))}
+            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "credential_id", event.target.value))}
           >
             <option value="">继承 App</option>
             {credentials.map((credential) => (
@@ -1015,7 +1291,7 @@ function App() {
           <input
             placeholder={selectedOwnedApp.model_base_url || "https://api.openai.com/v1"}
             value={String(agentNodeModel.base_url ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "base_url", event.target.value))}
+            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "base_url", event.target.value))}
           />
         </label>
         <div className="grid-two">
@@ -1025,7 +1301,7 @@ function App() {
               type="number"
               placeholder={String(selectedOwnedApp.temperature)}
               value={String(agentNodeModel.temperature ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "temperature", event.target.value))}
+              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "temperature", event.target.value))}
             />
           </label>
           <label>
@@ -1034,7 +1310,7 @@ function App() {
               type="number"
               placeholder={String(selectedOwnedApp.top_p)}
               value={String(agentNodeModel.top_p ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "top_p", event.target.value))}
+              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "top_p", event.target.value))}
             />
           </label>
         </div>
@@ -1044,7 +1320,7 @@ function App() {
             type="number"
             placeholder={String(selectedOwnedApp.max_tokens)}
             value={String(agentNodeModel.max_tokens ?? "")}
-            onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "max_tokens", event.target.value))}
+            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "max_tokens", event.target.value))}
           />
         </label>
         <div className="sub-panel-title">Agent Context</div>
@@ -1055,7 +1331,7 @@ function App() {
               type="number"
               placeholder="8192"
               value={String(agentNodeModel.model_context_window ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "model_context_window", event.target.value))}
+              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "model_context_window", event.target.value))}
             />
           </label>
           <label>
@@ -1064,7 +1340,7 @@ function App() {
               type="number"
               placeholder="400"
               value={String(agentNodeModel.context_safety_margin ?? "")}
-              onChange={(event) => setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "context_safety_margin", event.target.value))}
+              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "context_safety_margin", event.target.value))}
             />
           </label>
         </div>
@@ -1075,7 +1351,7 @@ function App() {
             placeholder="1024"
             value={String(agentNodeModel.context_reserved_output_tokens ?? "")}
             onChange={(event) =>
-              setSelectedApp(updateAgentNodeModel(selectedOwnedApp, "context_reserved_output_tokens", event.target.value))
+              setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "context_reserved_output_tokens", event.target.value))
             }
           />
         </label>
@@ -1152,7 +1428,7 @@ function App() {
         <div className="sub-panel-title">工具</div>
         {tools.map((tool) => (
           <label className="check" key={tool.name}>
-            <input type="checkbox" checked={enabledToolNames.includes(tool.name)} onChange={() => toggleTool(tool.name)} />
+            <input type="checkbox" checked={enabledAgentToolNames.includes(tool.name)} onChange={() => toggleTool(tool.name)} />
             <span>
               <strong>{tool.label}</strong>
               <small>{tool.description}</small>
@@ -1164,7 +1440,7 @@ function App() {
   }
 
   function renderSelectedNodeSettings() {
-    if (!selectedOwnedApp || !selectedWorkflowNode) return null;
+    if (!selectedOwnedApp || !selectedWorkflow || !selectedWorkflowNode) return null;
     const nodeIndex = workflowNodes.indexOf(selectedWorkflowNode);
     const title = getWorkflowNodeLabel(selectedWorkflowNode, Math.max(nodeIndex, 0));
     const id = getWorkflowNodeId(selectedWorkflowNode, Math.max(nodeIndex, 0));
@@ -1345,23 +1621,9 @@ function App() {
               onClick={() => selectApp(app)}
             >
               <strong>{app.name}</strong>
-              <span>{app.status}</span>
+              <span>{app.description || app.id}</span>
             </button>
           ))}
-          <div className="app-section-title">已发布应用</div>
-          {publishedApps.map((app) => {
-            const ownedApp = apps.find((item) => item.id === app.id);
-            return (
-              <button
-                key={app.id}
-                className={selectedApp?.id === app.id ? "app-item active" : "app-item"}
-                onClick={() => selectApp(ownedApp ?? app)}
-              >
-                <strong>{app.name}</strong>
-                <span>{app.owned ? "我发布的" : "可使用"}</span>
-              </button>
-            );
-          })}
         </div>
       </aside>
 
@@ -1376,21 +1638,21 @@ function App() {
             {renderKnowledgeDatabasePanel()}
             {renderCredentialPanel()}
             {renderAppSettings()}
+            {renderWorkflowListPanel()}
+            {renderWorkflowSettings()}
             {renderWorkflowCanvas()}
             {renderSelectedNodeSettings()}
             <div className="actions-row">
-              <button className="secondary inline-button" onClick={saveConfig}>
+              <button className="secondary inline-button" disabled={Boolean(draftSpecError)} onClick={saveConfig}>
                 <Save size={16} /> 保存
               </button>
-              {selectedOwnedApp?.status === "published" ? (
-                <button className="secondary inline-button" onClick={unpublishSelectedApp}>
-                  取消发布
-                </button>
-              ) : (
-                <button className="secondary inline-button" onClick={publishSelectedApp}>
-                  发布
-                </button>
-              )}
+              <button
+                className="secondary inline-button"
+                disabled={!canEditSelectedWorkflow || Boolean(draftSpecError)}
+                onClick={publishSelectedWorkflow}
+              >
+                Publish Workflow
+              </button>
             </div>
           </>
         ) : (
@@ -1419,6 +1681,7 @@ function App() {
             ))
           )}
         </div>
+        {selectedWorkflow && !selectedWorkflowPublished ? <div className="notice">Workflow is not published.</div> : null}
         <div className="composer">
           <input
             value={input}
@@ -1427,7 +1690,7 @@ function App() {
               if (event.key === "Enter") sendMessage();
             }}
           />
-          <button className="primary" disabled={busy || !selectedApp} onClick={sendMessage}>
+          <button className="primary" disabled={busy || !selectedWorkflowPublished} onClick={sendMessage}>
             <Play size={16} /> 发送
           </button>
         </div>
@@ -1446,9 +1709,22 @@ function App() {
           <section className="panel">
             <div className="panel-title">最近 Runs</div>
             {runs.map((run) => (
-              <div className="run" key={run.id}>
+              <button className={selectedRunId === run.id ? "run active" : "run"} key={run.id} onClick={() => selectRun(run)}>
                 <strong>{run.status}</strong>
-                <span>{run.latency_ms} ms</span>
+                <span>{run.workflow_version_id.slice(0, 8)} · {run.latency_ms} ms</span>
+              </button>
+            ))}
+          </section>
+        ) : null}
+        {runSteps.length ? (
+          <section className="panel">
+            <div className="panel-title">Run Steps</div>
+            {runSteps.map((step) => (
+              <div className="run-step" key={step.id}>
+                <strong>{step.name || step.type}</strong>
+                <span>
+                  {step.type} · {step.latency_ms} ms{step.error ? ` · ${step.error}` : ""}
+                </span>
               </div>
             ))}
           </section>

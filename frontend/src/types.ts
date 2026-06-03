@@ -3,7 +3,6 @@ export type AppItem = {
   owner_user_id: string;
   name: string;
   description: string;
-  status: string;
   system_prompt: string;
   model_provider: string;
   model_name: string;
@@ -12,18 +11,27 @@ export type AppItem = {
   temperature: number;
   top_p: number;
   max_tokens: number;
-  workflow_spec: Record<string, unknown>;
-};
-
-export type PublishedAppItem = {
-  id: string;
-  owner_user_id: string;
-  name: string;
-  description: string;
-  status: string;
-  owned: boolean;
   created_at: string;
   updated_at: string;
+};
+
+export type WorkflowItem = {
+  id: string;
+  app_id: string;
+  name: string;
+  description: string;
+  draft_spec: Record<string, unknown>;
+  published_version_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowVersionItem = {
+  id: string;
+  workflow_id: string;
+  version_number: number;
+  spec_json: Record<string, unknown>;
+  created_at: string;
 };
 
 export type ModelCredential = {
@@ -89,19 +97,29 @@ export type AuthResponse = {
   user: UserItem;
 };
 
-export type AppTool = {
-  tool_name: string;
-  enabled: boolean;
-};
-
 export type RunItem = {
   id: string;
   app_id: string;
+  workflow_id: string;
+  workflow_version_id: string;
   conversation_id: string;
   status: string;
   latency_ms: number;
   error: string;
   created_at: string;
+};
+
+export type RunStepItem = {
+  id: string;
+  run_id: string;
+  type: string;
+  name: string;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  latency_ms: number;
+  error: string;
+  started_at: string;
+  ended_at: string | null;
 };
 
 export type MessageItem = {

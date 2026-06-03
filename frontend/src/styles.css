@@ -328,6 +328,99 @@ textarea {
   background: #cfd8e5;
 }
 
+.panel-title-between {
+  justify-content: space-between;
+}
+
+.panel-title-between span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-list,
+.version-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.workflow-list-item,
+.version-item,
+.run-step {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  border: 1px solid #d9e0ea;
+  border-radius: 8px;
+  padding: 10px;
+  background: #ffffff;
+  color: #172033;
+  text-align: left;
+}
+
+.workflow-list-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  cursor: pointer;
+}
+
+.workflow-list-item.active {
+  border-color: #176b5f;
+  box-shadow: inset 3px 0 0 #176b5f;
+}
+
+.workflow-list-item span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.workflow-list-item strong,
+.workflow-list-item small,
+.version-item span,
+.run-step span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.status-pill {
+  border: 1px solid #d9e0ea;
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #f8fafc;
+  color: #64748b;
+}
+
+.status-pill.published {
+  border-color: #bfd7d1;
+  background: #eef8f5;
+  color: #176b5f;
+}
+
+.json-editor {
+  min-height: 240px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.error-notice {
+  margin-top: 10px;
+  border: 1px solid #f0c5cf;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff1f3;
+  color: #9f1d35;
+  font-size: 12px;
+}
+
+.danger {
+  margin-top: 12px;
+  color: #9f1d35;
+}
+
 .node-inspector {
   padding-bottom: 4px;
 }
@@ -583,9 +676,20 @@ pre {
 .run {
   display: flex;
   justify-content: space-between;
+  width: 100%;
+  border: 0;
   border-bottom: 1px solid #d9e0ea;
   padding: 10px 0;
+  background: transparent;
+  color: #172033;
+  cursor: pointer;
   font-size: 13px;
+  text-align: left;
+}
+
+.run.active {
+  color: #176b5f;
+  font-weight: 700;
 }
 
 @media (max-width: 1200px) {
