@@ -63,7 +63,10 @@ def delete(kb_id: str, db: Session = Depends(get_db), current_user: User = Depen
     kb = get_knowledge_base(db, kb_id, current_user.id)
     if not kb:
         raise HTTPException(status_code=404, detail="Knowledge database not found")
-    delete_knowledge_base(db, kb)
+    try:
+        delete_knowledge_base(db, kb)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True}
 
 

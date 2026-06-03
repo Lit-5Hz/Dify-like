@@ -23,6 +23,7 @@ from app.services.retrieval_defaults import (
 )
 from app.services.retrieval_service import retrieve_chunks
 from app.services.run_log_service import add_step
+from app.services.agent_tool_spec import resolve_agent_enabled_builtin_tool_names
 
 
 @dataclass
@@ -33,27 +34,26 @@ class WorkflowResult:
 
 
 class WorkflowExecutor:
-    def __init__(self, db: Session, app: Any, run_id: str):
+    def __init__(self, db: Session, app: Any, workflow_spec: dict[str, Any], run_id: str):
         self.db = db
         self.app = app
+        self.workflow_spec = workflow_spec
         self.run_id = run_id
         self.result = WorkflowResult()
 
     async def execute(
         self,
         query: str,
-        enabled_tools: list[str],
         conversation_id: str = "",
         user_id: str = "",
     ) -> AsyncIterator[RuntimeEvent]:
         context: dict[str, Any] = {
             "query": query,
-            "enabled_tools": enabled_tools,
             "conversation_id": conversation_id,
             "user_id": user_id,
         }
 
-        for node in self._ordered_nodes(self.app.workflow_spec):
+        for node in self._ordered_nodes(self.workflow_spec):
             node_type = self._normalize_type(str(node.get("type", "")))
             if node_type == "start":
                 for event in self._execute_start(node, context):
@@ -167,6 +167,7 @@ class WorkflowExecutor:
             except Exception as exc:
                 raise ValueError(str(exc)) from exc
 
+        enabled_tools = resolve_agent_enabled_builtin_tool_names(node)
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
@@ -177,7 +178,7 @@ class WorkflowExecutor:
             model_credential_id=credential_id,
             api_key=api_key,
             node_config=node,
-            enabled_tools=context["enabled_tools"],
+            enabled_tools=enabled_tools,
             retrieved_chunks=self.result.retrieved_chunks,
         )
 
@@ -221,6 +222,7 @@ class WorkflowExecutor:
                 "model_name": invocation.model_name,
                 "model_credential_id": invocation.model_credential_id,
                 "model_base_url": model_config.get("base_url", ""),
+                "enabled_tools": enabled_tools,
             },
             {
                 "answer": final_answer,

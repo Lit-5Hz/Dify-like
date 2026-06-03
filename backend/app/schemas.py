@@ -32,6 +32,14 @@ DEFAULT_WORKFLOW_SPEC = {
         {
             "id": "agent",
             "type": "react_agent",
+            "tools": [
+                {
+                    "type": "builtin",
+                    "name": "query_order",
+                    "enabled": True,
+                    "config": {},
+                }
+            ],
             "model": {},
         },
         {"id": "end", "type": "end"},
@@ -51,13 +59,11 @@ class AppCreate(BaseModel):
     temperature: int = 70
     top_p: int = 100
     max_tokens: int = 1024
-    workflow_spec: dict[str, Any] = Field(default_factory=lambda: deepcopy(DEFAULT_WORKFLOW_SPEC))
 
 
 class AppUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
-    status: str | None = None
     system_prompt: str | None = None
     model_provider: str | None = None
     model_name: str | None = None
@@ -66,7 +72,6 @@ class AppUpdate(BaseModel):
     temperature: int | None = None
     top_p: int | None = None
     max_tokens: int | None = None
-    workflow_spec: dict[str, Any] | None = None
 
 
 class AppOut(BaseModel):
@@ -74,7 +79,6 @@ class AppOut(BaseModel):
     owner_user_id: str
     name: str
     description: str
-    status: str
     system_prompt: str
     model_provider: str
     model_name: str
@@ -83,9 +87,43 @@ class AppOut(BaseModel):
     temperature: int
     top_p: int
     max_tokens: int
-    workflow_spec: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowCreate(BaseModel):
+    name: str = Field(default="Default workflow", min_length=1, max_length=120)
+    description: str = ""
+    draft_spec: dict[str, Any] = Field(default_factory=lambda: deepcopy(DEFAULT_WORKFLOW_SPEC))
+
+
+class WorkflowUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+    draft_spec: dict[str, Any] | None = None
+
+
+class WorkflowOut(BaseModel):
+    id: str
+    app_id: str
+    name: str
+    description: str
+    draft_spec: dict[str, Any]
+    published_version_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowVersionOut(BaseModel):
+    id: str
+    workflow_id: str
+    version_number: int
+    spec_json: dict[str, Any]
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
@@ -130,15 +168,6 @@ class ModelCredentialOut(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-class AppToolUpdate(BaseModel):
-    tool_names: list[str]
-
-
-class AppToolOut(BaseModel):
-    tool_name: str
-    enabled: bool
 
 
 class ChatRequest(BaseModel):
@@ -208,6 +237,8 @@ class KnowledgeDocumentOut(BaseModel):
 class RunOut(BaseModel):
     id: str
     app_id: str
+    workflow_id: str
+    workflow_version_id: str
     conversation_id: str
     status: str
     latency_ms: int

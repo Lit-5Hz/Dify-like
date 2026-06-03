@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,7 +36,6 @@ class App(Base):
     owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous")
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
-    status: Mapped[str] = mapped_column(String(32), default="draft")
     system_prompt: Mapped[str] = mapped_column(Text, default="")
     model_provider: Mapped[str] = mapped_column(String(80), default="mock")
     model_name: Mapped[str] = mapped_column(String(120), default="mock-react")
@@ -45,11 +44,10 @@ class App(Base):
     temperature: Mapped[int] = mapped_column(Integer, default=70)
     top_p: Mapped[int] = mapped_column(Integer, default=100)
     max_tokens: Mapped[int] = mapped_column(Integer, default=1024)
-    workflow_spec: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = now_col()
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    tools: Mapped[list["AppTool"]] = relationship(back_populates="app", cascade="all, delete-orphan")
+    workflows: Mapped[list["Workflow"]] = relationship(back_populates="app", cascade="all, delete-orphan")
 
 
 class ModelCredential(Base):
@@ -127,18 +125,49 @@ class KnowledgeChunk(Base):
     document: Mapped[KnowledgeDocument] = relationship(back_populates="chunks")
 
 
-class AppTool(Base):
-    __tablename__ = "app_tools"
+class Workflow(Base):
+    __tablename__ = "workflows"
 
     id: Mapped[str] = uuid_pk()
-    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
-    tool_name: Mapped[str] = mapped_column(String(120), nullable=False)
-    enabled: Mapped[bool] = mapped_column(default=True)
-    config_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    draft_spec: Mapped[dict] = mapped_column(JSONB, default=dict)
+    published_version_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("workflow_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+        index=True,
+    )
     created_at: Mapped[datetime] = now_col()
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    app: Mapped[App] = relationship(back_populates="tools")
+    app: Mapped[App] = relationship(back_populates="workflows")
+    versions: Mapped[list["WorkflowVersion"]] = relationship(
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        foreign_keys="WorkflowVersion.workflow_id",
+        order_by="WorkflowVersion.version_number.desc()",
+    )
+    published_version: Mapped["WorkflowVersion | None"] = relationship(
+        foreign_keys=[published_version_id],
+        post_update=True,
+        uselist=False,
+    )
+
+
+class WorkflowVersion(Base):
+    __tablename__ = "workflow_versions"
+    __table_args__ = (UniqueConstraint("workflow_id", "version_number", name="uq_workflow_versions_workflow_version_number"),)
+
+    id: Mapped[str] = uuid_pk()
+    workflow_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("workflows.id", ondelete="CASCADE"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    spec_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+
+    workflow: Mapped[Workflow] = relationship(back_populates="versions", foreign_keys=[workflow_id])
 
 
 class Conversation(Base):
@@ -146,6 +175,7 @@ class Conversation(Base):
 
     id: Mapped[str] = uuid_pk()
     app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    workflow_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("workflows.id", ondelete="CASCADE"))
     source: Mapped[str] = mapped_column(String(32), default="playground")
     user_id: Mapped[str] = mapped_column(String(120), default="anonymous")
     created_at: Mapped[datetime] = now_col()
@@ -168,6 +198,8 @@ class Run(Base):
 
     id: Mapped[str] = uuid_pk()
     app_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("apps.id", ondelete="CASCADE"))
+    workflow_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("workflows.id", ondelete="CASCADE"))
+    workflow_version_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("workflow_versions.id", ondelete="CASCADE"))
     conversation_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("conversations.id", ondelete="CASCADE"))
     input_message_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)
     output_message_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)

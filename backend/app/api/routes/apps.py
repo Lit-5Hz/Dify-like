@@ -10,9 +10,6 @@ from app.services.app_service import (
     delete_app,
     get_owned_app,
     list_apps,
-    list_published_apps,
-    publish_app,
-    unpublish_app,
     update_app,
 )
 
@@ -30,11 +27,6 @@ def create(payload: AppCreate, db: Session = Depends(get_db), current_user: User
 @router.get("/apps", response_model=list[AppOut])
 def list_owned(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     return list_apps(db, current_user.id)
-
-
-@router.get("/published-apps")
-def list_public(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return list_published_apps(db, current_user.id)
 
 
 @router.get("/apps/{app_id}", response_model=AppOut)
@@ -69,18 +61,3 @@ def delete(app_id: str, db: Session = Depends(get_db), current_user: User = Depe
     delete_app(db, app)
     return {"ok": True}
 
-
-@router.post("/apps/{app_id}/publish", response_model=AppOut)
-def publish(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    app = get_owned_app(db, app_id, current_user.id)
-    if not app:
-        raise HTTPException(status_code=404, detail="App not found")
-    return publish_app(db, app)
-
-
-@router.post("/apps/{app_id}/unpublish", response_model=AppOut)
-def unpublish(app_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    app = get_owned_app(db, app_id, current_user.id)
-    if not app:
-        raise HTTPException(status_code=404, detail="App not found")
-    return unpublish_app(db, app)

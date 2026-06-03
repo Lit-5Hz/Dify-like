@@ -13,7 +13,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import App, KnowledgeBase, KnowledgeChunk, KnowledgeDocument
+from app.db.models import KnowledgeBase, KnowledgeChunk, KnowledgeDocument
 from app.db.session import SessionLocal
 from app.schemas import KnowledgeBaseCreate, KnowledgeBaseUpdate
 from app.services.qdrant_service import (
@@ -39,6 +39,10 @@ from app.services.retrieval_providers import (
     validate_embedding_dimensions,
 )
 from app.services.sparse_bm25 import build_bm25_sparse_vectors
+from app.services.workflow_service import (
+    published_workflow_references_knowledge_base,
+    remove_knowledge_base_from_workflow_drafts,
+)
 
 
 DIRECT_TEXT_SUFFIXES = {
@@ -131,11 +135,13 @@ def update_knowledge_base(db: Session, kb: KnowledgeBase, payload: KnowledgeBase
 
 
 def delete_knowledge_base(db: Session, kb: KnowledgeBase) -> None:
+    if published_workflow_references_knowledge_base(db, kb.id):
+        raise ValueError("Knowledge database is referenced by a published workflow version.")
     try:
         delete_collection(kb)
     except Exception:
         pass
-    _remove_knowledge_base_from_app_workflows(db, kb)
+    remove_knowledge_base_from_workflow_drafts(db, kb.owner_user_id, kb.id)
     db.delete(kb)
     db.commit()
 
@@ -200,6 +206,8 @@ def delete_knowledge_document(db: Session, kb: KnowledgeBase, document_id: str) 
 
 
 def rebuild_knowledge_base(db: Session, kb: KnowledgeBase) -> KnowledgeBase:
+    if published_workflow_references_knowledge_base(db, kb.id):
+        raise ValueError("Knowledge database is referenced by a published workflow version.")
     _assert_embedding_config_not_drifted(kb)
     try:
         delete_collection(kb)
@@ -318,34 +326,6 @@ def _refresh_knowledge_sparse_vectors(
         refresh_chunks,
         [sparse_vectors_by_chunk_id.get(chunk.id, {"indices": [], "values": []}) for chunk in refresh_chunks],
     )
-
-
-def _remove_knowledge_base_from_app_workflows(db: Session, kb: KnowledgeBase) -> None:
-    apps = list(db.scalars(select(App).where(App.owner_user_id == kb.owner_user_id)))
-    for app in apps:
-        spec = dict(app.workflow_spec or {})
-        nodes = spec.get("nodes")
-        if not isinstance(nodes, list):
-            continue
-        changed = False
-        next_nodes: list[Any] = []
-        for node in nodes:
-            if not isinstance(node, dict):
-                next_nodes.append(node)
-                continue
-            next_node = dict(node)
-            ids = next_node.get("knowledge_base_ids")
-            if isinstance(ids, list):
-                next_ids = [str(item) for item in ids if str(item) != kb.id]
-                if next_ids != ids:
-                    next_node["knowledge_base_ids"] = next_ids
-                    changed = True
-            if str(next_node.get("kb_id") or "") == kb.id:
-                next_node.pop("kb_id", None)
-                changed = True
-            next_nodes.append(next_node)
-        if changed:
-            app.workflow_spec = {**spec, "nodes": next_nodes}
 
 
 def _list_sparse_index_chunks(db: Session, kb: KnowledgeBase) -> list[KnowledgeChunk]:

@@ -5,9 +5,8 @@ from time import perf_counter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import Conversation, Message
+from app.db.models import App, Conversation, Message, Workflow, WorkflowVersion
 from app.runtime.workflow_executor import WorkflowExecutor
-from app.services.app_service import get_enabled_tool_names
 from app.services.run_log_service import add_step, create_run, finish_run
 
 
@@ -19,12 +18,23 @@ def get_conversation_for_user(db: Session, conversation_id: str, user_id: str) -
     return db.scalar(select(Conversation).where(Conversation.id == conversation_id, Conversation.user_id == user_id))
 
 
-def get_or_create_conversation(db: Session, app_id: str, user_id: str, conversation_id: str | None) -> Conversation:
+def get_or_create_conversation(
+    db: Session,
+    app_id: str,
+    workflow_id: str,
+    user_id: str,
+    conversation_id: str | None,
+) -> Conversation:
     if conversation_id:
         conversation = db.get(Conversation, conversation_id)
-        if conversation and conversation.app_id == app_id and conversation.user_id == user_id:
+        if (
+            conversation
+            and conversation.app_id == app_id
+            and conversation.workflow_id == workflow_id
+            and conversation.user_id == user_id
+        ):
             return conversation
-    conversation = Conversation(app_id=app_id, user_id=user_id)
+    conversation = Conversation(app_id=app_id, workflow_id=workflow_id, user_id=user_id)
     db.add(conversation)
     db.commit()
     db.refresh(conversation)
@@ -44,17 +54,24 @@ def add_message(db: Session, conversation_id: str, role: str, content: str, meta
     return message
 
 
-async def chat_once(db: Session, app, query: str, user_id: str, conversation_id: str | None = None) -> dict:
+async def chat_once(
+    db: Session,
+    app: App,
+    workflow: Workflow,
+    workflow_version: WorkflowVersion,
+    query: str,
+    user_id: str,
+    conversation_id: str | None = None,
+) -> dict:
     started = perf_counter()
-    conversation = get_or_create_conversation(db, app.id, user_id, conversation_id)
+    conversation = get_or_create_conversation(db, app.id, workflow.id, user_id, conversation_id)
     user_message = add_message(db, conversation.id, "user", query)
-    run = create_run(db, app.id, conversation.id, user_message.id)
+    run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
 
-    enabled_tools = get_enabled_tool_names(db, app.id)
-    executor = WorkflowExecutor(db, app, run.id)
+    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
     adapter_error = ""
     try:
-        async for event in executor.execute(query, enabled_tools, conversation.id, user_id):
+        async for event in executor.execute(query, conversation.id, user_id):
             if event["type"] == "adapter_error":
                 adapter_error = str(event.get("message", "Agent adapter error"))
                 break
@@ -89,22 +106,31 @@ async def chat_once(db: Session, app, query: str, user_id: str, conversation_id:
 
 async def chat_stream(
     db: Session,
-    app,
+    app: App,
+    workflow: Workflow,
+    workflow_version: WorkflowVersion,
     query: str,
     user_id: str,
     conversation_id: str | None = None,
 ) -> AsyncIterator[str]:
     started = perf_counter()
-    conversation = get_or_create_conversation(db, app.id, user_id, conversation_id)
+    conversation = get_or_create_conversation(db, app.id, workflow.id, user_id, conversation_id)
     user_message = add_message(db, conversation.id, "user", query)
-    run = create_run(db, app.id, conversation.id, user_message.id)
+    run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
 
-    yield _sse("run_started", {"conversation_id": conversation.id, "run_id": run.id})
-    enabled_tools = get_enabled_tool_names(db, app.id)
-    executor = WorkflowExecutor(db, app, run.id)
+    yield _sse(
+        "run_started",
+        {
+            "conversation_id": conversation.id,
+            "run_id": run.id,
+            "workflow_id": workflow.id,
+            "workflow_version_id": workflow_version.id,
+        },
+    )
+    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
     final_sent = False
     try:
-        async for event in executor.execute(query, enabled_tools, conversation.id, user_id):
+        async for event in executor.execute(query, conversation.id, user_id):
             if event["type"] == "retrieval":
                 yield _sse("retrieval", event)
             elif event["type"] == "tool_call":

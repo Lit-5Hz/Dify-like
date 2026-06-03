@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.credential_crypto import decrypt_secret, encrypt_secret, mask_secret
-from app.db.models import App, ModelCredential
+from app.db.models import App, ModelCredential, Workflow, WorkflowVersion
 from app.schemas import ModelCredentialCreate
 
 
@@ -89,8 +89,11 @@ def is_model_credential_in_use(db: Session, credential_id: str) -> bool:
     for app in db.scalars(select(App)).all():
         if getattr(app, "model_credential_id", "") == credential_id:
             return True
-        workflow_spec = getattr(app, "workflow_spec", {}) or {}
-        if _workflow_uses_credential(workflow_spec, credential_id):
+    for workflow in db.scalars(select(Workflow)).all():
+        if _workflow_uses_credential(workflow.draft_spec, credential_id):
+            return True
+    for version in db.scalars(select(WorkflowVersion)).all():
+        if _workflow_uses_credential(version.spec_json, credential_id):
             return True
     return False
 

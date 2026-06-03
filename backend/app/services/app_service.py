@@ -6,20 +6,24 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import App, AppTool, KnowledgeBase
+from app.db.models import App, Workflow
 from app.schemas import AppCreate, AppUpdate, DEFAULT_RETRIEVAL_NODE, DEFAULT_WORKFLOW_SPEC
 from app.services.model_credential_service import get_model_credential
 from app.services.retrieval_defaults import DEFAULT_QUERY_LLM_TEMPERATURE, DEFAULT_RETRIEVAL_TOP_K
+from app.services.agent_tool_spec import normalize_agent_tools
 
 
 LEGACY_NODE_TYPE = "".join(["r", "a", "g"])
 
 
 def normalize_workflow_spec(workflow_spec: dict | None) -> dict:
-    spec = deepcopy(workflow_spec or DEFAULT_WORKFLOW_SPEC)
+    is_default_spec = workflow_spec is None or workflow_spec is DEFAULT_WORKFLOW_SPEC
+    spec = deepcopy(DEFAULT_WORKFLOW_SPEC if workflow_spec is None else workflow_spec)
+    if not isinstance(spec, dict):
+        spec = {}
     nodes = spec.get("nodes", [])
     if not isinstance(nodes, list):
-        nodes = deepcopy(DEFAULT_WORKFLOW_SPEC["nodes"])
+        nodes = _default_workflow_nodes(include_default_agent_tools=is_default_spec)
 
     next_nodes: list[dict[str, Any]] = []
     has_retrieval_node = False
@@ -32,7 +36,7 @@ def normalize_workflow_spec(workflow_spec: dict | None) -> dict:
             has_retrieval_node = True
             next_nodes.append(_normalize_retrieval_node(node))
         else:
-            next_nodes.append(deepcopy(node))
+            next_nodes.append(_normalize_agent_node(node) if _is_agent_node(node) else deepcopy(node))
 
     if not any(_node_matches(item, "start") for item in next_nodes):
         next_nodes.insert(0, {"id": "start", "type": "start"})
@@ -58,32 +62,19 @@ def get_retrieval_node(workflow_spec: dict | None) -> dict[str, Any]:
 
 
 def get_owned_app(db: Session, app_id: str, owner_user_id: str) -> App | None:
-    app = db.scalar(select(App).where(App.id == app_id, App.owner_user_id == owner_user_id))
-    return _prepare_app_out(app) if app else None
+    return db.scalar(select(App).where(App.id == app_id, App.owner_user_id == owner_user_id))
 
 
 def get_app(db: Session, app_id: str, owner_user_id: str) -> App | None:
     return get_owned_app(db, app_id, owner_user_id)
 
 
-def get_chat_accessible_app(db: Session, app_id: str, user_id: str) -> App | None:
-    app = db.get(App, app_id)
-    if not app:
-        return None
-    if app.owner_user_id == user_id or app.status == "published":
-        return _prepare_app_out(app)
-    return None
-
-
 def create_app(db: Session, payload: AppCreate, owner_user_id: str) -> App:
-    workflow_spec = normalize_workflow_spec(payload.workflow_spec or DEFAULT_WORKFLOW_SPEC)
-    _validate_app_credentials(db, owner_user_id, payload.model_credential_id, workflow_spec)
-    _validate_workflow_knowledge_bases(db, owner_user_id, workflow_spec)
+    _validate_app_model_credential(db, owner_user_id, payload.model_credential_id)
     app = App(
         owner_user_id=owner_user_id,
         name=payload.name,
         description=payload.description,
-        status="draft",
         system_prompt=payload.system_prompt,
         model_provider=payload.model_provider,
         model_name=payload.model_name,
@@ -92,68 +83,36 @@ def create_app(db: Session, payload: AppCreate, owner_user_id: str) -> App:
         temperature=payload.temperature,
         top_p=payload.top_p,
         max_tokens=payload.max_tokens,
-        workflow_spec=workflow_spec,
     )
     db.add(app)
     db.flush()
-    db.add(AppTool(app_id=app.id, tool_name="query_order", enabled=True))
+    db.add(
+        Workflow(
+            app_id=app.id,
+            name="Default workflow",
+            description="",
+            draft_spec=normalize_workflow_spec(DEFAULT_WORKFLOW_SPEC),
+        )
+    )
     db.commit()
     db.refresh(app)
-    return _prepare_app_out(app)
+    return app
 
 
 def list_apps(db: Session, owner_user_id: str) -> list[App]:
-    apps = list(db.scalars(select(App).where(App.owner_user_id == owner_user_id).order_by(App.created_at.desc())))
-    return [_prepare_app_out(app) for app in apps]
-
-
-def list_published_apps(db: Session, user_id: str) -> list[dict[str, Any]]:
-    apps = list(db.scalars(select(App).where(App.status == "published").order_by(App.updated_at.desc())))
-    return [
-        {
-            "id": app.id,
-            "owner_user_id": app.owner_user_id,
-            "name": app.name,
-            "description": app.description,
-            "status": app.status,
-            "owned": app.owner_user_id == user_id,
-            "created_at": app.created_at,
-            "updated_at": app.updated_at,
-        }
-        for app in apps
-    ]
+    return list(db.scalars(select(App).where(App.owner_user_id == owner_user_id).order_by(App.created_at.desc())))
 
 
 def update_app(db: Session, app: App, payload: AppUpdate, owner_user_id: str) -> App:
     next_model_credential_id = payload.model_credential_id if payload.model_credential_id is not None else app.model_credential_id
-    next_workflow_spec = normalize_workflow_spec(payload.workflow_spec if payload.workflow_spec is not None else app.workflow_spec)
-    _validate_app_credentials(db, owner_user_id, next_model_credential_id, next_workflow_spec)
-    _validate_workflow_knowledge_bases(db, owner_user_id, next_workflow_spec)
+    _validate_app_model_credential(db, owner_user_id, next_model_credential_id)
 
     values = payload.model_dump(exclude_unset=True)
-    if "workflow_spec" in values:
-        values["workflow_spec"] = next_workflow_spec
-    if "status" in values and values["status"] not in {"draft", "published"}:
-        raise ValueError("App status must be draft or published.")
     for key, value in values.items():
         setattr(app, key, value)
     db.commit()
     db.refresh(app)
-    return _prepare_app_out(app)
-
-
-def publish_app(db: Session, app: App) -> App:
-    app.status = "published"
-    db.commit()
-    db.refresh(app)
-    return _prepare_app_out(app)
-
-
-def unpublish_app(db: Session, app: App) -> App:
-    app.status = "draft"
-    db.commit()
-    db.refresh(app)
-    return _prepare_app_out(app)
+    return app
 
 
 def delete_app(db: Session, app: App) -> None:
@@ -161,22 +120,22 @@ def delete_app(db: Session, app: App) -> None:
     db.commit()
 
 
-def set_app_tools(db: Session, app_id: str, tool_names: list[str]) -> list[AppTool]:
-    existing = {tool.tool_name: tool for tool in db.scalars(select(AppTool).where(AppTool.app_id == app_id))}
-    for tool in existing.values():
-        tool.enabled = tool.tool_name in tool_names
-    for tool_name in tool_names:
-        if tool_name not in existing:
-            db.add(AppTool(app_id=app_id, tool_name=tool_name, enabled=True))
-    db.commit()
-    return list(db.scalars(select(AppTool).where(AppTool.app_id == app_id).order_by(AppTool.tool_name)))
+def _default_workflow_nodes(include_default_agent_tools: bool) -> list[dict[str, Any]]:
+    nodes = deepcopy(DEFAULT_WORKFLOW_SPEC["nodes"])
+    if include_default_agent_tools:
+        return nodes
+    for node in nodes:
+        if isinstance(node, dict) and _is_agent_node(node):
+            node["tools"] = []
+    return nodes
 
 
-def get_enabled_tool_names(db: Session, app_id: str) -> list[str]:
-    rows = db.scalars(
-        select(AppTool).where(AppTool.app_id == app_id, AppTool.enabled.is_(True)).order_by(AppTool.tool_name)
-    )
-    return [row.tool_name for row in rows]
+def _normalize_agent_node(node: dict[str, Any]) -> dict[str, Any]:
+    next_node = deepcopy(node)
+    raw_tools = next_node.get("tools")
+    if isinstance(raw_tools, list) and all(isinstance(tool, dict) for tool in raw_tools):
+        next_node["tools"] = normalize_agent_tools(next_node.get("tools", []))
+    return next_node
 
 
 def _normalize_retrieval_node(node: dict[str, Any]) -> dict[str, Any]:
@@ -233,9 +192,8 @@ def _node_matches(node: dict[str, Any], value: str) -> bool:
     return str(node.get("id") or "") == value or str(node.get("type") or "") == value
 
 
-def _prepare_app_out(app: App) -> App:
-    app.workflow_spec = normalize_workflow_spec(app.workflow_spec)
-    return app
+def _is_agent_node(node: dict[str, Any]) -> bool:
+    return str(node.get("id") or "") == "agent" or str(node.get("type") or "") in {"agent", "react_agent"}
 
 
 def _collect_workflow_credential_ids(workflow_spec: dict | None) -> set[str]:
@@ -271,31 +229,10 @@ def _collect_workflow_knowledge_base_ids(workflow_spec: dict | None) -> set[str]
     return ids
 
 
-def _validate_app_credentials(
-    db: Session,
-    owner_user_id: str,
-    model_credential_id: str | None,
-    workflow_spec: dict | None,
-) -> None:
-    credential_ids = {str(model_credential_id or "").strip()} if str(model_credential_id or "").strip() else set()
-    credential_ids.update(_collect_workflow_credential_ids(workflow_spec))
-    for credential_id in credential_ids:
-        if not get_model_credential(db, credential_id, owner_user_id):
-            raise ValueError(f"Model credential not found: {credential_id}")
-
-
-def _validate_workflow_knowledge_bases(db: Session, owner_user_id: str, workflow_spec: dict | None) -> None:
-    kb_ids = _collect_workflow_knowledge_base_ids(workflow_spec)
-    for kb_id in kb_ids:
-        exists = db.scalar(
-            select(KnowledgeBase.id).where(
-                KnowledgeBase.id == kb_id,
-                KnowledgeBase.owner_user_id == owner_user_id,
-                KnowledgeBase.scope == "creator",
-            )
-        )
-        if not exists:
-            raise ValueError(f"Knowledge database not found: {kb_id}")
+def _validate_app_model_credential(db: Session, owner_user_id: str, model_credential_id: str | None) -> None:
+    credential_id = str(model_credential_id or "").strip()
+    if credential_id and not get_model_credential(db, credential_id, owner_user_id):
+        raise ValueError(f"Model credential not found: {credential_id}")
 
 
 def _normalize_id_list(value: Any) -> list[str]:
