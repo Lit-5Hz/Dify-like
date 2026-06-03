@@ -399,6 +399,12 @@ textarea {
   color: #176b5f;
 }
 
+.status-pill.dirty {
+  border-color: #e4cf9e;
+  background: #fff8e6;
+  color: #895b0d;
+}
+
 .json-editor {
   min-height: 240px;
   font-family: "Cascadia Code", Consolas, monospace;

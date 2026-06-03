@@ -86,6 +86,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function defaultCredentialProvider(provider: string) {
   return provider && provider !== "mock" ? provider : "openai_compatible";
 }
@@ -311,6 +324,15 @@ function App() {
   const selectedOwnedApp = selectedApp?.owner_user_id === user?.id ? selectedApp : null;
   const selectedWorkflowId = selectedWorkflow?.id ?? "";
   const selectedWorkflowPublished = Boolean(selectedWorkflow?.published_version_id);
+  const selectedPublishedVersion = useMemo(
+    () => workflowVersions.find((version) => version.id === selectedWorkflow?.published_version_id) ?? null,
+    [selectedWorkflow?.published_version_id, workflowVersions],
+  );
+  const selectedWorkflowHasUnpublishedChanges = Boolean(
+    selectedWorkflow &&
+      selectedPublishedVersion &&
+      stableStringify(selectedWorkflow.draft_spec ?? {}) !== stableStringify(selectedPublishedVersion.spec_json ?? {}),
+  );
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
   const canEditSelectedApp = Boolean(selectedOwnedApp);
   const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
@@ -952,21 +974,33 @@ function App() {
           </button>
         </div>
         <div className="workflow-list">
-          {workflows.map((workflow) => (
-            <button
-              className={selectedWorkflowId === workflow.id ? "workflow-list-item active" : "workflow-list-item"}
-              key={workflow.id}
-              onClick={() => selectWorkflow(workflow)}
-            >
-              <span>
-                <strong>{workflow.name}</strong>
-                <small>{workflow.description || workflow.id}</small>
-              </span>
-              <small className={workflow.published_version_id ? "status-pill published" : "status-pill"}>
-                {workflow.published_version_id ? "Published" : "Draft only"}
-              </small>
-            </button>
-          ))}
+          {workflows.map((workflow) => {
+            const isSelected = selectedWorkflowId === workflow.id;
+            const hasUnpublishedChanges = isSelected && selectedWorkflowHasUnpublishedChanges;
+            const statusLabel = hasUnpublishedChanges
+              ? "Unpublished changes"
+              : workflow.published_version_id
+                ? "Published"
+                : "Draft only";
+            const statusClass = hasUnpublishedChanges
+              ? "status-pill dirty"
+              : workflow.published_version_id
+                ? "status-pill published"
+                : "status-pill";
+            return (
+              <button
+                className={isSelected ? "workflow-list-item active" : "workflow-list-item"}
+                key={workflow.id}
+                onClick={() => selectWorkflow(workflow)}
+              >
+                <span>
+                  <strong>{workflow.name}</strong>
+                  <small>{workflow.description || workflow.id}</small>
+                </span>
+                <small className={statusClass}>{statusLabel}</small>
+              </button>
+            );
+          })}
           {workflows.length === 0 ? <p className="empty">No workflows found for this App.</p> : null}
         </div>
       </section>
@@ -997,8 +1031,17 @@ function App() {
         </label>
         <div className="readonly-node">
           <strong>{selectedWorkflow.published_version_id || "Workflow is not published"}</strong>
-          <small>published_version_id</small>
+          <small>
+            {selectedWorkflowHasUnpublishedChanges
+              ? "current draft has unpublished changes"
+              : selectedWorkflow.published_version_id
+                ? "published_version_id"
+                : "publish before chat"}
+          </small>
         </div>
+        {selectedWorkflowHasUnpublishedChanges ? (
+          <div className="notice">Current draft has unpublished changes. Chat still runs the published version.</div>
+        ) : null}
         {workflowVersions.length ? (
           <div className="version-list">
             {workflowVersions.map((version) => (
@@ -1682,6 +1725,9 @@ function App() {
           )}
         </div>
         {selectedWorkflow && !selectedWorkflowPublished ? <div className="notice">Workflow is not published.</div> : null}
+        {selectedWorkflowHasUnpublishedChanges ? (
+          <div className="notice">Draft has unpublished changes. This chat uses the last published version.</div>
+        ) : null}
         <div className="composer">
           <input
             value={input}
