@@ -34,6 +34,22 @@ export type WorkflowVersionItem = {
   created_at: string;
 };
 
+export type WorkflowMcpServerItem = {
+  id: string;
+  workflow_id: string;
+  enabled: boolean;
+  server_name: string;
+  server_slug: string;
+  description: string;
+  auth_type: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowMcpServerProvisionItem = WorkflowMcpServerItem & {
+  token: string | null;
+};
+
 export type ModelCredential = {
   id: string;
   provider: string;
@@ -83,6 +99,30 @@ export type ToolItem = {
   name: string;
   label: string;
   description: string;
+};
+
+export type ExternalMcpServerItem = {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  description: string;
+  transport_type: string;
+  server_url: string;
+  auth_type: string;
+  has_auth_secret: boolean;
+  status: string;
+  last_sync_at: string | null;
+  last_sync_error: string;
+  tool_manifest_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ExternalMcpToolItem = {
+  server_id: string;
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
 };
 
 export type UserItem = {

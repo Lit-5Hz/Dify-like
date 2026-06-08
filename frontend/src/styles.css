@@ -582,6 +582,50 @@ textarea {
   padding: 0 14px;
 }
 
+.token-block {
+  min-height: 96px;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.mcp-tool-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mcp-tool-item,
+.mcp-tool-group {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #d9e0ea;
+  border-radius: 8px;
+  padding: 10px;
+  background: #ffffff;
+}
+
+.mcp-tool-item small,
+.mcp-tool-group small {
+  overflow-wrap: anywhere;
+}
+
+.mcp-tool-group {
+  margin-top: 10px;
+}
+
+.mcp-tool-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mcp-tool-group-meta {
+  color: #6b7688;
+  font-size: 12px;
+}
+
 .check {
   grid-template-columns: 18px 1fr;
   align-items: start;

@@ -7,9 +7,13 @@ import type {
   ModelCredential,
   RunItem,
   RunStepItem,
+  ExternalMcpServerItem,
+  ExternalMcpToolItem,
   ToolItem,
   UserItem,
   WorkflowItem,
+  WorkflowMcpServerItem,
+  WorkflowMcpServerProvisionItem,
   WorkflowVersionItem,
 } from "./types";
 
@@ -123,6 +127,19 @@ export const api = {
       method: "POST",
     }),
   listWorkflowVersions: (workflowId: string) => request<WorkflowVersionItem[]>(`/workflows/${workflowId}/versions`),
+  getWorkflowMcpServer: (workflowId: string) => request<WorkflowMcpServerItem | null>(`/workflows/${workflowId}/mcp-server`),
+  upsertWorkflowMcpServer: (
+    workflowId: string,
+    payload: { enabled: boolean; server_name: string; server_slug: string; description: string },
+  ) =>
+    request<WorkflowMcpServerProvisionItem>(`/workflows/${workflowId}/mcp-server`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  rotateWorkflowMcpServerToken: (workflowId: string) =>
+    request<WorkflowMcpServerProvisionItem>(`/workflows/${workflowId}/mcp-server/rotate-token`, {
+      method: "POST",
+    }),
   listKnowledgeBases: () => request<KnowledgeBase[]>("/knowledge-bases"),
   createKnowledgeBase: (payload: { name: string; description: string }) =>
     request<KnowledgeBase>("/knowledge-bases", {
@@ -163,6 +180,44 @@ export const api = {
     }),
   retrievalCapabilities: () => request<Record<string, unknown>>("/retrieval/capabilities"),
   listTools: () => request<ToolItem[]>("/tools"),
+  listExternalMcpServers: () => request<ExternalMcpServerItem[]>("/mcp/servers"),
+  createExternalMcpServer: (payload: {
+    name: string;
+    description: string;
+    transport_type: string;
+    server_url: string;
+    auth_type: string;
+    auth_secret: string;
+  }) =>
+    request<ExternalMcpServerItem>("/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getExternalMcpServer: (serverId: string) => request<ExternalMcpServerItem>(`/mcp/servers/${serverId}`),
+  updateExternalMcpServer: (
+    serverId: string,
+    payload: Partial<{
+      name: string;
+      description: string;
+      transport_type: string;
+      server_url: string;
+      auth_type: string;
+      auth_secret: string;
+    }>,
+  ) =>
+    request<ExternalMcpServerItem>(`/mcp/servers/${serverId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteExternalMcpServer: (serverId: string) =>
+    request<{ ok: boolean }>(`/mcp/servers/${serverId}`, {
+      method: "DELETE",
+    }),
+  syncExternalMcpServer: (serverId: string) =>
+    request<ExternalMcpServerItem>(`/mcp/servers/${serverId}/sync`, {
+      method: "POST",
+    }),
+  listExternalMcpTools: (serverId: string) => request<ExternalMcpToolItem[]>(`/mcp/servers/${serverId}/tools`),
   listModelCredentials: () => request<ModelCredential[]>("/model-credentials"),
   createModelCredential: (payload: { provider: string; name: string; api_key: string }) =>
     request<ModelCredential>("/model-credentials", {

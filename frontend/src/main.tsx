@@ -7,11 +7,13 @@ import {
   GitBranch,
   History,
   KeyRound,
+  Link2,
   LogIn,
   LogOut,
   MessageSquare,
   Play,
   Plus,
+  RefreshCw,
   Save,
   Trash2,
   UserRound,
@@ -21,6 +23,7 @@ import { api, streamChat } from "./api";
 import type {
   AppItem,
   ChatMessage,
+  ExternalMcpServerItem,
   KnowledgeBase,
   KnowledgeDocument,
   ModelCredential,
@@ -29,6 +32,8 @@ import type {
   ToolItem,
   UserItem,
   WorkflowItem,
+  WorkflowMcpServerItem,
+  WorkflowMcpServerProvisionItem,
   WorkflowVersionItem,
 } from "./types";
 import "./styles.css";
@@ -37,6 +42,9 @@ const MODEL_PROVIDERS = ["mock", "openai", "openai_compatible", "deepseek", "das
 const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "mock");
 const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
 const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
+const MCP_TRANSPORT_TYPES = ["streamable_http"];
+const MCP_AUTH_TYPES = ["none", "bearer"];
+const NEW_EXTERNAL_MCP_SERVER_ID = "__new_external_mcp_server__";
 const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
 
 type AgentNodeModel = {
@@ -73,6 +81,24 @@ type AgentToolConfig = {
   config: Record<string, unknown>;
 };
 
+type WorkflowMcpServerDraft = {
+  configured: boolean;
+  enabled: boolean;
+  server_name: string;
+  server_slug: string;
+  description: string;
+  auth_type: string;
+};
+
+type ExternalMcpServerDraft = {
+  name: string;
+  description: string;
+  transport_type: string;
+  server_url: string;
+  auth_type: string;
+  auth_secret: string;
+};
+
 type WorkflowNode = Record<string, unknown>;
 
 type WorkflowEdge = {
@@ -101,6 +127,21 @@ function stableStringify(value: unknown): string {
 
 function defaultCredentialProvider(provider: string) {
   return provider && provider !== "mock" ? provider : "openai_compatible";
+}
+
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) return "Not synced";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function slugifyMcpServerName(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function defaultQueryLlmBaseUrl(provider: string) {
@@ -187,6 +228,19 @@ function getEnabledAgentToolNames(node: WorkflowNode | null): string[] {
     .map((tool) => tool.name);
 }
 
+function getEnabledAgentMcpToolKeys(node: WorkflowNode | null): string[] {
+  return getAgentNodeTools(node)
+    .filter((tool) => tool.type === "mcp" && tool.enabled)
+    .map((tool) => {
+      const serverId = typeof tool.config.server_id === "string" ? tool.config.server_id : "";
+      return buildMcpToolKey(serverId, tool.name);
+    });
+}
+
+function buildMcpToolKey(serverId: string, toolName: string) {
+  return `${serverId}::${toolName}`;
+}
+
 function isAgentNode(node: WorkflowNode) {
   const type = getWorkflowNodeType(node);
   return node.id === "agent" || type === "agent" || type === "react_agent";
@@ -197,7 +251,7 @@ function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolN
   const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
   const existingTools = getAgentNodeTools(targetNode);
   const uniqueToolNames = Array.from(new Set(toolNames));
-  const nextTools = uniqueToolNames.map((name) => {
+  const nextBuiltinTools = uniqueToolNames.map((name) => {
     const existingTool = existingTools.find((tool) => tool.type === "builtin" && tool.name === name);
     return {
       type: "builtin",
@@ -206,10 +260,11 @@ function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolN
       config: existingTool?.config ?? {},
     };
   });
+  const nextMcpTools = existingTools.filter((tool) => tool.type === "mcp");
   const nextNodes = nodes.map((node, index) => {
     const nodeId = getWorkflowNodeId(node, index);
     if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
-    return { ...node, tools: nextTools };
+    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
   });
   return {
     ...workflow,
@@ -217,6 +272,98 @@ function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolN
       ...(workflow.draft_spec ?? {}),
       nodes: nextNodes,
     },
+  };
+}
+
+function updateAgentNodeMcpTool(
+  workflow: WorkflowItem,
+  agentNodeId: string,
+  serverId: string,
+  toolName: string,
+  enabled: boolean,
+): WorkflowItem {
+  const nodes = getWorkflowNodes(workflow);
+  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
+  const existingTools = getAgentNodeTools(targetNode);
+  const nextBuiltinTools = existingTools.filter((tool) => tool.type === "builtin");
+  const existingMcpTools = existingTools.filter(
+    (tool) => !(tool.type === "mcp" && String(tool.config.server_id ?? "") === serverId && tool.name === toolName),
+  );
+  const nextMcpTools = enabled
+    ? [
+        ...existingMcpTools,
+        {
+          type: "mcp",
+          name: toolName,
+          enabled: true,
+          config: { server_id: serverId },
+        },
+      ]
+    : existingMcpTools;
+
+  const nextNodes = nodes.map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
+    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
+  });
+  return {
+    ...workflow,
+    draft_spec: {
+      ...(workflow.draft_spec ?? {}),
+      nodes: nextNodes,
+    },
+  };
+}
+
+function getExternalServerTools(server: ExternalMcpServerItem | null): Array<{ name: string; description: string }> {
+  if (!server || !isRecord(server.tool_manifest_json)) return [];
+  const tools = server.tool_manifest_json.tools;
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap((tool) => {
+    if (!isRecord(tool)) return [];
+    const name = typeof tool.name === "string" ? tool.name.trim() : "";
+    if (!name) return [];
+    return [{ name, description: typeof tool.description === "string" ? tool.description : "" }];
+  });
+}
+
+function getWorkflowMcpEndpoint(serverSlug: string) {
+  if (typeof window === "undefined") {
+    return `http://localhost:8000/mcp/${serverSlug}`;
+  }
+  return `${window.location.protocol}//${window.location.hostname}:8000/mcp/${serverSlug}`;
+}
+
+function buildDefaultWorkflowMcpServerDraft(workflow: WorkflowItem, existing: WorkflowMcpServerItem | null): WorkflowMcpServerDraft {
+  if (existing) {
+    return {
+      configured: true,
+      enabled: existing.enabled,
+      server_name: existing.server_name,
+      server_slug: existing.server_slug,
+      description: existing.description,
+      auth_type: existing.auth_type,
+    };
+  }
+  const workflowName = workflow.name.trim() || "Workflow";
+  return {
+    configured: false,
+    enabled: true,
+    server_name: workflowName,
+    server_slug: slugifyMcpServerName(workflowName) || "workflow",
+    description: workflow.description || `Run the published workflow ${workflowName}.`,
+    auth_type: "bearer",
+  };
+}
+
+function emptyExternalMcpServerDraft(): ExternalMcpServerDraft {
+  return {
+    name: "",
+    description: "",
+    transport_type: "streamable_http",
+    server_url: "",
+    auth_type: "none",
+    auth_secret: "",
   };
 }
 
@@ -296,6 +443,9 @@ function App() {
   const [workflows, setWorkflows] = useState<WorkflowItem[]>([]);
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowItem | null>(null);
   const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersionItem[]>([]);
+  const [workflowMcpServer, setWorkflowMcpServer] = useState<WorkflowMcpServerItem | null>(null);
+  const [workflowMcpDraft, setWorkflowMcpDraft] = useState<WorkflowMcpServerDraft | null>(null);
+  const [workflowMcpToken, setWorkflowMcpToken] = useState("");
   const [draftSpecText, setDraftSpecText] = useState("");
   const [draftSpecError, setDraftSpecError] = useState("");
   const [credentials, setCredentials] = useState<ModelCredential[]>([]);
@@ -309,6 +459,9 @@ function App() {
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
   const [knowledgeDraft, setKnowledgeDraft] = useState({ name: "", description: "" });
   const [tools, setTools] = useState<ToolItem[]>([]);
+  const [externalMcpServers, setExternalMcpServers] = useState<ExternalMcpServerItem[]>([]);
+  const [selectedExternalMcpServerId, setSelectedExternalMcpServerId] = useState("");
+  const [externalMcpDraft, setExternalMcpDraft] = useState<ExternalMcpServerDraft>(emptyExternalMcpServerDraft);
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [runSteps, setRunSteps] = useState<RunStepItem[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -334,6 +487,8 @@ function App() {
       stableStringify(selectedWorkflow.draft_spec ?? {}) !== stableStringify(selectedPublishedVersion.spec_json ?? {}),
   );
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
+  const selectedExternalMcpServer =
+    externalMcpServers.find((item) => item.id === selectedExternalMcpServerId) ?? null;
   const canEditSelectedApp = Boolean(selectedOwnedApp);
   const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
   const agentNodeModel = useMemo(() => (selectedWorkflow ? getAgentNodeModel(selectedWorkflow) : {}), [selectedWorkflow]);
@@ -348,6 +503,7 @@ function App() {
   const selectedWorkflowNodeType = selectedWorkflowNode ? getWorkflowNodeType(selectedWorkflowNode) : "";
   const selectedWorkflowNodeIsAgent = Boolean(selectedWorkflowNode && isAgentNode(selectedWorkflowNode));
   const enabledAgentToolNames = useMemo(() => getEnabledAgentToolNames(selectedWorkflowNode), [selectedWorkflowNode]);
+  const enabledAgentMcpToolKeys = useMemo(() => getEnabledAgentMcpToolKeys(selectedWorkflowNode), [selectedWorkflowNode]);
 
   function setActiveConversationId(nextConversationId: string | null) {
     conversationIdRef.current = nextConversationId;
@@ -360,6 +516,9 @@ function App() {
     setSelectedApp(null);
     setSelectedWorkflow(null);
     setWorkflowVersions([]);
+    setWorkflowMcpServer(null);
+    setWorkflowMcpDraft(null);
+    setWorkflowMcpToken("");
     setDraftSpecText("");
     setDraftSpecError("");
     setCredentials([]);
@@ -367,6 +526,9 @@ function App() {
     setSelectedKnowledgeBaseId("");
     setKnowledgeDocuments([]);
     setTools([]);
+    setExternalMcpServers([]);
+    setSelectedExternalMcpServerId("");
+    setExternalMcpDraft(emptyExternalMcpServerDraft());
     setRuns([]);
     setRunSteps([]);
     setSelectedRunId("");
@@ -394,6 +556,9 @@ function App() {
   async function selectWorkflow(workflow: WorkflowItem | null) {
     setSelectedWorkflow(workflow);
     setWorkflowVersions([]);
+    setWorkflowMcpServer(null);
+    setWorkflowMcpDraft(workflow ? buildDefaultWorkflowMcpServerDraft(workflow, null) : null);
+    setWorkflowMcpToken("");
     setDraftSpecText("");
     setDraftSpecError("");
     setRuns([]);
@@ -405,8 +570,14 @@ function App() {
     setSelectedWorkflowNodeId("");
     if (!workflow) return;
 
-    const [versionList, runList] = await Promise.all([api.listWorkflowVersions(workflow.id), api.listWorkflowRuns(workflow.id)]);
+    const [versionList, runList, mcpServer] = await Promise.all([
+      api.listWorkflowVersions(workflow.id),
+      api.listWorkflowRuns(workflow.id),
+      api.getWorkflowMcpServer(workflow.id).catch(() => null),
+    ]);
     setWorkflowVersions(versionList);
+    setWorkflowMcpServer(mcpServer);
+    setWorkflowMcpDraft(buildDefaultWorkflowMcpServerDraft(workflow, mcpServer));
     setRuns(runList);
     const latestRun = runList[0] ?? null;
     await selectRun(latestRun);
@@ -460,16 +631,18 @@ function App() {
 
   async function refresh(preferredAppId?: string | null, preferredWorkflowId?: string | null) {
     if (!user) return;
-    const [appList, toolList, credentialList, kbList] = await Promise.all([
+    const [appList, toolList, credentialList, kbList, mcpServerList] = await Promise.all([
       api.listApps(),
       api.listTools(),
       api.listModelCredentials(),
       api.listKnowledgeBases(),
+      api.listExternalMcpServers(),
     ]);
     setApps(appList);
     setTools(toolList);
     setCredentials(credentialList);
     setKnowledgeBases(kbList);
+    setExternalMcpServers(mcpServerList);
     if (!selectedKnowledgeBaseId && kbList[0]) {
       setSelectedKnowledgeBaseId(kbList[0].id);
     }
@@ -540,6 +713,31 @@ function App() {
     setDraftSpecText(JSON.stringify(selectedWorkflow.draft_spec ?? {}, null, 2));
     setDraftSpecError("");
   }, [selectedWorkflow?.id, selectedWorkflow?.draft_spec]);
+
+  useEffect(() => {
+    if (selectedExternalMcpServer) {
+      setExternalMcpDraft({
+        name: selectedExternalMcpServer.name,
+        description: selectedExternalMcpServer.description,
+        transport_type: selectedExternalMcpServer.transport_type,
+        server_url: selectedExternalMcpServer.server_url,
+        auth_type: selectedExternalMcpServer.auth_type,
+        auth_secret: "",
+      });
+      return;
+    }
+    setExternalMcpDraft(emptyExternalMcpServerDraft());
+  }, [selectedExternalMcpServerId, selectedExternalMcpServer?.id]);
+
+  useEffect(() => {
+    if (selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID) {
+      return;
+    }
+    if (selectedExternalMcpServerId && externalMcpServers.some((server) => server.id === selectedExternalMcpServerId)) {
+      return;
+    }
+    setSelectedExternalMcpServerId(externalMcpServers[0]?.id ?? "");
+  }, [selectedExternalMcpServerId, externalMcpServers]);
 
   useEffect(() => {
     if (!canEditSelectedApp || !selectedKnowledgeBaseId) {
@@ -627,6 +825,56 @@ function App() {
     });
     await refresh(selectedOwnedApp.id, workflow.id);
     setStatusMessage("Workflow created.");
+  }
+
+  async function saveWorkflowMcpServerConfig() {
+    if (!selectedWorkflow || !workflowMcpDraft) return;
+    const serverName = workflowMcpDraft.server_name.trim();
+    const serverSlug = slugifyMcpServerName(workflowMcpDraft.server_slug);
+    if (!serverName || !serverSlug) {
+      setStatusMessage("MCP server name and slug are required.");
+      return;
+    }
+    try {
+      const saved = await api.upsertWorkflowMcpServer(selectedWorkflow.id, {
+        enabled: workflowMcpDraft.enabled,
+        server_name: serverName,
+        server_slug: serverSlug,
+        description: workflowMcpDraft.description.trim(),
+      });
+      applyWorkflowMcpProvision(saved);
+      setStatusMessage(saved.token ? "Workflow MCP server created." : "Workflow MCP server updated.");
+    } catch (error) {
+      setStatusMessage(`Failed to save workflow MCP server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function rotateWorkflowMcpServerAccessToken() {
+    if (!selectedWorkflow) return;
+    try {
+      const saved = await api.rotateWorkflowMcpServerToken(selectedWorkflow.id);
+      applyWorkflowMcpProvision(saved);
+      setStatusMessage("Workflow MCP access token rotated.");
+    } catch (error) {
+      setStatusMessage(`Failed to rotate MCP token: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function applyWorkflowMcpProvision(saved: WorkflowMcpServerProvisionItem) {
+    const normalized: WorkflowMcpServerItem = {
+      id: saved.id,
+      workflow_id: saved.workflow_id,
+      enabled: saved.enabled,
+      server_name: saved.server_name,
+      server_slug: saved.server_slug,
+      description: saved.description,
+      auth_type: saved.auth_type,
+      created_at: saved.created_at,
+      updated_at: saved.updated_at,
+    };
+    setWorkflowMcpServer(normalized);
+    setWorkflowMcpDraft(buildDefaultWorkflowMcpServerDraft(selectedWorkflow as WorkflowItem, normalized));
+    setWorkflowMcpToken(saved.token ?? "");
   }
 
   async function persistCurrentConfig() {
@@ -764,6 +1012,67 @@ function App() {
     setSelectedWorkflow(nextWorkflow);
   }
 
+  async function saveExternalMcpServer() {
+    const payload = {
+      name: externalMcpDraft.name.trim(),
+      description: externalMcpDraft.description.trim(),
+      transport_type: externalMcpDraft.transport_type,
+      server_url: externalMcpDraft.server_url.trim(),
+      auth_type: externalMcpDraft.auth_type,
+      auth_secret: externalMcpDraft.auth_secret.trim(),
+    };
+    if (!payload.name || !payload.server_url) {
+      setStatusMessage("External MCP server name and URL are required.");
+      return;
+    }
+    if (payload.auth_type === "bearer" && !payload.auth_secret && !selectedExternalMcpServer?.has_auth_secret) {
+      setStatusMessage("Bearer auth requires a token.");
+      return;
+    }
+    try {
+      const saved = selectedExternalMcpServer
+        ? await api.updateExternalMcpServer(selectedExternalMcpServer.id, payload)
+        : await api.createExternalMcpServer(payload);
+      const list = await api.listExternalMcpServers();
+      setExternalMcpServers(list);
+      setSelectedExternalMcpServerId(saved.id);
+      setStatusMessage(selectedExternalMcpServer ? "External MCP server updated." : "External MCP server created.");
+    } catch (error) {
+      setStatusMessage(`Failed to save external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function syncSelectedExternalMcpServer() {
+    if (!selectedExternalMcpServer) return;
+    try {
+      const saved = await api.syncExternalMcpServer(selectedExternalMcpServer.id);
+      const list = await api.listExternalMcpServers();
+      setExternalMcpServers(list.map((item) => (item.id === saved.id ? saved : item)));
+      setSelectedExternalMcpServerId(saved.id);
+      setStatusMessage("External MCP server synced.");
+    } catch (error) {
+      setStatusMessage(`Failed to sync external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function deleteSelectedExternalMcpServer() {
+    if (!selectedExternalMcpServer) return;
+    try {
+      await api.deleteExternalMcpServer(selectedExternalMcpServer.id);
+      const list = await api.listExternalMcpServers();
+      setExternalMcpServers(list);
+      setSelectedExternalMcpServerId(list[0]?.id ?? "");
+      setStatusMessage("External MCP server deleted.");
+    } catch (error) {
+      setStatusMessage(`Failed to delete external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function newExternalMcpServerDraft() {
+    setSelectedExternalMcpServerId(NEW_EXTERNAL_MCP_SERVER_ID);
+    setExternalMcpDraft(emptyExternalMcpServerDraft());
+  }
+
   function toggleTool(toolName: string) {
     if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
     const agentNodeId = selectedWorkflowNodeId || (selectedWorkflowNode ? getWorkflowNodeId(selectedWorkflowNode, 0) : "");
@@ -772,6 +1081,15 @@ function App() {
       ? enabledAgentToolNames.filter((name) => name !== toolName)
       : [...enabledAgentToolNames, toolName];
     setSelectedWorkflow(updateAgentNodeTools(selectedWorkflow, agentNodeId, next));
+  }
+
+  function toggleMcpTool(serverId: string, toolName: string) {
+    if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
+    const agentNodeId = selectedWorkflowNodeId || (selectedWorkflowNode ? getWorkflowNodeId(selectedWorkflowNode, 0) : "");
+    if (!agentNodeId) return;
+    const toolKey = buildMcpToolKey(serverId, toolName);
+    const enabled = !enabledAgentMcpToolKeys.includes(toolKey);
+    setSelectedWorkflow(updateAgentNodeMcpTool(selectedWorkflow, agentNodeId, serverId, toolName, enabled));
   }
 
   function updateRetrievalConfig(key: keyof RetrievalNodeModel, value: string | number | boolean | string[]) {
@@ -1009,6 +1327,7 @@ function App() {
 
   function renderWorkflowSettings() {
     if (!selectedWorkflow) return null;
+    const workflowMcpEndpoint = workflowMcpDraft ? getWorkflowMcpEndpoint(slugifyMcpServerName(workflowMcpDraft.server_slug)) : "";
     return (
       <section className="panel">
         <div className="panel-title">
@@ -1054,6 +1373,81 @@ function App() {
         ) : (
           <p className="empty">No published versions yet.</p>
         )}
+        {workflowMcpDraft ? (
+          <>
+            <div className="sub-panel-title">Workflow MCP Server</div>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={workflowMcpDraft.enabled}
+                onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, enabled: event.target.checked })}
+              />
+              <span>
+                <strong>Enabled</strong>
+                <small>{workflowMcpServer ? "Expose the published workflow over MCP." : "Create an MCP endpoint for this workflow."}</small>
+              </span>
+            </label>
+            <label>
+              Server Name
+              <input
+                value={workflowMcpDraft.server_name}
+                onChange={(event) => {
+                  const serverName = event.target.value;
+                  const nextSlug = workflowMcpDraft.configured
+                    ? workflowMcpDraft.server_slug
+                    : slugifyMcpServerName(serverName) || workflowMcpDraft.server_slug;
+                  setWorkflowMcpDraft({ ...workflowMcpDraft, server_name: serverName, server_slug: nextSlug });
+                }}
+              />
+            </label>
+            <label>
+              Server Slug
+              <input
+                value={workflowMcpDraft.server_slug}
+                onChange={(event) =>
+                  setWorkflowMcpDraft({ ...workflowMcpDraft, server_slug: slugifyMcpServerName(event.target.value) })
+                }
+              />
+            </label>
+            <label>
+              Description
+              <textarea
+                rows={2}
+                value={workflowMcpDraft.description}
+                onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, description: event.target.value })}
+              />
+            </label>
+            <div className="readonly-node">
+              <strong>{workflowMcpEndpoint || "Save the MCP server to get an endpoint"}</strong>
+              <small>Auth: Bearer token</small>
+            </div>
+            {workflowMcpServer ? (
+              <div className="readonly-node">
+                <strong>{workflowMcpServer.enabled ? "Active" : "Disabled"}</strong>
+                <small>Updated {formatTimestamp(workflowMcpServer.updated_at)}</small>
+              </div>
+            ) : null}
+            {workflowMcpToken ? (
+              <label>
+                Access Token
+                <textarea className="token-block" rows={3} readOnly value={workflowMcpToken} />
+              </label>
+            ) : null}
+            <div className="actions-row">
+              <button className="secondary inline-button" onClick={saveWorkflowMcpServerConfig}>
+                <Link2 size={16} /> {workflowMcpServer ? "Save MCP Server" : "Create MCP Server"}
+              </button>
+              <button
+                className="secondary inline-button"
+                disabled={!workflowMcpServer}
+                onClick={rotateWorkflowMcpServerAccessToken}
+              >
+                <RefreshCw size={16} /> Rotate Token
+              </button>
+            </div>
+            <div className="notice">MCP calls always run the currently published workflow version.</div>
+          </>
+        ) : null}
         <label>
           draft_spec JSON
           <textarea
@@ -1068,6 +1462,157 @@ function App() {
         <button className="secondary danger" disabled={workflows.length <= 1} onClick={deleteSelectedWorkflow}>
           <Trash2 size={16} /> Delete Workflow
         </button>
+      </section>
+    );
+  }
+
+  function renderExternalMcpServersPanel() {
+    if (!canEditSelectedApp) return null;
+    const selectedServerTools = getExternalServerTools(selectedExternalMcpServer);
+    const creatingNewServer = selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID;
+    return (
+      <section className="panel">
+        <div className="panel-title panel-title-between">
+          <span>
+            <Link2 size={16} /> External MCP Servers
+          </span>
+          <button className="icon-button" title="New external MCP server" onClick={newExternalMcpServerDraft}>
+            <Plus size={14} />
+          </button>
+        </div>
+        <div className="workflow-list">
+          {externalMcpServers.map((server) => {
+            const isSelected = selectedExternalMcpServerId === server.id;
+            const serverTools = getExternalServerTools(server);
+            return (
+              <button
+                className={isSelected ? "workflow-list-item active" : "workflow-list-item"}
+                key={server.id}
+                onClick={() => setSelectedExternalMcpServerId(server.id)}
+              >
+                <span>
+                  <strong>{server.name}</strong>
+                  <small>{server.description || server.server_url}</small>
+                </span>
+                <small className={server.status === "active" ? "status-pill published" : "status-pill"}>
+                  {server.status} · {serverTools.length}
+                </small>
+              </button>
+            );
+          })}
+          {creatingNewServer ? (
+            <div className="workflow-list-item active">
+              <span>
+                <strong>New server</strong>
+                <small>Create a new external MCP connection.</small>
+              </span>
+              <small className="status-pill">draft</small>
+            </div>
+          ) : null}
+        </div>
+        {!externalMcpServers.length && !creatingNewServer ? <p className="empty">No external MCP servers yet.</p> : null}
+        <label>
+          Name
+          <input value={externalMcpDraft.name} onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, name: event.target.value })} />
+        </label>
+        <label>
+          Description
+          <textarea
+            rows={2}
+            value={externalMcpDraft.description}
+            onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, description: event.target.value })}
+          />
+        </label>
+        <div className="grid-two">
+          <label>
+            Transport
+            <select
+              value={externalMcpDraft.transport_type}
+              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, transport_type: event.target.value })}
+            >
+              {MCP_TRANSPORT_TYPES.map((transport) => (
+                <option key={transport} value={transport}>
+                  {transport}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Auth
+            <select
+              value={externalMcpDraft.auth_type}
+              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_type: event.target.value })}
+            >
+              {MCP_AUTH_TYPES.map((authType) => (
+                <option key={authType} value={authType}>
+                  {authType}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label>
+          Server URL
+          <input
+            placeholder="https://example.com/mcp"
+            value={externalMcpDraft.server_url}
+            onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, server_url: event.target.value })}
+          />
+        </label>
+        {externalMcpDraft.auth_type === "bearer" ? (
+          <label>
+            Bearer Token
+            <input
+              type="password"
+              placeholder={selectedExternalMcpServer?.has_auth_secret ? "Leave blank to keep current token" : ""}
+              value={externalMcpDraft.auth_secret}
+              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_secret: event.target.value })}
+            />
+          </label>
+        ) : null}
+        {selectedExternalMcpServer ? (
+          <div className="readonly-node">
+            <strong>{selectedExternalMcpServer.status}</strong>
+            <small>Last sync {formatTimestamp(selectedExternalMcpServer.last_sync_at)}</small>
+          </div>
+        ) : null}
+        {selectedExternalMcpServer?.last_sync_error ? <div className="error-notice">{selectedExternalMcpServer.last_sync_error}</div> : null}
+        <div className="actions-row">
+          <button className="secondary inline-button" onClick={saveExternalMcpServer}>
+            <Save size={16} /> {selectedExternalMcpServer ? "Save Server" : "Create Server"}
+          </button>
+          <button
+            className="secondary inline-button"
+            disabled={!selectedExternalMcpServer}
+            onClick={syncSelectedExternalMcpServer}
+          >
+            <RefreshCw size={16} /> Sync Tools
+          </button>
+          <button
+            className="secondary inline-button"
+            disabled={!selectedExternalMcpServer}
+            onClick={deleteSelectedExternalMcpServer}
+          >
+            <Trash2 size={16} /> Delete
+          </button>
+        </div>
+        {selectedExternalMcpServer ? (
+          <>
+            <div className="sub-panel-title">Synced Tools</div>
+            {selectedServerTools.length ? (
+              <div className="mcp-tool-list">
+                {selectedServerTools.map((tool) => (
+                  <div className="mcp-tool-item" key={`${selectedExternalMcpServer.id}-${tool.name}`}>
+                    <strong>{tool.name}</strong>
+                    <small>{tool.description || "No description"}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty">Sync this server to load its tool manifest.</p>
+            )}
+          </>
+        ) : null}
       </section>
     );
   }
@@ -1478,6 +2023,41 @@ function App() {
             </span>
           </label>
         ))}
+        <div className="sub-panel-title">External MCP Tools</div>
+        {externalMcpServers.length === 0 ? <p className="empty">Create and sync an external MCP server first.</p> : null}
+        {externalMcpServers.map((server) => {
+          const serverTools = getExternalServerTools(server);
+          return (
+            <div className="mcp-tool-group" key={server.id}>
+              <div className="mcp-tool-group-header">
+                <strong>{server.name}</strong>
+                <small className={server.status === "active" ? "status-pill published" : "status-pill"}>{server.status}</small>
+              </div>
+              <small className="mcp-tool-group-meta">{server.server_url}</small>
+              {server.last_sync_error ? <div className="error-notice">{server.last_sync_error}</div> : null}
+              {serverTools.length ? (
+                serverTools.map((tool) => {
+                  const toolKey = buildMcpToolKey(server.id, tool.name);
+                  return (
+                    <label className="check" key={toolKey}>
+                      <input
+                        type="checkbox"
+                        checked={enabledAgentMcpToolKeys.includes(toolKey)}
+                        onChange={() => toggleMcpTool(server.id, tool.name)}
+                      />
+                      <span>
+                        <strong>{tool.name}</strong>
+                        <small>{tool.description || "Remote MCP tool"}</small>
+                      </span>
+                    </label>
+                  );
+                })
+              ) : (
+                <p className="empty">No synced tools available for this server.</p>
+              )}
+            </div>
+          );
+        })}
       </>
     );
   }
@@ -1681,6 +2261,7 @@ function App() {
             {renderKnowledgeDatabasePanel()}
             {renderCredentialPanel()}
             {renderAppSettings()}
+            {renderExternalMcpServersPanel()}
             {renderWorkflowListPanel()}
             {renderWorkflowSettings()}
             {renderWorkflowCanvas()}
