@@ -2,12 +2,18 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Bot,
+  CheckCircle2,
+  ChevronRight,
+  Circle,
+  Code2,
   Database,
+  FileText,
   FileUp,
   GitBranch,
   History,
   KeyRound,
   Link2,
+  Loader2,
   LogIn,
   LogOut,
   MessageSquare,
@@ -15,6 +21,8 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Send,
+  Settings2,
   Trash2,
   UserRound,
   Wrench,
@@ -46,6 +54,16 @@ const MCP_TRANSPORT_TYPES = ["streamable_http"];
 const MCP_AUTH_TYPES = ["none", "bearer"];
 const NEW_EXTERNAL_MCP_SERVER_ID = "__new_external_mcp_server__";
 const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
+
+type NavView = "workspace" | "knowledge" | "credentials";
+type AppView = "studio" | "mcp" | "logs";
+type AuthAction = "login" | "register";
+type WorkflowNode = Record<string, unknown>;
+
+type WorkflowEdge = {
+  source: string;
+  target: string;
+};
 
 type AgentNodeModel = {
   provider?: string;
@@ -99,14 +117,17 @@ type ExternalMcpServerDraft = {
   auth_secret: string;
 };
 
-type WorkflowNode = Record<string, unknown>;
+const NAV_ITEMS: Array<{ id: NavView; label: string; description: string; icon: React.ElementType }> = [
+  { id: "workspace", label: "工作室", description: "Apps", icon: Bot },
+  { id: "knowledge", label: "知识库", description: "Knowledge Bases", icon: Database },
+  { id: "credentials", label: "模型凭证", description: "Provider Keys", icon: KeyRound },
+];
 
-type WorkflowEdge = {
-  source: string;
-  target: string;
-};
-
-type AuthAction = "login" | "register";
+const APP_NAV_ITEMS: Array<{ id: AppView; label: string; description: string; icon: React.ElementType }> = [
+  { id: "studio", label: "应用编排", description: "Workflow Studio", icon: GitBranch },
+  { id: "mcp", label: "MCP 设置", description: "Server & Client", icon: Link2 },
+  { id: "logs", label: "运行日志", description: "Runs & Steps", icon: History },
+];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -130,9 +151,13 @@ function defaultCredentialProvider(provider: string) {
 }
 
 function formatTimestamp(value: string | null | undefined) {
-  if (!value) return "Not synced";
+  if (!value) return "未同步";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN");
+}
+
+function shortId(value: string | null | undefined) {
+  return value ? value.slice(0, 8) : "-";
 }
 
 function slugifyMcpServerName(value: string) {
@@ -183,26 +208,36 @@ function isRetrievalNode(node: WorkflowNode) {
   return node.id === "retrieval" || type === "retrieval";
 }
 
+function isAgentNode(node: WorkflowNode) {
+  const type = getWorkflowNodeType(node);
+  return node.id === "agent" || type === "agent" || type === "react_agent";
+}
+
 function getWorkflowNodeLabel(node: WorkflowNode, index: number) {
   const id = getWorkflowNodeId(node, index);
   const type = getWorkflowNodeType(node);
-  if (id === "start" || type === "start") return "Start";
-  if (id === "end" || type === "end") return "End";
-  if (id === "agent" || type === "agent" || type === "react_agent") return "Agent";
+  if (id === "start" || type === "start") return "开始";
+  if (id === "end" || type === "end") return "结束";
   if (isRetrievalNode(node)) return "检索节点";
+  if (isAgentNode(node)) return "Agent 节点";
   return id;
 }
 
-function getAgentNodeModel(workflow: WorkflowItem): AgentNodeModel {
-  const node = getWorkflowNodes(workflow).find((item) => {
-    const type = getWorkflowNodeType(item);
-    return item.id === "agent" || type === "agent" || type === "react_agent";
-  });
+function getNodeKindClass(node: WorkflowNode) {
+  if (isRetrievalNode(node)) return "retrieval";
+  if (isAgentNode(node)) return "agent";
+  const type = getWorkflowNodeType(node);
+  if (type === "start") return "start";
+  if (type === "end") return "end";
+  return "default";
+}
+
+function getAgentNodeModel(node: WorkflowNode | null): AgentNodeModel {
   return isRecord(node?.model) ? (node.model as AgentNodeModel) : {};
 }
 
-function getRetrievalNode(workflow: WorkflowItem): WorkflowNode {
-  return getWorkflowNodes(workflow).find((item) => isRetrievalNode(item)) ?? {};
+function getRetrievalNodeModel(node: WorkflowNode | null): RetrievalNodeModel {
+  return (node ?? {}) as RetrievalNodeModel;
 }
 
 function getAgentNodeTools(node: WorkflowNode | null): AgentToolConfig[] {
@@ -228,91 +263,14 @@ function getEnabledAgentToolNames(node: WorkflowNode | null): string[] {
     .map((tool) => tool.name);
 }
 
-function getEnabledAgentMcpToolKeys(node: WorkflowNode | null): string[] {
-  return getAgentNodeTools(node)
-    .filter((tool) => tool.type === "mcp" && tool.enabled)
-    .map((tool) => {
-      const serverId = typeof tool.config.server_id === "string" ? tool.config.server_id : "";
-      return buildMcpToolKey(serverId, tool.name);
-    });
-}
-
 function buildMcpToolKey(serverId: string, toolName: string) {
   return `${serverId}::${toolName}`;
 }
 
-function isAgentNode(node: WorkflowNode) {
-  const type = getWorkflowNodeType(node);
-  return node.id === "agent" || type === "agent" || type === "react_agent";
-}
-
-function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolNames: string[]): WorkflowItem {
-  const nodes = getWorkflowNodes(workflow);
-  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
-  const existingTools = getAgentNodeTools(targetNode);
-  const uniqueToolNames = Array.from(new Set(toolNames));
-  const nextBuiltinTools = uniqueToolNames.map((name) => {
-    const existingTool = existingTools.find((tool) => tool.type === "builtin" && tool.name === name);
-    return {
-      type: "builtin",
-      name,
-      enabled: true,
-      config: existingTool?.config ?? {},
-    };
-  });
-  const nextMcpTools = existingTools.filter((tool) => tool.type === "mcp");
-  const nextNodes = nodes.map((node, index) => {
-    const nodeId = getWorkflowNodeId(node, index);
-    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
-    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
-  });
-  return {
-    ...workflow,
-    draft_spec: {
-      ...(workflow.draft_spec ?? {}),
-      nodes: nextNodes,
-    },
-  };
-}
-
-function updateAgentNodeMcpTool(
-  workflow: WorkflowItem,
-  agentNodeId: string,
-  serverId: string,
-  toolName: string,
-  enabled: boolean,
-): WorkflowItem {
-  const nodes = getWorkflowNodes(workflow);
-  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
-  const existingTools = getAgentNodeTools(targetNode);
-  const nextBuiltinTools = existingTools.filter((tool) => tool.type === "builtin");
-  const existingMcpTools = existingTools.filter(
-    (tool) => !(tool.type === "mcp" && String(tool.config.server_id ?? "") === serverId && tool.name === toolName),
-  );
-  const nextMcpTools = enabled
-    ? [
-        ...existingMcpTools,
-        {
-          type: "mcp",
-          name: toolName,
-          enabled: true,
-          config: { server_id: serverId },
-        },
-      ]
-    : existingMcpTools;
-
-  const nextNodes = nodes.map((node, index) => {
-    const nodeId = getWorkflowNodeId(node, index);
-    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
-    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
-  });
-  return {
-    ...workflow,
-    draft_spec: {
-      ...(workflow.draft_spec ?? {}),
-      nodes: nextNodes,
-    },
-  };
+function getEnabledAgentMcpToolKeys(node: WorkflowNode | null): string[] {
+  return getAgentNodeTools(node)
+    .filter((tool) => tool.type === "mcp" && tool.enabled)
+    .map((tool) => buildMcpToolKey(typeof tool.config.server_id === "string" ? tool.config.server_id : "", tool.name));
 }
 
 function getExternalServerTools(server: ExternalMcpServerItem | null): Array<{ name: string; description: string }> {
@@ -351,7 +309,7 @@ function buildDefaultWorkflowMcpServerDraft(workflow: WorkflowItem, existing: Wo
     enabled: true,
     server_name: workflowName,
     server_slug: slugifyMcpServerName(workflowName) || "workflow",
-    description: workflow.description || `Run the published workflow ${workflowName}.`,
+    description: workflow.description || `运行已发布的 ${workflowName}`,
     auth_type: "bearer",
   };
 }
@@ -367,72 +325,96 @@ function emptyExternalMcpServerDraft(): ExternalMcpServerDraft {
   };
 }
 
-function updateAgentNodeModel(workflow: WorkflowItem, key: keyof AgentNodeModel, value: string | number): WorkflowItem {
-  const spec = workflow.draft_spec ?? {};
-  const nextNodes = getWorkflowNodes(workflow).map((item) => {
-    const type = getWorkflowNodeType(item);
-    const isAgentNode = item.id === "agent" || type === "agent" || type === "react_agent";
-    if (!isAgentNode) return item;
-    const model = isRecord(item.model) ? item.model : {};
+function updateAgentNodeTools(workflow: WorkflowItem, agentNodeId: string, toolNames: string[]): WorkflowItem {
+  const nodes = getWorkflowNodes(workflow);
+  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
+  const existingTools = getAgentNodeTools(targetNode);
+  const uniqueToolNames = Array.from(new Set(toolNames));
+  const nextBuiltinTools = uniqueToolNames.map((name) => {
+    const existingTool = existingTools.find((tool) => tool.type === "builtin" && tool.name === name);
     return {
-      ...item,
-      model: {
-        ...model,
-        [key]: value,
-      },
+      type: "builtin",
+      name,
+      enabled: true,
+      config: existingTool?.config ?? {},
     };
   });
-  return {
-    ...workflow,
-    draft_spec: {
-      ...spec,
-      nodes: nextNodes,
-    },
-  };
+  const nextMcpTools = existingTools.filter((tool) => tool.type === "mcp");
+  const nextNodes = nodes.map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
+    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
+  });
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
+}
+
+function updateAgentNodeMcpTool(
+  workflow: WorkflowItem,
+  agentNodeId: string,
+  serverId: string,
+  toolName: string,
+  enabled: boolean,
+): WorkflowItem {
+  const nodes = getWorkflowNodes(workflow);
+  const targetNode = nodes.find((node, index) => getWorkflowNodeId(node, index) === agentNodeId) ?? null;
+  const existingTools = getAgentNodeTools(targetNode);
+  const nextBuiltinTools = existingTools.filter((tool) => tool.type === "builtin");
+  const remainingMcpTools = existingTools.filter(
+    (tool) => !(tool.type === "mcp" && String(tool.config.server_id ?? "") === serverId && tool.name === toolName),
+  );
+  const nextMcpTools = enabled
+    ? [...remainingMcpTools, { type: "mcp", name: toolName, enabled: true, config: { server_id: serverId } }]
+    : remainingMcpTools;
+  const nextNodes = nodes.map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
+    return { ...node, tools: [...nextBuiltinTools, ...nextMcpTools] };
+  });
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
+}
+
+function updateAgentNodeModel(workflow: WorkflowItem, agentNodeId: string, key: keyof AgentNodeModel, value: string | number): WorkflowItem {
+  const nextNodes = getWorkflowNodes(workflow).map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== agentNodeId || !isAgentNode(node)) return node;
+    const model = isRecord(node.model) ? node.model : {};
+    return { ...node, model: { ...model, [key]: value } };
+  });
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
 }
 
 function updateRetrievalNode(
   workflow: WorkflowItem,
+  retrievalNodeId: string,
   key: keyof RetrievalNodeModel,
   value: string | number | boolean | string[],
 ): WorkflowItem {
-  const spec = workflow.draft_spec ?? {};
-  const nextNodes = getWorkflowNodes(workflow).map((item) => {
-    if (!isRetrievalNode(item)) return item;
-    return { ...item, id: "retrieval", type: "retrieval", [key]: value };
+  const nextNodes = getWorkflowNodes(workflow).map((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    if (nodeId !== retrievalNodeId || !isRetrievalNode(node)) return node;
+    return { ...node, id: node.id ?? "retrieval", type: "retrieval", [key]: value };
   });
-  return {
-    ...workflow,
-    draft_spec: {
-      ...spec,
-      nodes: nextNodes,
-    },
-  };
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
 }
 
 function pruneRetrievalKnowledgeBaseIds(workflow: WorkflowItem, knowledgeBases: KnowledgeBase[]): WorkflowItem {
   const validIds = new Set(knowledgeBases.map((item) => item.id));
-  const spec = workflow.draft_spec ?? {};
-  const nextNodes = getWorkflowNodes(workflow).map((item) => {
-    if (!isRetrievalNode(item)) return item;
-    const ids = Array.isArray(item.knowledge_base_ids) ? item.knowledge_base_ids : [];
+  const nextNodes = getWorkflowNodes(workflow).map((node) => {
+    if (!isRetrievalNode(node)) return node;
+    const ids = Array.isArray(node.knowledge_base_ids) ? node.knowledge_base_ids : [];
     return {
-      ...item,
-      id: "retrieval",
+      ...node,
+      id: node.id ?? "retrieval",
       type: "retrieval",
       knowledge_base_ids: ids.map((id) => String(id)).filter((id) => validIds.has(id)),
     };
   });
-  return {
-    ...workflow,
-    draft_spec: {
-      ...spec,
-      nodes: nextNodes,
-    },
-  };
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
 }
 
 function App() {
+  const [activeView, setActiveView] = useState<NavView>("workspace");
+  const [activeAppView, setActiveAppView] = useState<AppView>("studio");
   const [user, setUser] = useState<UserItem | null>(null);
   const [authForm, setAuthForm] = useState({ email: "", password: "" });
   const [authError, setAuthError] = useState("");
@@ -449,11 +431,7 @@ function App() {
   const [draftSpecText, setDraftSpecText] = useState("");
   const [draftSpecError, setDraftSpecError] = useState("");
   const [credentials, setCredentials] = useState<ModelCredential[]>([]);
-  const [credentialDraft, setCredentialDraft] = useState({
-    provider: "openai_compatible",
-    name: "",
-    api_key: "",
-  });
+  const [credentialDraft, setCredentialDraft] = useState({ provider: "openai_compatible", name: "", api_key: "" });
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
   const [selectedKnowledgeBaseId, setSelectedKnowledgeBaseId] = useState("");
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
@@ -469,7 +447,7 @@ function App() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const conversationIdRef = useRef<string | null>(null);
   const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState("");
-  const [input, setInput] = useState("这份知识库里讲了什么？");
+  const [input, setInput] = useState("我的订单10086到哪了？");
   const [trace, setTrace] = useState<Record<string, unknown>[]>([]);
   const [busy, setBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
@@ -487,27 +465,34 @@ function App() {
       stableStringify(selectedWorkflow.draft_spec ?? {}) !== stableStringify(selectedPublishedVersion.spec_json ?? {}),
   );
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
-  const selectedExternalMcpServer =
-    externalMcpServers.find((item) => item.id === selectedExternalMcpServerId) ?? null;
+  const selectedExternalMcpServer = externalMcpServers.find((item) => item.id === selectedExternalMcpServerId) ?? null;
   const canEditSelectedApp = Boolean(selectedOwnedApp);
   const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
-  const agentNodeModel = useMemo(() => (selectedWorkflow ? getAgentNodeModel(selectedWorkflow) : {}), [selectedWorkflow]);
-  const retrievalNode = useMemo(() => (selectedWorkflow ? getRetrievalNode(selectedWorkflow) : {}), [selectedWorkflow]);
-  const retrievalNodeModel = retrievalNode as RetrievalNodeModel;
   const workflowNodes = useMemo(() => (selectedWorkflow ? getWorkflowNodes(selectedWorkflow) : []), [selectedWorkflow]);
   const workflowEdges = useMemo(() => (selectedWorkflow ? getWorkflowEdges(selectedWorkflow) : []), [selectedWorkflow]);
   const selectedWorkflowNode = useMemo(() => {
     const node = workflowNodes.find((item, index) => getWorkflowNodeId(item, index) === selectedWorkflowNodeId);
     return node ?? workflowNodes[0] ?? null;
   }, [selectedWorkflowNodeId, workflowNodes]);
+  const selectedWorkflowNodeIndex = selectedWorkflowNode ? workflowNodes.indexOf(selectedWorkflowNode) : -1;
   const selectedWorkflowNodeType = selectedWorkflowNode ? getWorkflowNodeType(selectedWorkflowNode) : "";
   const selectedWorkflowNodeIsAgent = Boolean(selectedWorkflowNode && isAgentNode(selectedWorkflowNode));
+  const selectedWorkflowNodeIsRetrieval = Boolean(selectedWorkflowNode && isRetrievalNode(selectedWorkflowNode));
+  const selectedWorkflowNodeKey = selectedWorkflowNode
+    ? getWorkflowNodeId(selectedWorkflowNode, Math.max(selectedWorkflowNodeIndex, 0))
+    : "";
+  const agentNodeModel = useMemo(() => getAgentNodeModel(selectedWorkflowNode), [selectedWorkflowNode]);
+  const retrievalNodeModel = useMemo(() => getRetrievalNodeModel(selectedWorkflowNode), [selectedWorkflowNode]);
   const enabledAgentToolNames = useMemo(() => getEnabledAgentToolNames(selectedWorkflowNode), [selectedWorkflowNode]);
   const enabledAgentMcpToolKeys = useMemo(() => getEnabledAgentMcpToolKeys(selectedWorkflowNode), [selectedWorkflowNode]);
 
   function setActiveConversationId(nextConversationId: string | null) {
     conversationIdRef.current = nextConversationId;
     setConversationId(nextConversationId);
+  }
+
+  function setNotice(message: string) {
+    setStatusMessage(message);
   }
 
   function resetWorkspace() {
@@ -579,6 +564,7 @@ function App() {
     setWorkflowMcpServer(mcpServer);
     setWorkflowMcpDraft(buildDefaultWorkflowMcpServerDraft(workflow, mcpServer));
     setRuns(runList);
+
     const latestRun = runList[0] ?? null;
     await selectRun(latestRun);
     const latestConversationId = latestRun?.conversation_id ?? null;
@@ -589,10 +575,7 @@ function App() {
       setMessages(
         history
           .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
-          .map((message) => ({
-            role: message.role,
-            content: message.content,
-          })),
+          .map((message) => ({ role: message.role, content: message.content })),
       );
     } catch (error) {
       console.warn(error);
@@ -627,6 +610,17 @@ function App() {
       workflowList[0] ??
       null;
     await selectWorkflow(workflow);
+  }
+
+  async function openApp(app: AppItem) {
+    setActiveView("workspace");
+    setActiveAppView("studio");
+    await selectApp(app);
+  }
+
+  async function returnToWorkspaceHome() {
+    setActiveView("workspace");
+    await selectApp(null);
   }
 
   async function refresh(preferredAppId?: string | null, preferredWorkflowId?: string | null) {
@@ -696,11 +690,9 @@ function App() {
     const selectedStillExists = workflowNodes.some((node, index) => getWorkflowNodeId(node, index) === selectedWorkflowNodeId);
     if (selectedStillExists) return;
     const defaultNode =
-      workflowNodes.find((node, index) => {
-        const id = getWorkflowNodeId(node, index);
-        const type = getWorkflowNodeType(node);
-        return isRetrievalNode(node) || id === "agent" || type === "react_agent";
-      }) ?? workflowNodes[0];
+      workflowNodes.find((node) => isRetrievalNode(node) || isAgentNode(node)) ??
+      workflowNodes.find((node) => getWorkflowNodeType(node) === "start") ??
+      workflowNodes[0];
     setSelectedWorkflowNodeId(getWorkflowNodeId(defaultNode, workflowNodes.indexOf(defaultNode)));
   }, [selectedWorkflowNodeId, workflowNodes]);
 
@@ -730,12 +722,8 @@ function App() {
   }, [selectedExternalMcpServerId, selectedExternalMcpServer?.id]);
 
   useEffect(() => {
-    if (selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID) {
-      return;
-    }
-    if (selectedExternalMcpServerId && externalMcpServers.some((server) => server.id === selectedExternalMcpServerId)) {
-      return;
-    }
+    if (selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID) return;
+    if (selectedExternalMcpServerId && externalMcpServers.some((server) => server.id === selectedExternalMcpServerId)) return;
     setSelectedExternalMcpServerId(externalMcpServers[0]?.id ?? "");
   }, [selectedExternalMcpServerId, externalMcpServers]);
 
@@ -764,9 +752,7 @@ function App() {
         .then((documents) => {
           if (!cancelled) setKnowledgeDocuments(documents);
         })
-        .catch((error) => {
-          console.error(error);
-        });
+        .catch(console.error);
     }, 1500);
 
     return () => {
@@ -777,10 +763,7 @@ function App() {
 
   useEffect(() => {
     if (!selectedOwnedApp) return;
-    setCredentialDraft((draft) => ({
-      ...draft,
-      provider: defaultCredentialProvider(selectedOwnedApp.model_provider),
-    }));
+    setCredentialDraft((draft) => ({ ...draft, provider: defaultCredentialProvider(selectedOwnedApp.model_provider) }));
   }, [selectedOwnedApp?.id]);
 
   async function submitAuth(action: AuthAction) {
@@ -813,18 +796,63 @@ function App() {
   }
 
   async function createDemoApp() {
-    const app = await api.createApp();
-    await refresh(app.id);
+    try {
+      setBusy(true);
+      const app = await api.createApp();
+      await refresh(app.id);
+      setActiveView("workspace");
+      setActiveAppView("studio");
+      setNotice("应用已创建。");
+    } catch (error) {
+      setNotice(`创建应用失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteApp(app: AppItem, event?: React.MouseEvent<HTMLButtonElement>) {
+    event?.stopPropagation();
+    const confirmed = window.confirm(`确定删除应用「${app.name}」吗？该应用下的 Workflow、发布版本、会话和运行记录都会一起删除。`);
+    if (!confirmed) return;
+    try {
+      setBusy(true);
+      await api.deleteApp(app.id);
+      if (selectedApp?.id === app.id) {
+        await selectApp(null);
+      }
+      const [appList, toolList, credentialList, kbList, mcpServerList] = await Promise.all([
+        api.listApps(),
+        api.listTools(),
+        api.listModelCredentials(),
+        api.listKnowledgeBases(),
+        api.listExternalMcpServers(),
+      ]);
+      setApps(appList);
+      setTools(toolList);
+      setCredentials(credentialList);
+      setKnowledgeBases(kbList);
+      setExternalMcpServers(mcpServerList);
+      setActiveView("workspace");
+      setNotice("应用已删除。");
+    } catch (error) {
+      setNotice(`删除应用失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function createWorkflow() {
     if (!selectedOwnedApp) return;
-    const workflow = await api.createWorkflow(selectedOwnedApp.id, {
-      name: `Workflow ${workflows.length + 1}`,
-      description: "",
-    });
-    await refresh(selectedOwnedApp.id, workflow.id);
-    setStatusMessage("Workflow created.");
+    try {
+      const workflow = await api.createWorkflow(selectedOwnedApp.id, {
+        name: `Workflow ${workflows.length + 1}`,
+        description: "",
+      });
+      await refresh(selectedOwnedApp.id, workflow.id);
+      setNotice("Workflow 已创建。");
+    } catch (error) {
+      setNotice(`创建 Workflow 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function saveWorkflowMcpServerConfig() {
@@ -832,7 +860,7 @@ function App() {
     const serverName = workflowMcpDraft.server_name.trim();
     const serverSlug = slugifyMcpServerName(workflowMcpDraft.server_slug);
     if (!serverName || !serverSlug) {
-      setStatusMessage("MCP server name and slug are required.");
+      setNotice("MCP Server 名称和 slug 都不能为空。");
       return;
     }
     try {
@@ -843,9 +871,9 @@ function App() {
         description: workflowMcpDraft.description.trim(),
       });
       applyWorkflowMcpProvision(saved);
-      setStatusMessage(saved.token ? "Workflow MCP server created." : "Workflow MCP server updated.");
+      setNotice(saved.token ? "Workflow MCP Server 已创建，请立即保存这次返回的 token。" : "Workflow MCP Server 已更新。");
     } catch (error) {
-      setStatusMessage(`Failed to save workflow MCP server: ${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`保存 Workflow MCP Server 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -854,9 +882,9 @@ function App() {
     try {
       const saved = await api.rotateWorkflowMcpServerToken(selectedWorkflow.id);
       applyWorkflowMcpProvision(saved);
-      setStatusMessage("Workflow MCP access token rotated.");
+      setNotice("访问 token 已轮换，旧 token 已失效。");
     } catch (error) {
-      setStatusMessage(`Failed to rotate MCP token: ${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`轮换 token 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -879,9 +907,7 @@ function App() {
 
   async function persistCurrentConfig() {
     if (!selectedOwnedApp) return null;
-    if (draftSpecError) {
-      throw new Error("Draft spec JSON is invalid.");
-    }
+    if (draftSpecError) throw new Error("draft_spec JSON 不是合法 JSON。");
     const updatedApp = await api.updateApp(selectedOwnedApp.id, {
       name: selectedOwnedApp.name,
       description: selectedOwnedApp.description,
@@ -909,44 +935,63 @@ function App() {
   async function saveConfig() {
     if (!selectedOwnedApp) return;
     try {
+      setBusy(true);
       const saved = await persistCurrentConfig();
       if (!saved) return;
       await refresh(saved.app.id, saved.workflow?.id ?? selectedWorkflow?.id);
-      setStatusMessage("配置已保存。");
+      setNotice("草稿配置已保存。");
     } catch (error) {
-      setStatusMessage(`保存配置失败：${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`保存失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
     }
   }
 
   async function publishSelectedWorkflow() {
     if (!selectedOwnedApp || !selectedWorkflow) return;
-    const saved = await persistCurrentConfig();
-    const workflowId = saved?.workflow?.id ?? selectedWorkflow.id;
-    const version = await api.publishWorkflow(workflowId);
-    await refresh(selectedOwnedApp.id, workflowId);
-    setStatusMessage("应用已发布。");
+    try {
+      setBusy(true);
+      const saved = await persistCurrentConfig();
+      const workflowId = saved?.workflow?.id ?? selectedWorkflow.id;
+      await api.publishWorkflow(workflowId);
+      await refresh(selectedOwnedApp.id, workflowId);
+      setNotice("Workflow 已发布，聊天和 MCP 将运行新的发布版本。");
+    } catch (error) {
+      setNotice(`发布失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function deleteSelectedWorkflow() {
     if (!selectedOwnedApp || !selectedWorkflow) return;
-    await api.deleteWorkflow(selectedWorkflow.id);
-    await refresh(selectedOwnedApp.id);
-    setStatusMessage("应用已取消发布。");
+    const confirmed = window.confirm(`确定删除 Workflow「${selectedWorkflow.name}」吗？发布版本和运行记录也会失去这个入口。`);
+    if (!confirmed) return;
+    try {
+      setBusy(true);
+      await api.deleteWorkflow(selectedWorkflow.id);
+      await refresh(selectedOwnedApp.id);
+      setNotice("Workflow 已删除。");
+    } catch (error) {
+      setNotice(`删除 Workflow 失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function createKnowledgeBase() {
     const name = knowledgeDraft.name.trim();
     if (!name) return;
     setBusy(true);
-    setStatusMessage("正在创建知识库...");
     try {
       const kb = await api.createKnowledgeBase({ name, description: knowledgeDraft.description.trim() });
+      const list = await api.listKnowledgeBases();
       setKnowledgeDraft({ name: "", description: "" });
+      setKnowledgeBases(list);
       setSelectedKnowledgeBaseId(kb.id);
-      setKnowledgeBases(await api.listKnowledgeBases());
-      setStatusMessage("知识库已创建。");
+      setNotice("知识库已创建。");
     } catch (error) {
-      setStatusMessage(`创建知识库失败：${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`创建知识库失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setBusy(false);
     }
@@ -958,6 +1003,9 @@ function App() {
     try {
       await api.uploadKnowledgeDocument(selectedKnowledgeBaseId, file);
       setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+      setNotice("文档已上传，后台会继续处理索引。");
+    } catch (error) {
+      setNotice(`上传文档失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setBusy(false);
     }
@@ -965,51 +1013,85 @@ function App() {
 
   async function deleteKnowledgeDocument(documentId: string) {
     if (!selectedKnowledgeBaseId) return;
-    await api.deleteKnowledgeDocument(selectedKnowledgeBaseId, documentId);
-    setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+    try {
+      await api.deleteKnowledgeDocument(selectedKnowledgeBaseId, documentId);
+      setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+      setNotice("文档已删除。");
+    } catch (error) {
+      setNotice(`删除文档失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function deleteSelectedKnowledgeBase() {
+    if (!selectedKnowledgeBase) return;
+    try {
+      await api.deleteKnowledgeBase(selectedKnowledgeBase.id);
+      const list = await api.listKnowledgeBases();
+      setKnowledgeBases(list);
+      setSelectedKnowledgeBaseId(list[0]?.id ?? "");
+      if (selectedApp) await refresh(selectedApp.id, selectedWorkflow?.id);
+      setNotice("知识库已删除。");
+    } catch (error) {
+      setNotice(`删除知识库失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function rebuildSelectedKnowledgeBase() {
     if (!selectedKnowledgeBaseId) return;
-    await api.rebuildKnowledgeBase(selectedKnowledgeBaseId);
-    setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+    try {
+      await api.rebuildKnowledgeBase(selectedKnowledgeBaseId);
+      setKnowledgeDocuments(await api.listKnowledgeDocuments(selectedKnowledgeBaseId));
+      setNotice("知识库已开始重建。");
+    } catch (error) {
+      setNotice(`重建知识库失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function createCredential() {
     const provider = credentialDraft.provider.trim();
     const apiKey = credentialDraft.api_key.trim();
     if (!provider || !apiKey) return;
-    const name = credentialDraft.name.trim() || `${provider} credential`;
-    const credential = await api.createModelCredential({ provider, name, api_key: apiKey });
-    setCredentials(await api.listModelCredentials());
-    setCredentialDraft({
-      provider: defaultCredentialProvider(selectedOwnedApp?.model_provider ?? "openai_compatible"),
-      name: "",
-      api_key: "",
-    });
-    setSelectedApp((current) => {
-      if (!current) return current;
-      return current.model_credential_id ? current : { ...current, model_credential_id: credential.id };
-    });
+    try {
+      const name = credentialDraft.name.trim() || `${provider} credential`;
+      const credential = await api.createModelCredential({ provider, name, api_key: apiKey });
+      setCredentials(await api.listModelCredentials());
+      setCredentialDraft({
+        provider: defaultCredentialProvider(selectedOwnedApp?.model_provider ?? "openai_compatible"),
+        name: "",
+        api_key: "",
+      });
+      setSelectedApp((current) => {
+        if (!current) return current;
+        return current.model_credential_id ? current : { ...current, model_credential_id: credential.id };
+      });
+      setNotice("模型凭证已创建。");
+    } catch (error) {
+      setNotice(`创建凭证失败：${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function deleteCredential(credentialId: string) {
-    await api.deleteModelCredential(credentialId);
-    setCredentials(await api.listModelCredentials());
-    if (!selectedOwnedApp) return;
-    let nextApp = selectedOwnedApp;
-    if (selectedOwnedApp.model_credential_id === credentialId) {
-      nextApp = { ...nextApp, model_credential_id: "" };
+    try {
+      await api.deleteModelCredential(credentialId);
+      setCredentials(await api.listModelCredentials());
+      if (!selectedOwnedApp) return;
+      let nextApp = selectedOwnedApp;
+      if (selectedOwnedApp.model_credential_id === credentialId) {
+        nextApp = { ...nextApp, model_credential_id: "" };
+      }
+      let nextWorkflow = selectedWorkflow;
+      if (selectedWorkflowNodeIsAgent && String(agentNodeModel.credential_id ?? "") === credentialId) {
+        nextWorkflow = nextWorkflow ? updateAgentNodeModel(nextWorkflow, selectedWorkflowNodeKey, "credential_id", "") : nextWorkflow;
+      }
+      if (selectedWorkflowNodeIsRetrieval && String(retrievalNodeModel.query_llm_credential_id ?? "") === credentialId) {
+        nextWorkflow = nextWorkflow ? updateRetrievalNode(nextWorkflow, selectedWorkflowNodeKey, "query_llm_credential_id", "") : nextWorkflow;
+      }
+      setSelectedApp(nextApp);
+      setSelectedWorkflow(nextWorkflow);
+      setNotice("模型凭证已删除。");
+    } catch (error) {
+      setNotice(`删除凭证失败：${error instanceof Error ? error.message : String(error)}`);
     }
-    let nextWorkflow = selectedWorkflow;
-    if (String(agentNodeModel.credential_id ?? "") === credentialId) {
-      nextWorkflow = nextWorkflow ? updateAgentNodeModel(nextWorkflow, "credential_id", "") : nextWorkflow;
-    }
-    if (String(retrievalNodeModel.query_llm_credential_id ?? "") === credentialId) {
-      nextWorkflow = nextWorkflow ? updateRetrievalNode(nextWorkflow, "query_llm_credential_id", "") : nextWorkflow;
-    }
-    setSelectedApp(nextApp);
-    setSelectedWorkflow(nextWorkflow);
   }
 
   async function saveExternalMcpServer() {
@@ -1022,11 +1104,11 @@ function App() {
       auth_secret: externalMcpDraft.auth_secret.trim(),
     };
     if (!payload.name || !payload.server_url) {
-      setStatusMessage("External MCP server name and URL are required.");
+      setNotice("外部 MCP Server 名称和 URL 都不能为空。");
       return;
     }
     if (payload.auth_type === "bearer" && !payload.auth_secret && !selectedExternalMcpServer?.has_auth_secret) {
-      setStatusMessage("Bearer auth requires a token.");
+      setNotice("Bearer 认证需要填写 token。");
       return;
     }
     try {
@@ -1036,9 +1118,9 @@ function App() {
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list);
       setSelectedExternalMcpServerId(saved.id);
-      setStatusMessage(selectedExternalMcpServer ? "External MCP server updated." : "External MCP server created.");
+      setNotice(selectedExternalMcpServer ? "外部 MCP Server 已更新。" : "外部 MCP Server 已创建。");
     } catch (error) {
-      setStatusMessage(`Failed to save external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`保存外部 MCP Server 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1049,9 +1131,9 @@ function App() {
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list.map((item) => (item.id === saved.id ? saved : item)));
       setSelectedExternalMcpServerId(saved.id);
-      setStatusMessage("External MCP server synced.");
+      setNotice("外部 MCP tools 已同步。");
     } catch (error) {
-      setStatusMessage(`Failed to sync external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`同步外部 MCP tools 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1062,9 +1144,9 @@ function App() {
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list);
       setSelectedExternalMcpServerId(list[0]?.id ?? "");
-      setStatusMessage("External MCP server deleted.");
+      setNotice("外部 MCP Server 已删除。");
     } catch (error) {
-      setStatusMessage(`Failed to delete external MCP server: ${error instanceof Error ? error.message : String(error)}`);
+      setNotice(`删除外部 MCP Server 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1075,26 +1157,27 @@ function App() {
 
   function toggleTool(toolName: string) {
     if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
-    const agentNodeId = selectedWorkflowNodeId || (selectedWorkflowNode ? getWorkflowNodeId(selectedWorkflowNode, 0) : "");
-    if (!agentNodeId) return;
     const next = enabledAgentToolNames.includes(toolName)
       ? enabledAgentToolNames.filter((name) => name !== toolName)
       : [...enabledAgentToolNames, toolName];
-    setSelectedWorkflow(updateAgentNodeTools(selectedWorkflow, agentNodeId, next));
+    setSelectedWorkflow(updateAgentNodeTools(selectedWorkflow, selectedWorkflowNodeKey, next));
   }
 
   function toggleMcpTool(serverId: string, toolName: string) {
     if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
-    const agentNodeId = selectedWorkflowNodeId || (selectedWorkflowNode ? getWorkflowNodeId(selectedWorkflowNode, 0) : "");
-    if (!agentNodeId) return;
     const toolKey = buildMcpToolKey(serverId, toolName);
     const enabled = !enabledAgentMcpToolKeys.includes(toolKey);
-    setSelectedWorkflow(updateAgentNodeMcpTool(selectedWorkflow, agentNodeId, serverId, toolName, enabled));
+    setSelectedWorkflow(updateAgentNodeMcpTool(selectedWorkflow, selectedWorkflowNodeKey, serverId, toolName, enabled));
+  }
+
+  function updateAgentConfig(key: keyof AgentNodeModel, value: string | number) {
+    if (!selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
+    setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, selectedWorkflowNodeKey, key, value));
   }
 
   function updateRetrievalConfig(key: keyof RetrievalNodeModel, value: string | number | boolean | string[]) {
-    if (!selectedWorkflow) return;
-    setSelectedWorkflow(updateRetrievalNode(selectedWorkflow, key, value));
+    if (!selectedWorkflow || !selectedWorkflowNodeIsRetrieval) return;
+    setSelectedWorkflow(updateRetrievalNode(selectedWorkflow, selectedWorkflowNodeKey, key, value));
   }
 
   function toggleKnowledgeBaseInNode(kbId: string) {
@@ -1107,9 +1190,9 @@ function App() {
   }
 
   function updateRetrievalQueryLlmProvider(provider: string) {
-    if (!selectedWorkflow) return;
-    let nextWorkflow = updateRetrievalNode(selectedWorkflow, "query_llm_provider", provider);
-    nextWorkflow = updateRetrievalNode(nextWorkflow, "query_llm_base_url", defaultQueryLlmBaseUrl(provider));
+    if (!selectedWorkflow || !selectedWorkflowNodeIsRetrieval) return;
+    let nextWorkflow = updateRetrievalNode(selectedWorkflow, selectedWorkflowNodeKey, "query_llm_provider", provider);
+    nextWorkflow = updateRetrievalNode(nextWorkflow, selectedWorkflowNodeKey, "query_llm_base_url", defaultQueryLlmBaseUrl(provider));
     setSelectedWorkflow(nextWorkflow);
   }
 
@@ -1118,9 +1201,7 @@ function App() {
     if (!selectedWorkflow) return;
     try {
       const parsed = JSON.parse(value);
-      if (!isRecord(parsed)) {
-        throw new Error("draft_spec must be a JSON object");
-      }
+      if (!isRecord(parsed)) throw new Error("draft_spec 必须是 JSON object。");
       setSelectedWorkflow({ ...selectedWorkflow, draft_spec: parsed });
       setDraftSpecError("");
     } catch (error) {
@@ -1148,10 +1229,7 @@ function App() {
             const next = [...items];
             const last = next[next.length - 1];
             if (last?.role === "assistant") {
-              next[next.length - 1] = {
-                ...last,
-                content: last.content ? `${last.content}\n\n${message}` : message,
-              };
+              next[next.length - 1] = { ...last, content: last.content ? `${last.content}\n\n${message}` : message };
             }
             return next;
           });
@@ -1160,7 +1238,9 @@ function App() {
           setMessages((items) => {
             const next = [...items];
             const last = next[next.length - 1];
-            next[next.length - 1] = { ...last, content: last.content + String(data.content ?? "") };
+            if (last?.role === "assistant") {
+              next[next.length - 1] = { ...last, content: last.content + String(data.content ?? "") };
+            }
             return next;
           });
         }
@@ -1168,74 +1248,295 @@ function App() {
           setTrace((items) => [...items, { event, ...data }]);
         }
       });
-      if (selectedWorkflow) {
-        const runList = await api.listWorkflowRuns(selectedWorkflow.id);
-        setRuns(runList);
-        await selectRun(runList[0] ?? null);
-      }
+      const runList = await api.listWorkflowRuns(selectedWorkflow.id);
+      setRuns(runList);
+      await selectRun(runList[0] ?? null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setNotice(`聊天运行失败：${message}`);
+      setMessages((items) => {
+        const next = [...items];
+        const last = next[next.length - 1];
+        if (last?.role === "assistant") {
+          next[next.length - 1] = { ...last, content: last.content ? `${last.content}\n\n${message}` : message };
+        }
+        return next;
+      });
     } finally {
       setBusy(false);
     }
   }
 
-  function renderWorkflowNodeIcon(type: string) {
-    if (type === "retrieval") return <Database size={16} />;
-    if (type === "react_agent" || type === "agent") return <Bot size={16} />;
+  function renderStatusBadge(workflow: WorkflowItem | null, isSelected = false) {
+    if (!workflow) return <span className="badge muted">未选择</span>;
+    if (isSelected && selectedWorkflowHasUnpublishedChanges) return <span className="badge warning">有未发布改动</span>;
+    if (workflow.published_version_id) return <span className="badge success">已发布</span>;
+    return <span className="badge muted">仅草稿</span>;
+  }
+
+  function renderWorkflowNodeIcon(node: WorkflowNode) {
+    if (isRetrievalNode(node)) return <Database size={16} />;
+    if (isAgentNode(node)) return <Bot size={16} />;
+    const type = getWorkflowNodeType(node);
+    if (type === "end") return <CheckCircle2 size={16} />;
     return <Play size={16} />;
   }
 
   function renderWorkflowNodeSummary(node: WorkflowNode) {
-    const type = getWorkflowNodeType(node);
     if (isRetrievalNode(node)) {
       const ids = Array.isArray(node.knowledge_base_ids) ? node.knowledge_base_ids : [];
-      return ids.length ? `${ids.length} 个知识库` : "未选择知识库";
+      return ids.length ? `已选择 ${ids.length} 个知识库` : "未选择知识库";
     }
-    if (type === "react_agent" || type === "agent") {
-      const model = isRecord(node.model) ? node.model : {};
-      return String(model.model_name ?? selectedOwnedApp?.model_name ?? "继承 App 模型");
+    if (isAgentNode(node)) {
+      const model = getAgentNodeModel(node);
+      const toolCount = getAgentNodeTools(node).filter((tool) => tool.enabled).length;
+      return `${String(model.model_name ?? selectedOwnedApp?.model_name ?? "继承 App 模型")} · ${toolCount} 个工具`;
     }
+    const type = getWorkflowNodeType(node);
     if (type === "start") return "接收用户输入";
-    if (type === "end") return "结束并返回结果";
+    if (type === "end") return "返回最终答案";
     return type;
+  }
+
+  function renderEmptyState(title: string, detail: string, action?: React.ReactNode) {
+    return (
+      <div className="empty-state">
+        <Circle size={20} />
+        <strong>{title}</strong>
+        <span>{detail}</span>
+        {action}
+      </div>
+    );
+  }
+
+  function renderWorkspaceHome() {
+    return (
+      <div className="workspace-home">
+        <section className="home-hero">
+          <div>
+            <span className="eyebrow">Studio</span>
+            <h2>工作室</h2>
+            <p>在这里管理 App。进入某个 App 后，再配置 Workflow、MCP 和运行日志。</p>
+          </div>
+          <button className="primary-button" disabled={busy} onClick={createDemoApp}>
+            <Plus size={15} /> 创建应用
+          </button>
+        </section>
+        <section className="app-grid-section">
+          <div className="workspace-filters">
+            <div className="segmented-tabs">
+              <button className="active">全部</button>
+              <button disabled>Workflow</button>
+              <button disabled>Agent</button>
+              <button disabled>Chatflow</button>
+            </div>
+            <div className="search-shell">
+              <input placeholder="搜索应用" />
+            </div>
+          </div>
+          <div className="app-card-grid">
+            <button className="create-app-card" disabled={busy} onClick={createDemoApp}>
+              <Plus size={18} />
+              <strong>创建应用</strong>
+              <span>创建一个带默认 Workflow 草稿的应用。</span>
+            </button>
+            {apps.map((app) => (
+              <article
+                className="app-card"
+                key={app.id}
+                role="button"
+                tabIndex={0}
+                onClick={() => openApp(app)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    openApp(app);
+                  }
+                }}
+              >
+                <span className="app-card-icon">
+                  <Bot size={20} />
+                </span>
+                <span className="app-card-main">
+                  <strong>{app.name}</strong>
+                  <small>{app.description || `App ${shortId(app.id)}`}</small>
+                </span>
+                <span className="app-card-meta">
+                  <small>{formatTimestamp(app.updated_at)}</small>
+                  <span className="app-card-actions">
+                    {app.owner_user_id === user?.id ? (
+                      <button className="icon-button danger" title="删除应用" aria-label="删除应用" disabled={busy} onClick={(event) => deleteApp(app, event)}>
+                        <Trash2 size={14} />
+                      </button>
+                    ) : null}
+                    <ChevronRight size={16} />
+                  </span>
+                </span>
+              </article>
+            ))}
+          </div>
+          {!apps.length ? renderEmptyState("还没有应用", "创建应用后会自动生成默认 Workflow 草稿。") : null}
+        </section>
+      </div>
+    );
+  }
+
+  function renderWorkflowListPanel() {
+    return (
+      <section className="work-panel">
+        <div className="panel-heading compact-heading">
+          <div>
+            <span className="eyebrow">Workflows</span>
+            <h2>流程版本</h2>
+          </div>
+          <button
+            className="icon-button"
+            title="新建 Workflow"
+            aria-label="新建 Workflow"
+            disabled={!canEditSelectedApp}
+            onClick={createWorkflow}
+          >
+            <Plus size={16} />
+          </button>
+        </div>
+        <div className="stack-list">
+          {workflows.map((workflow) => {
+            const isSelected = selectedWorkflowId === workflow.id;
+            return (
+              <button
+                className={isSelected ? "list-card active" : "list-card"}
+                key={workflow.id}
+                onClick={() => selectWorkflow(workflow)}
+              >
+                <span className="list-card-main">
+                  <strong>{workflow.name}</strong>
+                  <small>{workflow.description || `Workflow ${shortId(workflow.id)}`}</small>
+                </span>
+                {renderStatusBadge(workflow, isSelected)}
+              </button>
+            );
+          })}
+          {selectedApp && !workflows.length ? renderEmptyState("暂无 Workflow", "可以为当前 App 新建一个流程草稿。") : null}
+        </div>
+        {selectedWorkflow ? (
+          <div className="workflow-raw-spec">
+            <div className="raw-spec-heading">
+              <span>
+                <span className="eyebrow">Raw Spec</span>
+                <strong>draft_spec JSON</strong>
+              </span>
+              <Code2 size={15} />
+            </div>
+            <textarea
+              className="json-editor compact-json-editor"
+              rows={16}
+              spellCheck={false}
+              readOnly={!canEditSelectedWorkflow}
+              value={draftSpecText}
+              onChange={(event) => updateDraftSpecText(event.target.value)}
+            />
+            {draftSpecError ? <div className="inline-alert error">{draftSpecError}</div> : null}
+          </div>
+        ) : null}
+        {selectedWorkflow ? (
+          <div className="workflow-manage-bar">
+            <span>
+              当前选中 <strong>{selectedWorkflow.name}</strong>
+            </span>
+            <button className="ghost-danger-button" disabled={!canEditSelectedWorkflow || busy} onClick={deleteSelectedWorkflow}>
+              <Trash2 size={15} /> 删除 Workflow
+            </button>
+          </div>
+        ) : null}
+      </section>
+    );
+  }
+
+  function renderAppSettingsPanel() {
+    if (!selectedOwnedApp) return null;
+    return (
+      <section className="work-panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">App Settings</span>
+            <h2>应用默认设置</h2>
+          </div>
+        </div>
+        <div className="form-grid">
+          <label>
+            应用名称
+            <input value={selectedOwnedApp.name} onChange={(event) => setSelectedApp({ ...selectedOwnedApp, name: event.target.value })} />
+          </label>
+          <label>
+            描述
+            <textarea
+              rows={2}
+              value={selectedOwnedApp.description}
+              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, description: event.target.value })}
+            />
+          </label>
+          <label>
+            System Prompt
+            <textarea
+              rows={4}
+              value={selectedOwnedApp.system_prompt}
+              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, system_prompt: event.target.value })}
+            />
+          </label>
+        </div>
+      </section>
+    );
   }
 
   function renderWorkflowCanvas() {
     if (!selectedWorkflow) {
       return (
-        <section className="panel">
-          <div className="panel-title">
-            <GitBranch size={16} /> Workflow
-          </div>
-          <p className="empty">Select or create a Workflow.</p>
+        <section className="work-panel canvas-panel">
+          {renderEmptyState("请选择 Workflow", "左侧选择或创建 Workflow 后，可以配置节点和发布版本。")}
         </section>
       );
     }
+
     return (
-      <section className="panel">
-        <div className="panel-title">
-          <GitBranch size={16} /> Workflow 编排
+      <section className="work-panel canvas-panel">
+        <div className="panel-heading canvas-heading">
+          <div>
+            <span className="eyebrow">Workflow Graph</span>
+            <h2>{selectedWorkflow.name}</h2>
+          </div>
+          <div className="heading-actions">
+            {selectedWorkflow ? renderStatusBadge(selectedWorkflow, true) : null}
+            <button className="secondary-button" disabled={busy || !canEditSelectedWorkflow || Boolean(draftSpecError)} onClick={saveConfig}>
+              <Save size={15} /> 保存草稿
+            </button>
+            <button className="primary-button" disabled={busy || !canEditSelectedWorkflow || Boolean(draftSpecError)} onClick={publishSelectedWorkflow}>
+              <Play size={15} /> 发布
+            </button>
+          </div>
         </div>
-        <div className="workflow-canvas">
+        {selectedWorkflowHasUnpublishedChanges ? (
+          <div className="inline-alert warning">
+            当前草稿已经变化。聊天和 MCP 仍运行上一次发布版本，发布后才会切换。
+          </div>
+        ) : null}
+        {!selectedWorkflowPublished ? <div className="inline-alert">该 Workflow 尚未发布，发布后才能聊天或通过 MCP 调用。</div> : null}
+        <div className="workflow-board">
           {workflowNodes.map((node, index) => {
             const id = getWorkflowNodeId(node, index);
-            const type = getWorkflowNodeType(node);
             const isSelected = selectedWorkflowNodeId === id || (!selectedWorkflowNodeId && index === 0);
             const outgoing = workflowEdges.filter((edge) => edge.source === id).map((edge) => edge.target);
             return (
-              <div className="workflow-chain-item" key={`${id}-${index}`}>
-                <button
-                  className={isSelected ? "workflow-node active" : "workflow-node"}
-                  onClick={() => setSelectedWorkflowNodeId(id)}
-                >
-                  <span className="workflow-node-icon">{renderWorkflowNodeIcon(type)}</span>
-                  <span className="workflow-node-main">
+              <div className="workflow-column" key={`${id}-${index}`}>
+                <button className={isSelected ? "workflow-node active" : "workflow-node"} onClick={() => setSelectedWorkflowNodeId(id)}>
+                  <span className={`node-icon ${getNodeKindClass(node)}`}>{renderWorkflowNodeIcon(node)}</span>
+                  <span className="node-content">
                     <strong>{getWorkflowNodeLabel(node, index)}</strong>
-                    <small>{type}</small>
+                    <small>{renderWorkflowNodeSummary(node)}</small>
                   </span>
-                  <span className="workflow-node-meta">{renderWorkflowNodeSummary(node)}</span>
+                  <span className="node-type">{getWorkflowNodeType(node)}</span>
                 </button>
                 {index < workflowNodes.length - 1 ? (
-                  <div className="workflow-link">
+                  <div className="edge-line">
                     <span />
                     <small>{outgoing.length ? outgoing.join(", ") : "next"}</small>
                   </div>
@@ -1248,453 +1549,6 @@ function App() {
     );
   }
 
-  function renderAppSettings() {
-    if (!selectedOwnedApp) return null;
-    return (
-      <section className="panel">
-        <div className="panel-title">
-          <Wrench size={16} /> 应用设置
-        </div>
-        <label>
-          名称
-          <input value={selectedOwnedApp.name} onChange={(event) => setSelectedApp({ ...selectedOwnedApp, name: event.target.value })} />
-        </label>
-        <label>
-          描述
-          <textarea
-            rows={2}
-            value={selectedOwnedApp.description}
-            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, description: event.target.value })}
-          />
-        </label>
-        <label>
-          System Prompt
-          <textarea
-            rows={4}
-            value={selectedOwnedApp.system_prompt}
-            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, system_prompt: event.target.value })}
-          />
-        </label>
-      </section>
-    );
-  }
-
-  function renderWorkflowListPanel() {
-    if (!selectedOwnedApp) return null;
-    return (
-      <section className="panel">
-        <div className="panel-title panel-title-between">
-          <span>
-            <GitBranch size={16} /> Workflows
-          </span>
-          <button className="icon-button" title="Create workflow" onClick={createWorkflow}>
-            <Plus size={14} />
-          </button>
-        </div>
-        <div className="workflow-list">
-          {workflows.map((workflow) => {
-            const isSelected = selectedWorkflowId === workflow.id;
-            const hasUnpublishedChanges = isSelected && selectedWorkflowHasUnpublishedChanges;
-            const statusLabel = hasUnpublishedChanges
-              ? "Unpublished changes"
-              : workflow.published_version_id
-                ? "Published"
-                : "Draft only";
-            const statusClass = hasUnpublishedChanges
-              ? "status-pill dirty"
-              : workflow.published_version_id
-                ? "status-pill published"
-                : "status-pill";
-            return (
-              <button
-                className={isSelected ? "workflow-list-item active" : "workflow-list-item"}
-                key={workflow.id}
-                onClick={() => selectWorkflow(workflow)}
-              >
-                <span>
-                  <strong>{workflow.name}</strong>
-                  <small>{workflow.description || workflow.id}</small>
-                </span>
-                <small className={statusClass}>{statusLabel}</small>
-              </button>
-            );
-          })}
-          {workflows.length === 0 ? <p className="empty">No workflows found for this App.</p> : null}
-        </div>
-      </section>
-    );
-  }
-
-  function renderWorkflowSettings() {
-    if (!selectedWorkflow) return null;
-    const workflowMcpEndpoint = workflowMcpDraft ? getWorkflowMcpEndpoint(slugifyMcpServerName(workflowMcpDraft.server_slug)) : "";
-    return (
-      <section className="panel">
-        <div className="panel-title">
-          <GitBranch size={16} /> Workflow Detail
-        </div>
-        <label>
-          Name
-          <input
-            value={selectedWorkflow.name}
-            onChange={(event) => setSelectedWorkflow({ ...selectedWorkflow, name: event.target.value })}
-          />
-        </label>
-        <label>
-          Description
-          <textarea
-            rows={2}
-            value={selectedWorkflow.description}
-            onChange={(event) => setSelectedWorkflow({ ...selectedWorkflow, description: event.target.value })}
-          />
-        </label>
-        <div className="readonly-node">
-          <strong>{selectedWorkflow.published_version_id || "Workflow is not published"}</strong>
-          <small>
-            {selectedWorkflowHasUnpublishedChanges
-              ? "current draft has unpublished changes"
-              : selectedWorkflow.published_version_id
-                ? "published_version_id"
-                : "publish before chat"}
-          </small>
-        </div>
-        {selectedWorkflowHasUnpublishedChanges ? (
-          <div className="notice">Current draft has unpublished changes. Chat still runs the published version.</div>
-        ) : null}
-        {workflowVersions.length ? (
-          <div className="version-list">
-            {workflowVersions.map((version) => (
-              <div className="version-item" key={version.id}>
-                <strong>v{version.version_number}</strong>
-                <span>{version.id}</span>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="empty">No published versions yet.</p>
-        )}
-        {workflowMcpDraft ? (
-          <>
-            <div className="sub-panel-title">Workflow MCP Server</div>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={workflowMcpDraft.enabled}
-                onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, enabled: event.target.checked })}
-              />
-              <span>
-                <strong>Enabled</strong>
-                <small>{workflowMcpServer ? "Expose the published workflow over MCP." : "Create an MCP endpoint for this workflow."}</small>
-              </span>
-            </label>
-            <label>
-              Server Name
-              <input
-                value={workflowMcpDraft.server_name}
-                onChange={(event) => {
-                  const serverName = event.target.value;
-                  const nextSlug = workflowMcpDraft.configured
-                    ? workflowMcpDraft.server_slug
-                    : slugifyMcpServerName(serverName) || workflowMcpDraft.server_slug;
-                  setWorkflowMcpDraft({ ...workflowMcpDraft, server_name: serverName, server_slug: nextSlug });
-                }}
-              />
-            </label>
-            <label>
-              Server Slug
-              <input
-                value={workflowMcpDraft.server_slug}
-                onChange={(event) =>
-                  setWorkflowMcpDraft({ ...workflowMcpDraft, server_slug: slugifyMcpServerName(event.target.value) })
-                }
-              />
-            </label>
-            <label>
-              Description
-              <textarea
-                rows={2}
-                value={workflowMcpDraft.description}
-                onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, description: event.target.value })}
-              />
-            </label>
-            <div className="readonly-node">
-              <strong>{workflowMcpEndpoint || "Save the MCP server to get an endpoint"}</strong>
-              <small>Auth: Bearer token</small>
-            </div>
-            {workflowMcpServer ? (
-              <div className="readonly-node">
-                <strong>{workflowMcpServer.enabled ? "Active" : "Disabled"}</strong>
-                <small>Updated {formatTimestamp(workflowMcpServer.updated_at)}</small>
-              </div>
-            ) : null}
-            {workflowMcpToken ? (
-              <label>
-                Access Token
-                <textarea className="token-block" rows={3} readOnly value={workflowMcpToken} />
-              </label>
-            ) : null}
-            <div className="actions-row">
-              <button className="secondary inline-button" onClick={saveWorkflowMcpServerConfig}>
-                <Link2 size={16} /> {workflowMcpServer ? "Save MCP Server" : "Create MCP Server"}
-              </button>
-              <button
-                className="secondary inline-button"
-                disabled={!workflowMcpServer}
-                onClick={rotateWorkflowMcpServerAccessToken}
-              >
-                <RefreshCw size={16} /> Rotate Token
-              </button>
-            </div>
-            <div className="notice">MCP calls always run the currently published workflow version.</div>
-          </>
-        ) : null}
-        <label>
-          draft_spec JSON
-          <textarea
-            className="json-editor"
-            rows={12}
-            spellCheck={false}
-            value={draftSpecText}
-            onChange={(event) => updateDraftSpecText(event.target.value)}
-          />
-        </label>
-        {draftSpecError ? <div className="error-notice">{draftSpecError}</div> : null}
-        <button className="secondary danger" disabled={workflows.length <= 1} onClick={deleteSelectedWorkflow}>
-          <Trash2 size={16} /> Delete Workflow
-        </button>
-      </section>
-    );
-  }
-
-  function renderExternalMcpServersPanel() {
-    if (!canEditSelectedApp) return null;
-    const selectedServerTools = getExternalServerTools(selectedExternalMcpServer);
-    const creatingNewServer = selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID;
-    return (
-      <section className="panel">
-        <div className="panel-title panel-title-between">
-          <span>
-            <Link2 size={16} /> External MCP Servers
-          </span>
-          <button className="icon-button" title="New external MCP server" onClick={newExternalMcpServerDraft}>
-            <Plus size={14} />
-          </button>
-        </div>
-        <div className="workflow-list">
-          {externalMcpServers.map((server) => {
-            const isSelected = selectedExternalMcpServerId === server.id;
-            const serverTools = getExternalServerTools(server);
-            return (
-              <button
-                className={isSelected ? "workflow-list-item active" : "workflow-list-item"}
-                key={server.id}
-                onClick={() => setSelectedExternalMcpServerId(server.id)}
-              >
-                <span>
-                  <strong>{server.name}</strong>
-                  <small>{server.description || server.server_url}</small>
-                </span>
-                <small className={server.status === "active" ? "status-pill published" : "status-pill"}>
-                  {server.status} · {serverTools.length}
-                </small>
-              </button>
-            );
-          })}
-          {creatingNewServer ? (
-            <div className="workflow-list-item active">
-              <span>
-                <strong>New server</strong>
-                <small>Create a new external MCP connection.</small>
-              </span>
-              <small className="status-pill">draft</small>
-            </div>
-          ) : null}
-        </div>
-        {!externalMcpServers.length && !creatingNewServer ? <p className="empty">No external MCP servers yet.</p> : null}
-        <label>
-          Name
-          <input value={externalMcpDraft.name} onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, name: event.target.value })} />
-        </label>
-        <label>
-          Description
-          <textarea
-            rows={2}
-            value={externalMcpDraft.description}
-            onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, description: event.target.value })}
-          />
-        </label>
-        <div className="grid-two">
-          <label>
-            Transport
-            <select
-              value={externalMcpDraft.transport_type}
-              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, transport_type: event.target.value })}
-            >
-              {MCP_TRANSPORT_TYPES.map((transport) => (
-                <option key={transport} value={transport}>
-                  {transport}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Auth
-            <select
-              value={externalMcpDraft.auth_type}
-              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_type: event.target.value })}
-            >
-              {MCP_AUTH_TYPES.map((authType) => (
-                <option key={authType} value={authType}>
-                  {authType}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <label>
-          Server URL
-          <input
-            placeholder="https://example.com/mcp"
-            value={externalMcpDraft.server_url}
-            onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, server_url: event.target.value })}
-          />
-        </label>
-        {externalMcpDraft.auth_type === "bearer" ? (
-          <label>
-            Bearer Token
-            <input
-              type="password"
-              placeholder={selectedExternalMcpServer?.has_auth_secret ? "Leave blank to keep current token" : ""}
-              value={externalMcpDraft.auth_secret}
-              onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_secret: event.target.value })}
-            />
-          </label>
-        ) : null}
-        {selectedExternalMcpServer ? (
-          <div className="readonly-node">
-            <strong>{selectedExternalMcpServer.status}</strong>
-            <small>Last sync {formatTimestamp(selectedExternalMcpServer.last_sync_at)}</small>
-          </div>
-        ) : null}
-        {selectedExternalMcpServer?.last_sync_error ? <div className="error-notice">{selectedExternalMcpServer.last_sync_error}</div> : null}
-        <div className="actions-row">
-          <button className="secondary inline-button" onClick={saveExternalMcpServer}>
-            <Save size={16} /> {selectedExternalMcpServer ? "Save Server" : "Create Server"}
-          </button>
-          <button
-            className="secondary inline-button"
-            disabled={!selectedExternalMcpServer}
-            onClick={syncSelectedExternalMcpServer}
-          >
-            <RefreshCw size={16} /> Sync Tools
-          </button>
-          <button
-            className="secondary inline-button"
-            disabled={!selectedExternalMcpServer}
-            onClick={deleteSelectedExternalMcpServer}
-          >
-            <Trash2 size={16} /> Delete
-          </button>
-        </div>
-        {selectedExternalMcpServer ? (
-          <>
-            <div className="sub-panel-title">Synced Tools</div>
-            {selectedServerTools.length ? (
-              <div className="mcp-tool-list">
-                {selectedServerTools.map((tool) => (
-                  <div className="mcp-tool-item" key={`${selectedExternalMcpServer.id}-${tool.name}`}>
-                    <strong>{tool.name}</strong>
-                    <small>{tool.description || "No description"}</small>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="empty">Sync this server to load its tool manifest.</p>
-            )}
-          </>
-        ) : null}
-      </section>
-    );
-  }
-
-  function renderKnowledgeDatabasePanel() {
-    return (
-      <section className="panel">
-        <div className="panel-title">
-          <Database size={16} /> 知识库
-        </div>
-        <div className="grid-two">
-          <label>
-            名称
-            <input value={knowledgeDraft.name} onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, name: event.target.value })} />
-          </label>
-          <label>
-            操作
-            <button className="secondary" disabled={!knowledgeDraft.name.trim()} onClick={createKnowledgeBase}>
-              <Plus size={16} /> 新建
-            </button>
-          </label>
-        </div>
-        <label>
-          描述
-          <input
-            value={knowledgeDraft.description}
-            onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, description: event.target.value })}
-          />
-        </label>
-        <div className="kb-list">
-          {knowledgeBases.map((kb) => (
-            <button
-              className={selectedKnowledgeBaseId === kb.id ? "kb-item active" : "kb-item"}
-              key={kb.id}
-              onClick={() => setSelectedKnowledgeBaseId(kb.id)}
-            >
-              <strong>{kb.name}</strong>
-              <span>
-                {kb.locked ? "已锁定" : "未锁定"} · {kb.embedding_provider}/{kb.embedding_model} · {kb.embedding_dimension}
-              </span>
-            </button>
-          ))}
-        </div>
-        {selectedKnowledgeBase ? (
-          <>
-            <div className="actions-row">
-              <label className="upload upload-inline">
-                <FileUp size={16} />
-                上传文档
-                <input
-                  type="file"
-                  accept=".txt,.md,.py,.js,.jsx,.ts,.tsx,.java,.go,.json,.yaml,.yml,.csv,.html,.css,.pdf,.docx,.pptx,.xlsx,.xls"
-                  disabled={busy}
-                  onChange={(event) => uploadKnowledgeFile(event.target.files?.[0] ?? null)}
-                />
-              </label>
-              <button className="secondary inline-button" onClick={rebuildSelectedKnowledgeBase}>
-                重建
-              </button>
-            </div>
-            <div className="doc-list">
-              {knowledgeDocuments.map((document) => (
-                <div className="doc-item" key={document.id}>
-                  <strong>{document.filename}</strong>
-                  <span>
-                    {document.status}
-                    {document.error ? ` · ${document.error}` : ""}
-                  </span>
-                  <button className="icon-button" title="删除文档" onClick={() => deleteKnowledgeDocument(document.id)}>
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </>
-        ) : (
-          <p className="empty">先创建一个知识库。</p>
-        )}
-      </section>
-    );
-  }
-
   function renderRetrievalNodeSettings() {
     const queryEnhancementEnabled = Boolean(retrievalNodeModel.query_enhancement_enabled ?? false);
     const validIds = new Set(knowledgeBases.map((item) => item.id));
@@ -1702,29 +1556,35 @@ function App() {
       ? retrievalNodeModel.knowledge_base_ids.filter((item) => validIds.has(item))
       : [];
     return (
-      <>
-        <label className="check">
+      <div className="form-grid">
+        <label className="check-row">
           <input
             type="checkbox"
             checked={Boolean(retrievalNodeModel.enabled ?? true)}
             onChange={(event) => updateRetrievalConfig("enabled", event.target.checked)}
           />
           <span>
-            <strong>启用检索</strong>
-            <small>关闭后 workflow 会跳过该节点</small>
+            <strong>启用检索节点</strong>
+            <small>关闭后，Workflow 运行时会跳过该检索节点。</small>
           </span>
         </label>
-        <div className="sub-panel-title">知识库选择</div>
-        {knowledgeBases.map((kb) => (
-          <label className="check" key={kb.id}>
-            <input type="checkbox" checked={selectedIds.includes(kb.id)} onChange={() => toggleKnowledgeBaseInNode(kb.id)} />
-            <span>
-              <strong>{kb.name}</strong>
-              <small>{kb.description || kb.embedding_model}</small>
-            </span>
-          </label>
-        ))}
-        <div className="grid-two">
+        <div className="field-section-title">知识库选择</div>
+        {knowledgeBases.length ? (
+          <div className="checkbox-list">
+            {knowledgeBases.map((kb) => (
+              <label className="check-row bordered" key={kb.id}>
+                <input type="checkbox" checked={selectedIds.includes(kb.id)} onChange={() => toggleKnowledgeBaseInNode(kb.id)} />
+                <span>
+                  <strong>{kb.name}</strong>
+                  <small>{kb.description || `${kb.embedding_provider}/${kb.embedding_model}`}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+        ) : (
+          <p className="muted-copy">还没有知识库。可以到“知识库”页面创建并上传文档。</p>
+        )}
+        <div className="two-fields">
           <label>
             召回 Top-K
             <input
@@ -1734,7 +1594,7 @@ function App() {
             />
           </label>
           <label>
-            Jina Rerank
+            Rerank
             <select
               value={Boolean(retrievalNodeModel.rerank_enabled ?? false) ? "on" : "off"}
               onChange={(event) => updateRetrievalConfig("rerank_enabled", event.target.value === "on")}
@@ -1744,7 +1604,7 @@ function App() {
             </select>
           </label>
         </div>
-        <label className="check">
+        <label className="check-row">
           <input
             type="checkbox"
             checked={queryEnhancementEnabled}
@@ -1752,16 +1612,16 @@ function App() {
           />
           <span>
             <strong>Query Enhancement</strong>
-            <small>开启后必须配置独立的 Query LLM 凭据</small>
+            <small>用独立 Query LLM 重写、HyDE 或生成多查询。</small>
           </span>
         </label>
         {queryEnhancementEnabled ? (
           <>
-            <div className="notice">
-              Query Enhancement 使用创建者单独选择的 LLM API 和 key，不复用 Agent 节点模型配置。
+            <div className="inline-alert">
+              Query Enhancement 使用这里单独选择的凭证和模型，不复用 Agent 节点模型配置。
             </div>
             <label>
-              策略
+              增强策略
               <select
                 value={String(retrievalNodeModel.query_enhancement_strategy ?? "rewrite")}
                 onChange={(event) => updateRetrievalConfig("query_enhancement_strategy", event.target.value)}
@@ -1773,14 +1633,14 @@ function App() {
                 ))}
               </select>
             </label>
-            <div className="grid-two">
+            <div className="two-fields">
               <label>
                 Query LLM Provider
                 <select
                   value={String(retrievalNodeModel.query_llm_provider ?? "")}
                   onChange={(event) => updateRetrievalQueryLlmProvider(event.target.value)}
                 >
-                  <option value="">选择</option>
+                  <option value="">选择 provider</option>
                   {QUERY_LLM_PROVIDERS.map((provider) => (
                     <option key={provider} value={provider}>
                       {provider}
@@ -1812,7 +1672,7 @@ function App() {
                 value={String(retrievalNodeModel.query_llm_credential_id ?? "")}
                 onChange={(event) => updateRetrievalConfig("query_llm_credential_id", event.target.value)}
               >
-                <option value="">选择 API 凭据</option>
+                <option value="">选择 API 凭证</option>
                 {credentials.map((credential) => (
                   <option key={credential.id} value={credential.id}>
                     {credential.name} · {credential.provider} · {credential.masked_api_key}
@@ -1830,21 +1690,18 @@ function App() {
             </label>
           </>
         ) : null}
-      </>
+      </div>
     );
   }
 
   function renderAgentNodeSettings() {
     if (!selectedOwnedApp || !selectedWorkflow) return null;
     return (
-      <>
+      <div className="form-grid">
         <label>
           模型提供方
-          <select
-            value={String(agentNodeModel.provider ?? "")}
-            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "provider", event.target.value))}
-          >
-            <option value="">继承 App</option>
+          <select value={String(agentNodeModel.provider ?? "")} onChange={(event) => updateAgentConfig("provider", event.target.value)}>
+            <option value="">继承 App 默认模型</option>
             {MODEL_PROVIDERS.map((provider) => (
               <option key={provider} value={provider}>
                 {provider}
@@ -1857,16 +1714,13 @@ function App() {
           <input
             placeholder={selectedOwnedApp.model_name}
             value={String(agentNodeModel.model_name ?? "")}
-            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "model_name", event.target.value))}
+            onChange={(event) => updateAgentConfig("model_name", event.target.value)}
           />
         </label>
         <label>
-          模型凭据
-          <select
-            value={String(agentNodeModel.credential_id ?? "")}
-            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "credential_id", event.target.value))}
-          >
-            <option value="">继承 App</option>
+          模型凭证
+          <select value={String(agentNodeModel.credential_id ?? "")} onChange={(event) => updateAgentConfig("credential_id", event.target.value)}>
+            <option value="">继承 App 凭证</option>
             {credentials.map((credential) => (
               <option key={credential.id} value={credential.id}>
                 {credential.name} · {credential.masked_api_key}
@@ -1879,17 +1733,17 @@ function App() {
           <input
             placeholder={selectedOwnedApp.model_base_url || "https://api.openai.com/v1"}
             value={String(agentNodeModel.base_url ?? "")}
-            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "base_url", event.target.value))}
+            onChange={(event) => updateAgentConfig("base_url", event.target.value)}
           />
         </label>
-        <div className="grid-two">
+        <div className="two-fields">
           <label>
-            温度
+            Temperature
             <input
               type="number"
               placeholder={String(selectedOwnedApp.temperature)}
               value={String(agentNodeModel.temperature ?? "")}
-              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "temperature", event.target.value))}
+              onChange={(event) => updateAgentConfig("temperature", event.target.value)}
             />
           </label>
           <label>
@@ -1898,7 +1752,7 @@ function App() {
               type="number"
               placeholder={String(selectedOwnedApp.top_p)}
               value={String(agentNodeModel.top_p ?? "")}
-              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "top_p", event.target.value))}
+              onChange={(event) => updateAgentConfig("top_p", event.target.value)}
             />
           </label>
         </div>
@@ -1908,27 +1762,27 @@ function App() {
             type="number"
             placeholder={String(selectedOwnedApp.max_tokens)}
             value={String(agentNodeModel.max_tokens ?? "")}
-            onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "max_tokens", event.target.value))}
+            onChange={(event) => updateAgentConfig("max_tokens", event.target.value)}
           />
         </label>
-        <div className="sub-panel-title">Agent Context</div>
-        <div className="grid-two">
+        <div className="field-section-title">上下文预算</div>
+        <div className="two-fields">
           <label>
             Context Window
             <input
               type="number"
               placeholder="8192"
               value={String(agentNodeModel.model_context_window ?? "")}
-              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "model_context_window", event.target.value))}
+              onChange={(event) => updateAgentConfig("model_context_window", event.target.value)}
             />
           </label>
           <label>
-            Safety
+            Safety Margin
             <input
               type="number"
               placeholder="400"
               value={String(agentNodeModel.context_safety_margin ?? "")}
-              onChange={(event) => setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "context_safety_margin", event.target.value))}
+              onChange={(event) => updateAgentConfig("context_safety_margin", event.target.value)}
             />
           </label>
         </div>
@@ -1938,225 +1792,744 @@ function App() {
             type="number"
             placeholder="1024"
             value={String(agentNodeModel.context_reserved_output_tokens ?? "")}
-            onChange={(event) =>
-              setSelectedWorkflow(updateAgentNodeModel(selectedWorkflow, "context_reserved_output_tokens", event.target.value))
-            }
+            onChange={(event) => updateAgentConfig("context_reserved_output_tokens", event.target.value)}
           />
         </label>
-        <div className="sub-panel-title">App 默认模型</div>
-        <label>
-          模型提供方
-          <select
-            value={selectedOwnedApp.model_provider}
-            onChange={(event) => {
-              const provider = event.target.value;
-              setSelectedApp({ ...selectedOwnedApp, model_provider: provider });
-              setCredentialDraft({ ...credentialDraft, provider: defaultCredentialProvider(provider) });
-            }}
-          >
-            {MODEL_PROVIDERS.map((provider) => (
-              <option key={provider} value={provider}>
-                {provider}
-              </option>
+        <div className="field-section-title">内置工具</div>
+        {tools.length ? (
+          <div className="checkbox-list">
+            {tools.map((tool) => (
+              <label className="check-row bordered" key={tool.name}>
+                <input type="checkbox" checked={enabledAgentToolNames.includes(tool.name)} onChange={() => toggleTool(tool.name)} />
+                <span>
+                  <strong>{tool.label || tool.name}</strong>
+                  <small>{tool.description}</small>
+                </span>
+              </label>
             ))}
-          </select>
-        </label>
-        <label>
-          模型名称
-          <input value={selectedOwnedApp.model_name} onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_name: event.target.value })} />
-        </label>
-        <label>
-          模型凭据
-          <select
-            value={selectedOwnedApp.model_credential_id}
-            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_credential_id: event.target.value })}
-          >
-            <option value="">未选择</option>
-            {credentials.map((credential) => (
-              <option key={credential.id} value={credential.id}>
-                {credential.name} · {credential.masked_api_key}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Base URL
-          <input
-            placeholder="https://api.openai.com/v1"
-            value={selectedOwnedApp.model_base_url}
-            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, model_base_url: event.target.value })}
-          />
-        </label>
-        <div className="grid-two">
-          <label>
-            温度
-            <input
-              type="number"
-              value={selectedOwnedApp.temperature}
-              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, temperature: Number(event.target.value) })}
-            />
-          </label>
-          <label>
-            Top P
-            <input
-              type="number"
-              value={selectedOwnedApp.top_p}
-              onChange={(event) => setSelectedApp({ ...selectedOwnedApp, top_p: Number(event.target.value) })}
-            />
-          </label>
-        </div>
-        <label>
-          Max Tokens
-          <input
-            type="number"
-            value={selectedOwnedApp.max_tokens}
-            onChange={(event) => setSelectedApp({ ...selectedOwnedApp, max_tokens: Number(event.target.value) })}
-          />
-        </label>
-        <div className="sub-panel-title">工具</div>
-        {tools.map((tool) => (
-          <label className="check" key={tool.name}>
-            <input type="checkbox" checked={enabledAgentToolNames.includes(tool.name)} onChange={() => toggleTool(tool.name)} />
-            <span>
-              <strong>{tool.label}</strong>
-              <small>{tool.description}</small>
-            </span>
-          </label>
-        ))}
-        <div className="sub-panel-title">External MCP Tools</div>
-        {externalMcpServers.length === 0 ? <p className="empty">Create and sync an external MCP server first.</p> : null}
+          </div>
+        ) : (
+          <p className="muted-copy">平台暂未返回内置工具 catalog。</p>
+        )}
+        <div className="field-section-title">外部 MCP 工具</div>
+        {externalMcpServers.length === 0 ? <p className="muted-copy">先到 MCP 页面注册并同步外部 Server。</p> : null}
         {externalMcpServers.map((server) => {
           const serverTools = getExternalServerTools(server);
           return (
-            <div className="mcp-tool-group" key={server.id}>
-              <div className="mcp-tool-group-header">
-                <strong>{server.name}</strong>
-                <small className={server.status === "active" ? "status-pill published" : "status-pill"}>{server.status}</small>
+            <div className="tool-server-group" key={server.id}>
+              <div className="tool-server-heading">
+                <span>
+                  <strong>{server.name}</strong>
+                  <small>{server.server_url}</small>
+                </span>
+                <span className={server.status === "active" ? "badge success" : "badge muted"}>{server.status}</span>
               </div>
-              <small className="mcp-tool-group-meta">{server.server_url}</small>
-              {server.last_sync_error ? <div className="error-notice">{server.last_sync_error}</div> : null}
+              {server.last_sync_error ? <div className="inline-alert error">{server.last_sync_error}</div> : null}
               {serverTools.length ? (
-                serverTools.map((tool) => {
-                  const toolKey = buildMcpToolKey(server.id, tool.name);
-                  return (
-                    <label className="check" key={toolKey}>
-                      <input
-                        type="checkbox"
-                        checked={enabledAgentMcpToolKeys.includes(toolKey)}
-                        onChange={() => toggleMcpTool(server.id, tool.name)}
-                      />
-                      <span>
-                        <strong>{tool.name}</strong>
-                        <small>{tool.description || "Remote MCP tool"}</small>
-                      </span>
-                    </label>
-                  );
-                })
+                <div className="checkbox-list">
+                  {serverTools.map((tool) => {
+                    const toolKey = buildMcpToolKey(server.id, tool.name);
+                    return (
+                      <label className="check-row bordered" key={toolKey}>
+                        <input
+                          type="checkbox"
+                          checked={enabledAgentMcpToolKeys.includes(toolKey)}
+                          onChange={() => toggleMcpTool(server.id, tool.name)}
+                        />
+                        <span>
+                          <strong>{tool.name}</strong>
+                          <small>{tool.description || "远端 MCP tool"}</small>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
               ) : (
-                <p className="empty">No synced tools available for this server.</p>
+                <p className="muted-copy">该 Server 还没有同步到 tools。</p>
               )}
             </div>
           );
         })}
-      </>
+      </div>
     );
   }
 
-  function renderSelectedNodeSettings() {
-    if (!selectedOwnedApp || !selectedWorkflow || !selectedWorkflowNode) return null;
-    const nodeIndex = workflowNodes.indexOf(selectedWorkflowNode);
-    const title = getWorkflowNodeLabel(selectedWorkflowNode, Math.max(nodeIndex, 0));
-    const id = getWorkflowNodeId(selectedWorkflowNode, Math.max(nodeIndex, 0));
-    const selectedIsRetrievalNode = isRetrievalNode(selectedWorkflowNode);
-    const isAgentNode = id === "agent" || selectedWorkflowNodeType === "agent" || selectedWorkflowNodeType === "react_agent";
+  function renderNodeInspector() {
+    if (!selectedWorkflow || !selectedWorkflowNode) {
+      return (
+        <aside className="studio-inspector">
+          {renderEmptyState("没有选中节点", "选择画布中的节点后会显示配置面板。")}
+        </aside>
+      );
+    }
+    const title = getWorkflowNodeLabel(selectedWorkflowNode, Math.max(selectedWorkflowNodeIndex, 0));
     return (
-      <section className="panel node-inspector">
-        <div className="panel-title">
-          {renderWorkflowNodeIcon(selectedWorkflowNodeType)} {title}
+      <aside className="studio-inspector">
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Node Inspector</span>
+              <h2>{title}</h2>
+            </div>
+            <span className={`node-icon small ${getNodeKindClass(selectedWorkflowNode)}`}>{renderWorkflowNodeIcon(selectedWorkflowNode)}</span>
+          </div>
+          <div className="node-meta-row">
+            <span>{selectedWorkflowNodeKey}</span>
+            <span>{selectedWorkflowNodeType}</span>
+          </div>
+          {!canEditSelectedWorkflow ? (
+            <div className="readonly-card">
+              <strong>只读使用模式</strong>
+              <small>你可以运行已发布 Workflow，但不能修改草稿节点、工具、知识库或模型配置。</small>
+            </div>
+          ) : null}
+          {canEditSelectedWorkflow && selectedWorkflowNodeIsRetrieval ? renderRetrievalNodeSettings() : null}
+          {canEditSelectedWorkflow && selectedWorkflowNodeIsAgent ? renderAgentNodeSettings() : null}
+          {canEditSelectedWorkflow && !selectedWorkflowNodeIsRetrieval && !selectedWorkflowNodeIsAgent ? (
+            <div className="readonly-card">
+              <strong>{renderWorkflowNodeSummary(selectedWorkflowNode)}</strong>
+              <small>该节点当前只展示结构，不提供编辑项。</small>
+            </div>
+          ) : null}
+        </section>
+      </aside>
+    );
+  }
+
+  function renderChatPanel() {
+    return (
+      <section className="work-panel chat-panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">Debug Chat</span>
+            <h2>调试发布版本</h2>
+          </div>
+          {conversationId ? <span className="badge muted">会话 {shortId(conversationId)}</span> : <span className="badge muted">新会话</span>}
         </div>
-        <div className="node-meta">
-          <span>{id}</span>
-          <span>{selectedWorkflowNodeType}</span>
+        {selectedWorkflowHasUnpublishedChanges ? (
+          <div className="inline-alert warning">当前聊天仍运行已发布版本；草稿改动需要发布后才会生效。</div>
+        ) : null}
+        {selectedWorkflow && !selectedWorkflowPublished ? <div className="inline-alert">未发布 Workflow 不能聊天。</div> : null}
+        <div className="messages">
+          {messages.length === 0 ? (
+            <div className="chat-empty">
+              <MessageSquare size={20} />
+              <strong>发送一条问题来调试 Workflow</strong>
+              <span>回答、检索事件和工具调用会同步记录到右侧运行日志。</span>
+            </div>
+          ) : (
+            messages.map((message, index) => (
+              <div key={`${message.role}-${index}`} className={`message ${message.role}`}>
+                {message.content}
+              </div>
+            ))
+          )}
         </div>
-        {selectedIsRetrievalNode ? renderRetrievalNodeSettings() : null}
-        {isAgentNode ? renderAgentNodeSettings() : null}
-        {!selectedIsRetrievalNode && !isAgentNode ? (
-          <div className="readonly-node">
-            <strong>{renderWorkflowNodeSummary(selectedWorkflowNode)}</strong>
-            <small>当前节点只展示运行结构。</small>
+        <div className="composer">
+          <input
+            value={input}
+            placeholder="输入调试问题"
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") sendMessage();
+            }}
+          />
+          <button className="primary-button" disabled={busy || !selectedWorkflowPublished || !input.trim()} onClick={sendMessage}>
+            {busy ? <Loader2 className="spin" size={15} /> : <Send size={15} />} 发送
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  function renderStudioView() {
+    return (
+      <div className="studio-layout">
+        <aside className="studio-left">
+          {renderAppSettingsPanel()}
+          {renderWorkflowListPanel()}
+          {selectedWorkflow ? (
+            <section className="work-panel">
+              <div className="panel-heading compact-heading">
+                <div>
+                  <span className="eyebrow">Published Versions</span>
+                  <h2>发布记录</h2>
+                </div>
+                <span className="badge muted">{workflowVersions.length}</span>
+              </div>
+              <div className="version-list">
+                {workflowVersions.map((version) => (
+                  <div className="version-card" key={version.id}>
+                    <strong>v{version.version_number}</strong>
+                    <small>{formatTimestamp(version.created_at)}</small>
+                    {version.id === selectedWorkflow.published_version_id ? <span className="badge success">当前线上</span> : null}
+                  </div>
+                ))}
+                {!workflowVersions.length ? <p className="muted-copy">还没有发布版本。</p> : null}
+              </div>
+            </section>
+          ) : null}
+        </aside>
+        <section className="studio-center">
+          {renderWorkflowCanvas()}
+          {renderChatPanel()}
+        </section>
+        {renderNodeInspector()}
+      </div>
+    );
+  }
+
+  function renderAppDetailView() {
+    if (!selectedApp) return renderWorkspaceHome();
+    return (
+      <div className="app-detail-view">
+        <section className="app-detail-header">
+          <div className="app-title-block">
+            <button className="secondary-button" onClick={returnToWorkspaceHome}>
+              <ChevronRight className="back-icon" size={15} /> 返回工作室
+            </button>
+            <span className="app-avatar">
+              <Bot size={21} />
+            </span>
+            <span>
+              <span className="eyebrow">App</span>
+              <h2>{selectedApp.name}</h2>
+              <small>{selectedApp.description || `App ${shortId(selectedApp.id)}`}</small>
+            </span>
+          </div>
+          <nav className="app-tabs" aria-label="App 内导航">
+            {APP_NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.id}
+                  className={activeAppView === item.id ? "app-tab active" : "app-tab"}
+                  onClick={() => setActiveAppView(item.id)}
+                >
+                  <Icon size={16} />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </section>
+        <section className="app-detail-content">
+          {activeAppView === "mcp" ? renderMcpView() : null}
+          {activeAppView === "logs" ? renderLogsView() : null}
+          {activeAppView === "studio" ? renderStudioView() : null}
+        </section>
+      </div>
+    );
+  }
+
+  function renderKnowledgeView() {
+    return (
+      <div className="resource-layout">
+        <section className="work-panel resource-list-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Knowledge Bases</span>
+              <h2>知识库</h2>
+            </div>
+          </div>
+          <div className="form-grid">
+            <div className="two-fields wide-left">
+              <label>
+                名称
+                <input value={knowledgeDraft.name} onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, name: event.target.value })} />
+              </label>
+              <label>
+                操作
+                <button className="secondary-button field-button" disabled={!knowledgeDraft.name.trim() || busy} onClick={createKnowledgeBase}>
+                  <Plus size={15} /> 新建
+                </button>
+              </label>
+            </div>
+            <label>
+              描述
+              <input
+                value={knowledgeDraft.description}
+                onChange={(event) => setKnowledgeDraft({ ...knowledgeDraft, description: event.target.value })}
+              />
+            </label>
+          </div>
+          <div className="stack-list roomy">
+            {knowledgeBases.map((kb) => (
+              <button
+                className={selectedKnowledgeBaseId === kb.id ? "list-card active" : "list-card"}
+                key={kb.id}
+                onClick={() => setSelectedKnowledgeBaseId(kb.id)}
+              >
+                <span className="list-card-main">
+                  <strong>{kb.name}</strong>
+                  <small>{kb.description || `${kb.embedding_provider}/${kb.embedding_model}`}</small>
+                </span>
+                <span className={kb.locked ? "badge success" : "badge muted"}>{kb.locked ? "索引锁定" : "未锁定"}</span>
+              </button>
+            ))}
+            {!knowledgeBases.length ? renderEmptyState("还没有知识库", "创建知识库后上传文档，检索节点才能选择它。") : null}
+          </div>
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Documents</span>
+              <h2>{selectedKnowledgeBase?.name ?? "文档"}</h2>
+            </div>
+            {selectedKnowledgeBase ? (
+              <div className="heading-actions">
+                <label className="upload-button">
+                  <FileUp size={15} /> 上传文档
+                  <input
+                    type="file"
+                    accept=".txt,.md,.py,.js,.jsx,.ts,.tsx,.java,.go,.json,.yaml,.yml,.csv,.html,.css,.pdf,.docx,.pptx,.xlsx,.xls"
+                    disabled={busy}
+                    onChange={(event) => uploadKnowledgeFile(event.target.files?.[0] ?? null)}
+                  />
+                </label>
+                <button className="secondary-button" disabled={busy} onClick={rebuildSelectedKnowledgeBase}>
+                  <RefreshCw size={15} /> 重建索引
+                </button>
+                <button className="ghost-danger-button" disabled={busy} onClick={deleteSelectedKnowledgeBase}>
+                  <Trash2 size={15} /> 删除知识库
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {selectedKnowledgeBase ? (
+            <>
+              <div className="kb-meta-grid">
+                <div>
+                  <span>Embedding</span>
+                  <strong>
+                    {selectedKnowledgeBase.embedding_provider}/{selectedKnowledgeBase.embedding_model}
+                  </strong>
+                </div>
+                <div>
+                  <span>Dimension</span>
+                  <strong>{selectedKnowledgeBase.embedding_dimension}</strong>
+                </div>
+                <div>
+                  <span>Chunk</span>
+                  <strong>
+                    {selectedKnowledgeBase.chunk_size}/{selectedKnowledgeBase.chunk_overlap}
+                  </strong>
+                </div>
+              </div>
+              <div className="table-list">
+                {knowledgeDocuments.map((document) => (
+                  <div className="table-row" key={document.id}>
+                    <FileText size={16} />
+                    <span className="table-main">
+                      <strong>{document.filename}</strong>
+                      <small>
+                        {document.status}
+                        {document.error ? ` · ${document.error}` : ""}
+                      </small>
+                    </span>
+                    <button className="icon-button danger" title="删除文档" aria-label="删除文档" onClick={() => deleteKnowledgeDocument(document.id)}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                ))}
+                {!knowledgeDocuments.length ? <p className="muted-copy">该知识库暂无文档。</p> : null}
+              </div>
+            </>
+          ) : (
+            renderEmptyState("请选择知识库", "左侧选择知识库后可以上传文档和查看索引状态。")
+          )}
+        </section>
+      </div>
+    );
+  }
+
+  function renderCredentialsView() {
+    return (
+      <div className="resource-layout">
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Credentials</span>
+              <h2>新增模型凭证</h2>
+            </div>
+          </div>
+          <div className="form-grid">
+            <div className="two-fields">
+              <label>
+                Provider
+                <select value={credentialDraft.provider} onChange={(event) => setCredentialDraft({ ...credentialDraft, provider: event.target.value })}>
+                  {CREDENTIAL_PROVIDERS.map((provider) => (
+                    <option key={provider} value={provider}>
+                      {provider}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                名称
+                <input value={credentialDraft.name} onChange={(event) => setCredentialDraft({ ...credentialDraft, name: event.target.value })} />
+              </label>
+            </div>
+            <label>
+              API Key
+              <input
+                type="password"
+                value={credentialDraft.api_key}
+                onChange={(event) => setCredentialDraft({ ...credentialDraft, api_key: event.target.value })}
+              />
+            </label>
+            <button className="primary-button form-submit" disabled={!credentialDraft.api_key.trim()} onClick={createCredential}>
+              <Plus size={15} /> 创建凭证
+            </button>
+          </div>
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Provider Keys</span>
+              <h2>凭证列表</h2>
+            </div>
+            <span className="badge muted">{credentials.length}</span>
+          </div>
+          <div className="table-list">
+            {credentials.map((credential) => (
+              <div className="table-row" key={credential.id}>
+                <KeyRound size={16} />
+                <span className="table-main">
+                  <strong>{credential.name}</strong>
+                  <small>
+                    {credential.provider} · {credential.masked_api_key} · {formatTimestamp(credential.updated_at)}
+                  </small>
+                </span>
+                <button className="icon-button danger" title="删除凭证" aria-label="删除凭证" onClick={() => deleteCredential(credential.id)}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+            {!credentials.length ? <p className="muted-copy">还没有模型凭证。</p> : null}
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function renderWorkflowMcpPanel() {
+    if (!selectedWorkflow || !workflowMcpDraft) {
+      return (
+        <section className="work-panel">
+          {renderEmptyState("请选择 Workflow", "选择一个 Workflow 后可以把它暴露为 MCP Server。")}
+        </section>
+      );
+    }
+    const endpoint = getWorkflowMcpEndpoint(slugifyMcpServerName(workflowMcpDraft.server_slug));
+    const canManageWorkflowMcp = canEditSelectedWorkflow;
+    return (
+      <section className="work-panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">MCP Server</span>
+            <h2>暴露当前 Workflow</h2>
+          </div>
+          {workflowMcpServer ? (
+            <span className={workflowMcpServer.enabled ? "badge success" : "badge muted"}>{workflowMcpServer.enabled ? "启用" : "停用"}</span>
+          ) : (
+            <span className="badge muted">未创建</span>
+          )}
+        </div>
+        <div className="form-grid">
+          <label className="check-row">
+            <input
+              type="checkbox"
+              disabled={!canManageWorkflowMcp}
+              checked={workflowMcpDraft.enabled}
+              onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, enabled: event.target.checked })}
+            />
+            <span>
+              <strong>启用 MCP Endpoint</strong>
+              <small>外部 MCP Client 将调用当前 Workflow 的已发布版本。</small>
+            </span>
+          </label>
+          <div className="two-fields">
+            <label>
+              Server Name
+              <input
+                disabled={!canManageWorkflowMcp}
+                value={workflowMcpDraft.server_name}
+                onChange={(event) => {
+                  const serverName = event.target.value;
+                  const nextSlug = workflowMcpDraft.configured
+                    ? workflowMcpDraft.server_slug
+                    : slugifyMcpServerName(serverName) || workflowMcpDraft.server_slug;
+                  setWorkflowMcpDraft({ ...workflowMcpDraft, server_name: serverName, server_slug: nextSlug });
+                }}
+              />
+            </label>
+            <label>
+              Server Slug
+              <input
+                disabled={!canManageWorkflowMcp}
+                value={workflowMcpDraft.server_slug}
+                onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, server_slug: slugifyMcpServerName(event.target.value) })}
+              />
+            </label>
+          </div>
+          <label>
+            描述
+            <textarea
+              disabled={!canManageWorkflowMcp}
+              rows={2}
+              value={workflowMcpDraft.description}
+              onChange={(event) => setWorkflowMcpDraft({ ...workflowMcpDraft, description: event.target.value })}
+            />
+          </label>
+          <div className="readonly-card">
+            <small>Endpoint</small>
+            <strong>{endpoint}</strong>
+            <small>认证方式：Bearer token。`tools/call` 会运行 `Workflow.published_version_id` 指向的版本。</small>
+          </div>
+          {!canManageWorkflowMcp ? <div className="inline-alert">只有 Workflow owner 可以管理 MCP Server 配置。</div> : null}
+          {workflowMcpToken ? (
+            <label>
+              新 token
+              <textarea className="token-block" rows={3} readOnly value={workflowMcpToken} />
+            </label>
+          ) : null}
+          <div className="heading-actions">
+            <button className="secondary-button" disabled={!canManageWorkflowMcp} onClick={saveWorkflowMcpServerConfig}>
+              <Save size={15} /> {workflowMcpServer ? "保存配置" : "创建 Server"}
+            </button>
+            <button className="secondary-button" disabled={!workflowMcpServer || !canManageWorkflowMcp} onClick={rotateWorkflowMcpServerAccessToken}>
+              <RefreshCw size={15} /> 轮换 token
+            </button>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  function renderExternalMcpPanel() {
+    const selectedServerTools = getExternalServerTools(selectedExternalMcpServer);
+    const creatingNewServer = selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID;
+    return (
+      <section className="work-panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">MCP Client</span>
+            <h2>外部 MCP Servers</h2>
+          </div>
+          <button className="secondary-button" onClick={newExternalMcpServerDraft}>
+            <Plus size={15} /> 新建连接
+          </button>
+        </div>
+        <div className="mcp-split">
+          <div className="stack-list">
+            {externalMcpServers.map((server) => {
+              const serverTools = getExternalServerTools(server);
+              return (
+                <button
+                  className={selectedExternalMcpServerId === server.id ? "list-card active" : "list-card"}
+                  key={server.id}
+                  onClick={() => setSelectedExternalMcpServerId(server.id)}
+                >
+                  <span className="list-card-main">
+                    <strong>{server.name}</strong>
+                    <small>{server.server_url}</small>
+                  </span>
+                  <span className={server.status === "active" ? "badge success" : "badge muted"}>{serverTools.length} tools</span>
+                </button>
+              );
+            })}
+            {creatingNewServer ? (
+              <div className="list-card active">
+                <span className="list-card-main">
+                  <strong>新建 Server</strong>
+                  <small>填写 Streamable HTTP MCP Server 地址。</small>
+                </span>
+                <span className="badge muted">草稿</span>
+              </div>
+            ) : null}
+            {!externalMcpServers.length && !creatingNewServer ? <p className="muted-copy">还没有外部 MCP Server。</p> : null}
+          </div>
+          <div className="form-grid">
+            <label>
+              名称
+              <input value={externalMcpDraft.name} onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, name: event.target.value })} />
+            </label>
+            <label>
+              描述
+              <textarea
+                rows={2}
+                value={externalMcpDraft.description}
+                onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, description: event.target.value })}
+              />
+            </label>
+            <div className="two-fields">
+              <label>
+                Transport
+                <select
+                  value={externalMcpDraft.transport_type}
+                  onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, transport_type: event.target.value })}
+                >
+                  {MCP_TRANSPORT_TYPES.map((transport) => (
+                    <option key={transport} value={transport}>
+                      {transport}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Auth
+                <select value={externalMcpDraft.auth_type} onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_type: event.target.value })}>
+                  {MCP_AUTH_TYPES.map((authType) => (
+                    <option key={authType} value={authType}>
+                      {authType}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label>
+              Server URL
+              <input
+                placeholder="https://example.com/mcp"
+                value={externalMcpDraft.server_url}
+                onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, server_url: event.target.value })}
+              />
+            </label>
+            {externalMcpDraft.auth_type === "bearer" ? (
+              <label>
+                Bearer Token
+                <input
+                  type="password"
+                  placeholder={selectedExternalMcpServer?.has_auth_secret ? "留空表示沿用当前 token" : ""}
+                  value={externalMcpDraft.auth_secret}
+                  onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, auth_secret: event.target.value })}
+                />
+              </label>
+            ) : null}
+            {selectedExternalMcpServer ? (
+              <div className="readonly-card">
+                <small>同步状态</small>
+                <strong>{selectedExternalMcpServer.status}</strong>
+                <small>Last sync：{formatTimestamp(selectedExternalMcpServer.last_sync_at)}</small>
+              </div>
+            ) : null}
+            {selectedExternalMcpServer?.last_sync_error ? <div className="inline-alert error">{selectedExternalMcpServer.last_sync_error}</div> : null}
+            <div className="heading-actions">
+              <button className="secondary-button" onClick={saveExternalMcpServer}>
+                <Save size={15} /> {selectedExternalMcpServer ? "保存 Server" : "创建 Server"}
+              </button>
+              <button className="secondary-button" disabled={!selectedExternalMcpServer} onClick={syncSelectedExternalMcpServer}>
+                <RefreshCw size={15} /> 同步 tools
+              </button>
+              <button className="ghost-danger-button" disabled={!selectedExternalMcpServer} onClick={deleteSelectedExternalMcpServer}>
+                <Trash2 size={15} /> 删除
+              </button>
+            </div>
+          </div>
+        </div>
+        {selectedExternalMcpServer ? (
+          <div className="tool-grid">
+            {selectedServerTools.map((tool) => (
+              <div className="tool-card" key={`${selectedExternalMcpServer.id}-${tool.name}`}>
+                <strong>{tool.name}</strong>
+                <small>{tool.description || "No description"}</small>
+              </div>
+            ))}
+            {!selectedServerTools.length ? <p className="muted-copy">同步后会在这里显示远端 tools manifest。</p> : null}
           </div>
         ) : null}
       </section>
     );
   }
 
-  function renderCredentialPanel() {
-    if (!canEditSelectedApp) return null;
+  function renderMcpView() {
     return (
-      <section className="panel">
-        <div className="panel-title">
-          <KeyRound size={16} /> 模型凭据
-        </div>
-        <div className="grid-two">
-          <label>
-            提供方
-            <select value={credentialDraft.provider} onChange={(event) => setCredentialDraft({ ...credentialDraft, provider: event.target.value })}>
-              {CREDENTIAL_PROVIDERS.map((provider) => (
-                <option key={provider} value={provider}>
-                  {provider}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            名称
-            <input value={credentialDraft.name} onChange={(event) => setCredentialDraft({ ...credentialDraft, name: event.target.value })} />
-          </label>
-        </div>
-        <label>
-          API Key
-          <input
-            type="password"
-            value={credentialDraft.api_key}
-            onChange={(event) => setCredentialDraft({ ...credentialDraft, api_key: event.target.value })}
-          />
-        </label>
-        <button className="secondary" disabled={!credentialDraft.api_key.trim()} onClick={createCredential}>
-          <Plus size={16} /> 新建凭据
-        </button>
-        <div className="credential-list">
-          {credentials.map((credential) => (
-            <div
-              className={
-                credential.id === selectedOwnedApp?.model_credential_id ||
-                credential.id === String(agentNodeModel.credential_id ?? "") ||
-                credential.id === String(retrievalNodeModel.query_llm_credential_id ?? "")
-                  ? "credential-item active"
-                  : "credential-item"
-              }
-              key={credential.id}
-            >
-              <span>
-                <strong>{credential.name}</strong>
-                <small>
-                  {credential.provider} · {credential.masked_api_key}
-                </small>
-              </span>
-              <button className="icon-button" title="删除凭据" onClick={() => deleteCredential(credential.id)}>
-                <Trash2 size={14} />
-              </button>
-            </div>
-          ))}
-        </div>
-      </section>
+      <div className="mcp-layout">
+        {renderWorkflowMcpPanel()}
+        {renderExternalMcpPanel()}
+      </div>
     );
+  }
+
+  function renderLogsView() {
+    return (
+      <div className="logs-layout">
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Runs</span>
+              <h2>运行记录</h2>
+            </div>
+            <span className="badge muted">{runs.length}</span>
+          </div>
+          <div className="stack-list roomy">
+            {runs.map((run) => (
+              <button className={selectedRunId === run.id ? "list-card active" : "list-card"} key={run.id} onClick={() => selectRun(run)}>
+                <span className="list-card-main">
+                  <strong>{run.status}</strong>
+                  <small>
+                    v {shortId(run.workflow_version_id)} · {run.latency_ms} ms · {formatTimestamp(run.created_at)}
+                  </small>
+                </span>
+                <span className={run.error ? "badge danger" : "badge success"}>{run.error ? "error" : "ok"}</span>
+              </button>
+            ))}
+            {!runs.length ? <p className="muted-copy">当前 Workflow 暂无运行记录。</p> : null}
+          </div>
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Run Steps</span>
+              <h2>步骤详情</h2>
+            </div>
+          </div>
+          <div className="table-list">
+            {runSteps.map((step) => (
+              <div className="step-card" key={step.id}>
+                <div className="step-heading">
+                  <strong>{step.name || step.type}</strong>
+                  <span className={step.error ? "badge danger" : "badge muted"}>{step.latency_ms} ms</span>
+                </div>
+                <small>
+                  {step.type} · {formatTimestamp(step.started_at)}
+                  {step.error ? ` · ${step.error}` : ""}
+                </small>
+                <details>
+                  <summary>查看输入输出</summary>
+                  <pre>{JSON.stringify({ input: step.input_json, output: step.output_json }, null, 2)}</pre>
+                </details>
+              </div>
+            ))}
+            {!runSteps.length ? <p className="muted-copy">选择一条 run 查看步骤。</p> : null}
+          </div>
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Current Trace</span>
+              <h2>本次调试事件</h2>
+            </div>
+          </div>
+          <pre className="trace-json">{trace.length ? JSON.stringify(trace, null, 2) : "暂无 trace"}</pre>
+        </section>
+      </div>
+    );
+  }
+
+  function renderActiveView() {
+    if (activeView === "workspace") return selectedApp ? renderAppDetailView() : renderWorkspaceHome();
+    if (activeView === "knowledge") return renderKnowledgeView();
+    if (activeView === "credentials") return renderCredentialsView();
+    return renderWorkspaceHome();
   }
 
   if (authLoading) {
     return (
       <main className="auth-shell">
         <section className="auth-card">
-          <div className="brand">
+          <div className="brand-mark">
             <Bot size={22} />
             <div>
               <h1>Dify-like</h1>
@@ -2172,20 +2545,16 @@ function App() {
     return (
       <main className="auth-shell">
         <section className="auth-card">
-          <div className="brand">
-            <Bot size={22} />
+          <div className="brand-mark large">
+            <Bot size={24} />
             <div>
               <h1>Dify-like</h1>
-              <p>知识库与检索节点工作台</p>
+              <p>知识库、Workflow 与 MCP 编排工作台</p>
             </div>
           </div>
           <label>
             邮箱
-            <input
-              autoComplete="email"
-              value={authForm.email}
-              onChange={(event) => setAuthForm({ ...authForm, email: event.target.value })}
-            />
+            <input autoComplete="email" value={authForm.email} onChange={(event) => setAuthForm({ ...authForm, email: event.target.value })} />
           </label>
           <label>
             密码
@@ -2201,11 +2570,11 @@ function App() {
           </label>
           {authError ? <p className="auth-error">{authError}</p> : null}
           <div className="auth-actions">
-            <button className="primary" disabled={authBusy} onClick={() => submitAuth("login")}>
-              <LogIn size={16} /> 登录
+            <button className="primary-button" disabled={authBusy} onClick={() => submitAuth("login")}>
+              <LogIn size={15} /> 登录
             </button>
-            <button className="secondary" disabled={authBusy} onClick={() => submitAuth("register")}>
-              <Plus size={16} /> 注册
+            <button className="secondary-button" disabled={authBusy} onClick={() => submitAuth("register")}>
+              <Plus size={15} /> 注册
             </button>
           </div>
         </section>
@@ -2214,149 +2583,74 @@ function App() {
   }
 
   return (
-    <main className="shell">
-      <aside className="sidebar">
-        <div className="brand">
+    <main className="workspace-shell">
+      <aside className="global-sidebar">
+        <div className="brand-mark">
           <Bot size={22} />
           <div>
             <h1>Dify-like</h1>
-            <p>知识库与检索节点</p>
+            <p>LLM Workflow Console</p>
           </div>
         </div>
-        <div className="session">
-          <div className="session-user">
+        <nav className="main-nav" aria-label="主导航">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                className={activeView === item.id ? "nav-item active" : "nav-item"}
+                onClick={() => {
+                  if (item.id === "workspace") {
+                    returnToWorkspaceHome();
+                    return;
+                  }
+                  setActiveView(item.id);
+                }}
+              >
+                <Icon size={18} />
+                <span>
+                  <strong>{item.label}</strong>
+                  <small>{item.description}</small>
+                </span>
+              </button>
+            );
+          })}
+        </nav>
+        <div className="sidebar-footer">
+          <div className="session-card">
             <UserRound size={16} />
             <span>{user.email}</span>
-          </div>
-          <button className="icon-button" title="退出登录" onClick={logout}>
-            <LogOut size={14} />
-          </button>
-        </div>
-        <button className="primary" onClick={createDemoApp}>
-          <Play size={16} /> 创建应用
-        </button>
-        <div className="app-list">
-          <div className="app-section-title">我的应用</div>
-          {apps.map((app) => (
-            <button
-              key={app.id}
-              className={selectedApp?.id === app.id ? "app-item active" : "app-item"}
-              onClick={() => selectApp(app)}
-            >
-              <strong>{app.name}</strong>
-              <span>{app.description || app.id}</span>
+            <button className="icon-button" title="退出登录" aria-label="退出登录" onClick={logout}>
+              <LogOut size={14} />
             </button>
-          ))}
+          </div>
         </div>
       </aside>
-
-      <section className="config">
-        <header>
-          <GitBranch size={18} />
-          <h2>{canEditSelectedApp ? "创建者配置" : "使用模式"}</h2>
-        </header>
-        {statusMessage ? <div className="notice">{statusMessage}</div> : null}
-        {canEditSelectedApp ? (
-          <>
-            {renderKnowledgeDatabasePanel()}
-            {renderCredentialPanel()}
-            {renderAppSettings()}
-            {renderExternalMcpServersPanel()}
-            {renderWorkflowListPanel()}
-            {renderWorkflowSettings()}
-            {renderWorkflowCanvas()}
-            {renderSelectedNodeSettings()}
-            <div className="actions-row">
-              <button className="secondary inline-button" disabled={Boolean(draftSpecError)} onClick={saveConfig}>
-                <Save size={16} /> 保存
-              </button>
-              <button
-                className="secondary inline-button"
-                disabled={!canEditSelectedWorkflow || Boolean(draftSpecError)}
-                onClick={publishSelectedWorkflow}
-              >
-                Publish Workflow
-              </button>
-            </div>
-          </>
-        ) : (
-          <section className="panel">
-            <div className="panel-title">
-              <MessageSquare size={16} /> 只读使用
-            </div>
-            <p className="empty">你可以对已发布应用提问，不能修改节点、知识库、工具或凭据。</p>
-          </section>
-        )}
-      </section>
-
-      <section className="chat">
-        <header>
-          <MessageSquare size={18} />
-          <h2>Chat</h2>
-        </header>
-        <div className="messages">
-          {messages.length === 0 ? (
-            <div className="empty">选择一个应用后开始提问。</div>
-          ) : (
-            messages.map((message, index) => (
-              <div key={`${message.role}-${index}`} className={`message ${message.role}`}>
-                {message.content}
+      <section className="workspace-main">
+        <header className="topbar">
+          <div className="topbar-title">
+            <span className="eyebrow">{NAV_ITEMS.find((item) => item.id === activeView)?.description}</span>
+            <h1>{NAV_ITEMS.find((item) => item.id === activeView)?.label}</h1>
+          </div>
+          <div className="topbar-context">
+            {activeView === "workspace" && selectedApp ? (
+              <div className="context-pill">
+                <Wrench size={14} />
+                <span>{selectedApp.name}</span>
               </div>
-            ))
-          )}
-        </div>
-        {selectedWorkflow && !selectedWorkflowPublished ? <div className="notice">Workflow is not published.</div> : null}
-        {selectedWorkflowHasUnpublishedChanges ? (
-          <div className="notice">Draft has unpublished changes. This chat uses the last published version.</div>
-        ) : null}
-        <div className="composer">
-          <input
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") sendMessage();
-            }}
-          />
-          <button className="primary" disabled={busy || !selectedWorkflowPublished} onClick={sendMessage}>
-            <Play size={16} /> 发送
-          </button>
-        </div>
-      </section>
-
-      <aside className="trace">
-        <header>
-          <History size={18} />
-          <h2>Logs</h2>
-        </header>
-        <section className="panel">
-          <div className="panel-title">当前 Trace</div>
-          <pre>{trace.length ? JSON.stringify(trace, null, 2) : "暂无 trace"}</pre>
-        </section>
-        {canEditSelectedApp ? (
-          <section className="panel">
-            <div className="panel-title">最近 Runs</div>
-            {runs.map((run) => (
-              <button className={selectedRunId === run.id ? "run active" : "run"} key={run.id} onClick={() => selectRun(run)}>
-                <strong>{run.status}</strong>
-                <span>{run.workflow_version_id.slice(0, 8)} · {run.latency_ms} ms</span>
-              </button>
-            ))}
-          </section>
-        ) : null}
-        {runSteps.length ? (
-          <section className="panel">
-            <div className="panel-title">Run Steps</div>
-            {runSteps.map((step) => (
-              <div className="run-step" key={step.id}>
-                <strong>{step.name || step.type}</strong>
-                <span>
-                  {step.type} · {step.latency_ms} ms{step.error ? ` · ${step.error}` : ""}
-                </span>
+            ) : null}
+            {activeView === "workspace" && selectedWorkflow ? (
+              <div className="context-pill">
+                <GitBranch size={14} />
+                <span>{selectedWorkflow.name}</span>
               </div>
-            ))}
-          </section>
-        ) : null}
-      </aside>
+            ) : null}
+            {activeView === "workspace" && selectedWorkflow ? renderStatusBadge(selectedWorkflow, true) : null}
+          </div>
+        </header>
+        {statusMessage ? <div className="toast-notice">{statusMessage}</div> : null}
+        <div className="workspace-content">{renderActiveView()}</div>
+      </section>
     </main>
   );
 }

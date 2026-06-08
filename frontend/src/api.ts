@@ -86,7 +86,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({
         name: "知识库问答应用",
-        description: "创建者维护知识库，使用者只能提问。",
+        description: "创建者维护知识库，使用者只能运行已发布 Workflow。",
         system_prompt: "你是一个专业、耐心、简洁的智能体。优先依据检索到的知识库上下文回答。",
         model_provider: "mock",
         model_name: "mock-react",
