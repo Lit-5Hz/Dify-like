@@ -9,4 +9,5 @@ dist/
 .vite/
 *.log
 *.egg-info/
+backend/*.egg-info/
 testsimple/
