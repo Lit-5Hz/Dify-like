@@ -144,6 +144,11 @@ class Workflow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     app: Mapped[App] = relationship(back_populates="workflows")
+    mcp_server: Mapped["WorkflowMcpServer | None"] = relationship(
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
     versions: Mapped[list["WorkflowVersion"]] = relationship(
         back_populates="workflow",
         cascade="all, delete-orphan",
@@ -168,6 +173,47 @@ class WorkflowVersion(Base):
     created_at: Mapped[datetime] = now_col()
 
     workflow: Mapped[Workflow] = relationship(back_populates="versions", foreign_keys=[workflow_id])
+
+
+class WorkflowMcpServer(Base):
+    __tablename__ = "workflow_mcp_servers"
+
+    id: Mapped[str] = uuid_pk()
+    workflow_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False),
+        ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    enabled: Mapped[bool] = mapped_column(default=True)
+    server_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    server_slug: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    auth_type: Mapped[str] = mapped_column(String(32), default="bearer")
+    encrypted_token: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    workflow: Mapped[Workflow] = relationship(back_populates="mcp_server")
+
+
+class ExternalMcpServer(Base):
+    __tablename__ = "external_mcp_servers"
+
+    id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    transport_type: Mapped[str] = mapped_column(String(32), default="streamable_http")
+    server_url: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_type: Mapped[str] = mapped_column(String(32), default="none")
+    encrypted_auth_secret: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_error: Mapped[str] = mapped_column(Text, default="")
+    tool_manifest_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class Conversation(Base):

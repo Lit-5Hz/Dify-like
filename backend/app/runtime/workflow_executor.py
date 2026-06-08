@@ -8,6 +8,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
+from app.services.agent_tool_spec import resolve_agent_enabled_builtin_tool_names
+from app.services.external_mcp_server_service import resolve_agent_mcp_tool_runtime_specs
 from app.services.model_credential_service import resolve_model_api_key
 from app.services.retrieval_defaults import (
     DEFAULT_BM25_B,
@@ -23,7 +25,6 @@ from app.services.retrieval_defaults import (
 )
 from app.services.retrieval_service import retrieve_chunks
 from app.services.run_log_service import add_step
-from app.services.agent_tool_spec import resolve_agent_enabled_builtin_tool_names
 
 
 @dataclass
@@ -168,6 +169,11 @@ class WorkflowExecutor:
                 raise ValueError(str(exc)) from exc
 
         enabled_tools = resolve_agent_enabled_builtin_tool_names(node)
+        enabled_mcp_tools = resolve_agent_mcp_tool_runtime_specs(
+            self.db,
+            getattr(self.app, "owner_user_id", ""),
+            node,
+        )
         invocation = AgentInvocation(
             app_name=self.app.name,
             query=context["query"],
@@ -179,6 +185,7 @@ class WorkflowExecutor:
             api_key=api_key,
             node_config=node,
             enabled_tools=enabled_tools,
+            enabled_mcp_tools=enabled_mcp_tools,
             retrieved_chunks=self.result.retrieved_chunks,
         )
 
@@ -186,12 +193,19 @@ class WorkflowExecutor:
         async for event in adapter.run(invocation):
             if event["type"] == "tool_call":
                 self.result.tool_calls.append(event)
+                step_input = dict(event.get("input", {}))
+                if event.get("server_id"):
+                    step_input["_mcp"] = {
+                        "server_id": event["server_id"],
+                        "server_name": event.get("server_name", ""),
+                        "registered_name": event.get("registered_name", ""),
+                    }
                 add_step(
                     self.db,
                     self.run_id,
                     "tool_call",
                     event["name"],
-                    event.get("input", {}),
+                    step_input,
                     event.get("output", {}),
                 )
             elif event["type"] == "final":
@@ -223,6 +237,14 @@ class WorkflowExecutor:
                 "model_credential_id": invocation.model_credential_id,
                 "model_base_url": model_config.get("base_url", ""),
                 "enabled_tools": enabled_tools,
+                "enabled_mcp_tools": [
+                    {
+                        "server_id": tool.get("server_id", ""),
+                        "server_name": tool.get("server_name", ""),
+                        "name": tool.get("name", ""),
+                    }
+                    for tool in enabled_mcp_tools
+                ],
             },
             {
                 "answer": final_answer,

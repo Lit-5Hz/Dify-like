@@ -128,6 +128,75 @@ class WorkflowVersionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class WorkflowMcpServerUpsert(BaseModel):
+    enabled: bool = True
+    server_name: str = Field(min_length=1, max_length=120)
+    server_slug: str = Field(min_length=1, max_length=160)
+    description: str = ""
+
+
+class WorkflowMcpServerOut(BaseModel):
+    id: str
+    workflow_id: str
+    enabled: bool
+    server_name: str
+    server_slug: str
+    description: str
+    auth_type: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class WorkflowMcpServerProvisionOut(WorkflowMcpServerOut):
+    token: str | None = None
+
+
+class ExternalMcpServerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    transport_type: str = "streamable_http"
+    server_url: str = Field(min_length=1)
+    auth_type: str = "none"
+    auth_secret: str = ""
+
+
+class ExternalMcpServerUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = None
+    transport_type: str | None = None
+    server_url: str | None = None
+    auth_type: str | None = None
+    auth_secret: str | None = None
+
+
+class ExternalMcpServerOut(BaseModel):
+    id: str
+    owner_user_id: str
+    name: str
+    description: str
+    transport_type: str
+    server_url: str
+    auth_type: str
+    has_auth_secret: bool
+    status: str
+    last_sync_at: datetime | None
+    last_sync_error: str
+    tool_manifest_json: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ExternalMcpToolOut(BaseModel):
+    server_id: str
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
 class UserCreate(BaseModel):
     email: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=128)

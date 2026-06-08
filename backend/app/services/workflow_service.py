@@ -7,19 +7,24 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.models import App, KnowledgeBase, Workflow, WorkflowVersion
+from app.services.agent_tool_spec import normalize_agent_tools, validate_workflow_agent_tools
 from app.schemas import WorkflowCreate, WorkflowUpdate
 from app.services.app_service import (
     _collect_workflow_credential_ids,
     _collect_workflow_knowledge_base_ids,
     normalize_workflow_spec,
 )
+from app.services.external_mcp_server_service import (
+    get_external_mcp_server,
+    get_external_mcp_tool,
+    list_external_mcp_tools,
+)
 from app.services.model_credential_service import get_model_credential
-from app.services.agent_tool_spec import validate_workflow_agent_tools
 
 
 def create_workflow(db: Session, app: App, payload: WorkflowCreate) -> Workflow:
     draft_spec = normalize_workflow_spec(payload.draft_spec)
-    _validate_workflow_spec(db, app.owner_user_id, app.model_credential_id, draft_spec)
+    _validate_workflow_spec(db, app, draft_spec)
     workflow = Workflow(
         app_id=app.id,
         name=payload.name.strip(),
@@ -68,7 +73,7 @@ def update_workflow(db: Session, workflow: Workflow, payload: WorkflowUpdate) ->
         workflow.description = str(values["description"]).strip()
     if "draft_spec" in values and values["draft_spec"] is not None:
         draft_spec = normalize_workflow_spec(values["draft_spec"])
-        _validate_workflow_spec(db, app.owner_user_id, app.model_credential_id, draft_spec)
+        _validate_workflow_spec(db, app, draft_spec)
         workflow.draft_spec = draft_spec
     db.commit()
     db.refresh(workflow)
@@ -80,7 +85,7 @@ def publish_workflow(db: Session, workflow: Workflow) -> WorkflowVersion:
     if not app:
         raise ValueError("App not found.")
     spec = normalize_workflow_spec(workflow.draft_spec)
-    _validate_workflow_spec(db, app.owner_user_id, app.model_credential_id, spec)
+    _validate_workflow_spec(db, app, spec)
     last_version = db.scalar(
         select(func.max(WorkflowVersion.version_number)).where(WorkflowVersion.workflow_id == workflow.id)
     )
@@ -132,11 +137,12 @@ def remove_knowledge_base_from_workflow_drafts(db: Session, owner_user_id: str, 
             workflow.draft_spec = next_spec
 
 
-def _validate_workflow_spec(db: Session, owner_user_id: str, app_model_credential_id: str | None, spec: dict[str, Any]) -> None:
+def _validate_workflow_spec(db: Session, app: App, spec: dict[str, Any]) -> None:
+    owner_user_id = app.owner_user_id
     validate_workflow_agent_tools(spec)
 
     credential_ids = _collect_workflow_credential_ids(spec)
-    app_credential_id = str(app_model_credential_id or "").strip()
+    app_credential_id = str(app.model_credential_id or "").strip()
     if app_credential_id:
         credential_ids.add(app_credential_id)
     for credential_id in credential_ids:
@@ -153,6 +159,25 @@ def _validate_workflow_spec(db: Session, owner_user_id: str, app_model_credentia
         )
         if not exists:
             raise ValueError(f"Knowledge database not found: {kb_id}")
+
+    for node in _agent_nodes(spec):
+        node_id = str(node.get("id") or "agent")
+        uses_mcp = False
+        for tool in normalize_agent_tools(node.get("tools", [])):
+            if tool["type"] != "mcp":
+                continue
+            uses_mcp = True
+            config = tool.get("config") if isinstance(tool.get("config"), dict) else {}
+            server_id = str(config.get("server_id") or "").strip()
+            server = get_external_mcp_server(db, server_id, owner_user_id)
+            if not server:
+                raise ValueError(f"External MCP server not found: {server_id}")
+            if not list_external_mcp_tools(server):
+                raise ValueError(f"External MCP server is not synced yet: {server.name}")
+            if not get_external_mcp_tool(server, tool["name"]):
+                raise ValueError(f"External MCP tool not found on server {server.name}: {tool['name']}")
+        if uses_mcp and not _agent_node_uses_agentscope(node, app):
+            raise ValueError(f"Agent node {node_id} uses MCP tools and must run with AgentScope.")
 
 
 def _remove_knowledge_base_id(workflow_spec: dict | None, kb_id: str) -> tuple[dict[str, Any], bool]:
@@ -182,3 +207,25 @@ def _remove_knowledge_base_id(workflow_spec: dict | None, kb_id: str) -> tuple[d
     if changed:
         spec["nodes"] = next_nodes
     return spec, changed
+
+
+def _agent_nodes(workflow_spec: dict[str, Any]) -> list[dict[str, Any]]:
+    nodes = normalize_workflow_spec(workflow_spec).get("nodes", [])
+    if not isinstance(nodes, list):
+        return []
+    return [
+        node
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("type") or "") in {"agent", "react_agent"}
+    ]
+
+
+def _agent_node_uses_agentscope(node: dict[str, Any], app: App) -> bool:
+    adapter_name = str(node.get("adapter") or "").strip().lower()
+    if adapter_name == "agentscope":
+        return True
+    if adapter_name == "mock":
+        return False
+    model = node.get("model") if isinstance(node.get("model"), dict) else {}
+    provider = str(model.get("provider") or app.model_provider or "").strip().lower()
+    return provider not in {"", "mock"}

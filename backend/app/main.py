@@ -1,7 +1,19 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import apps, auth, chat, knowledge_bases, model_credentials, retrieval, runs, tools, workflows
+from app.api.routes import (
+    apps,
+    auth,
+    chat,
+    external_mcp_servers,
+    knowledge_bases,
+    mcp_server,
+    model_credentials,
+    retrieval,
+    runs,
+    tools,
+    workflows,
+)
 from app.core.config import get_settings
 from app.db.session import init_db
 
@@ -27,6 +39,9 @@ app.include_router(knowledge_bases.router, prefix="/api")
 app.include_router(retrieval.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")
 app.include_router(workflows.router, prefix="/api")
+app.include_router(mcp_server.api_router, prefix="/api")
+app.include_router(external_mcp_servers.router, prefix="/api")
+app.include_router(mcp_server.public_router)
 
 
 @app.on_event("startup")

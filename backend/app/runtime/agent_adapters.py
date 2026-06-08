@@ -23,6 +23,7 @@ class AgentInvocation:
     api_key: str = ""
     node_config: dict[str, Any] = field(default_factory=dict)
     enabled_tools: list[str] = field(default_factory=list)
+    enabled_mcp_tools: list[dict[str, Any]] = field(default_factory=list)
     retrieved_chunks: list[dict[str, Any]] = field(default_factory=list)
     context_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -333,7 +334,11 @@ class AgentScopeAdapter(BaseAgentAdapter):
         # formatter 是 LLM 消息协议适配器，告诉 AgentScope 怎么把消息整理给这个品牌的 LLM 模型。
         model, formatter = self._build_model_and_formatter(invocation)
         # 创建 AgentScope 工具箱，并把当前 app 启用的平台工具注册进去。
-        toolkit = build_agentscope_toolkit(invocation.enabled_tools, trace_sink=trace_sink)
+        toolkit = build_agentscope_toolkit(
+            invocation.enabled_tools,
+            invocation.enabled_mcp_tools,
+            trace_sink=trace_sink,
+        )
         sys_prompt = self._build_system_prompt(invocation)
         return ReActAgent(
             name=invocation.app_name or "assistant",

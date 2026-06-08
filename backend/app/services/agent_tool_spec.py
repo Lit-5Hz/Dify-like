@@ -6,7 +6,7 @@ from typing import Any
 from app.tools.registry import list_tools
 
 
-SUPPORTED_AGENT_TOOL_TYPES = {"builtin"}
+SUPPORTED_AGENT_TOOL_TYPES = {"builtin", "mcp"}
 
 
 def normalize_agent_tools(value: Any) -> list[dict[str, Any]]:
@@ -24,8 +24,9 @@ def normalize_agent_tools(value: Any) -> list[dict[str, Any]]:
         enabled = bool(item.get("enabled", True))
         raw_config = item.get("config")
         config = deepcopy(raw_config) if isinstance(raw_config, dict) else {}
+        server_id = str(config.get("server_id") or "").strip()
 
-        key = (tool_type, name)
+        key = (tool_type, name, server_id)
         if key in seen:
             continue
         seen.add(key)
@@ -62,6 +63,13 @@ def validate_workflow_agent_tools(workflow_spec: dict[str, Any]) -> None:
                 raise ValueError(f"Unsupported agent tool type: {tool_type or 'empty'}")
             if tool_type == "builtin" and name not in known_builtin_tools:
                 raise ValueError(f"Unknown builtin tool: {name or 'empty'}")
+            if tool_type == "mcp":
+                config = tool.get("config")
+                if not isinstance(config, dict):
+                    raise ValueError(f"MCP tool config is required on agent node {node_id}.")
+                server_id = str(config.get("server_id") or "").strip()
+                if not server_id:
+                    raise ValueError(f"MCP tool {name or 'empty'} on agent node {node_id} requires config.server_id.")
 
 
 def resolve_agent_enabled_builtin_tool_names(agent_node: dict[str, Any]) -> list[str]:
@@ -69,6 +77,14 @@ def resolve_agent_enabled_builtin_tool_names(agent_node: dict[str, Any]) -> list
         tool["name"]
         for tool in normalize_agent_tools(agent_node.get("tools", []))
         if tool["type"] == "builtin" and bool(tool.get("enabled", True))
+    ]
+
+
+def resolve_agent_enabled_mcp_tools(agent_node: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        tool
+        for tool in normalize_agent_tools(agent_node.get("tools", []))
+        if tool["type"] == "mcp" and bool(tool.get("enabled", True))
     ]
 
 
