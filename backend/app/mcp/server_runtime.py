@@ -30,7 +30,7 @@ async def handle_workflow_mcp_request(
     db: Session,
     server_slug: str,
     authorization: str | None,
-    payload: Any,
+    payload: Any, # JSON-RPC request body sent by external MCP client
 ) -> tuple[int, dict[str, Any]]:
     request_id = payload.get("id") if isinstance(payload, dict) else None
     try:

@@ -12,7 +12,21 @@ from app.mcp.client import initialize_mcp_server, list_mcp_tools
 from app.schemas import ExternalMcpServerCreate, ExternalMcpServerUpdate
 from app.services.agent_tool_spec import normalize_agent_tools
 
+"""
+SUPPORTED_TRANSPORT_TYPES:
+    Transport_type describes the "communication mode".
+    Now the first edition only supports streamable_http. That is, sending JSON-RPC requests through HTTP POST.
+    If it is expanded in the future, there may be:
+        Stdio = standard input/output communication through local process.
+        Sse = receive streaming messages through Server-Sent Events.
+        Websocket = communicate through WebSocket.
 
+SUPPORTED_AUTH_TYPES:
+    Auth_type describes the "authentication method".
+    Now support:
+        None = external MCP Server is called without authentication header.
+        Bearer = call external MCP Server with Authorization header.
+"""
 SUPPORTED_TRANSPORT_TYPES = {"streamable_http"}
 SUPPORTED_AUTH_TYPES = {"none", "bearer"}
 

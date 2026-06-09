@@ -24,6 +24,10 @@ class JsonRpcError(Exception):
 
 
 def parse_jsonrpc_request(payload: Any) -> tuple[Any, str, dict[str, Any]]:
+    """
+    JSON-RPC: Function call protocol expressed by JSON
+    RPC = Remote Procedure Call
+    """
     if not isinstance(payload, dict):
         raise JsonRpcError(JSONRPC_INVALID_REQUEST, "Invalid JSON-RPC request body.")
     if payload.get("jsonrpc") != "2.0":
