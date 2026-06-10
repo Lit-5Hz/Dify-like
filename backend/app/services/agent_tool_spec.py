@@ -80,14 +80,6 @@ def resolve_agent_enabled_builtin_tool_names(agent_node: dict[str, Any]) -> list
     ]
 
 
-def resolve_agent_enabled_mcp_tools(agent_node: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        tool
-        for tool in normalize_agent_tools(agent_node.get("tools", []))
-        if tool["type"] == "mcp" and bool(tool.get("enabled", True))
-    ]
-
-
 def _agent_nodes(workflow_spec: dict[str, Any]) -> list[dict[str, Any]]:
     nodes = workflow_spec.get("nodes", [])
     if not isinstance(nodes, list):

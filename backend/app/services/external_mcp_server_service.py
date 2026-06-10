@@ -133,11 +133,18 @@ def delete_external_mcp_server(db: Session, server: ExternalMcpServer) -> None:
     db.commit()
 
 
-def sync_external_mcp_server(db: Session, server: ExternalMcpServer) -> ExternalMcpServer:
+async def refresh_external_mcp_server_tool_manifest(db: Session, server: ExternalMcpServer) -> ExternalMcpServer:
+    """
+        → Adjust the remote initialization
+        → Adjust remote tools/list.
+        → Save the tool list returned from the remote end to tool_manifest_json.
+        → Update status/last_sync_at/last_sync_error.
+        → Return to the updated ExternalMcpServer.
+    """
     try:
         auth_secret = resolve_external_mcp_auth_secret(server)
-        initialize_mcp_server(server.server_url, server.auth_type, auth_secret)
-        tools = list_mcp_tools(server.server_url, server.auth_type, auth_secret)
+        await initialize_mcp_server(server.server_url, server.auth_type, auth_secret)
+        tools = await list_mcp_tools(server.server_url, server.auth_type, auth_secret)
         server.tool_manifest_json = {"tools": tools}
         server.status = "active"
         server.last_sync_error = ""

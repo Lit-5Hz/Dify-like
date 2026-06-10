@@ -19,7 +19,7 @@ from app.services.external_mcp_server_service import (
     get_external_mcp_server,
     list_external_mcp_servers,
     list_external_mcp_tools,
-    sync_external_mcp_server,
+    refresh_external_mcp_server_tool_manifest,
     update_external_mcp_server,
 )
 
@@ -88,16 +88,20 @@ def delete(
 
 
 @router.post("/{server_id}/sync", response_model=ExternalMcpServerOut)
-def sync(
+async def sync_tools( # Synchronize/refresh the tool list asynchronously
     server_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """
+    Find a registered ExternalMcpServer according to server_id, 
+    and then visit the remote MCP Server in refresh_external_mcp_server_tool_manifest.
+    """
     server = get_external_mcp_server(db, server_id, current_user.id)
     if not server:
         raise HTTPException(status_code=404, detail="External MCP server not found")
     try:
-        server = sync_external_mcp_server(db, server)
+        server = await refresh_external_mcp_server_tool_manifest(db, server)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return external_mcp_server_to_out(server)

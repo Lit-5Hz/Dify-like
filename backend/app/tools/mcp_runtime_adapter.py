@@ -26,13 +26,18 @@ def register_mcp_tools(
         used_names.add(registered_name)
 
         def _build_tool(_spec=spec):
-            def _tool(**kwargs):
+            """
+            What AgentScope needs is a callable function.
+            However, the remote MCP tool is not a local function, it is just an HTTP JSON-RPC tool.
+            So a function is dynamically created here.
+            """
+            async def _tool(**kwargs):
                 from agentscope.message import TextBlock
                 from agentscope.tool import ToolResponse
 
                 started = perf_counter()
                 try:
-                    output = call_mcp_tool(
+                    output = await call_mcp_tool( # Actually call the remote MCP tool
                         str(_spec.get("server_url") or ""),
                         str(_spec.get("auth_type") or "none"),
                         str(_spec.get("name") or ""),
@@ -41,7 +46,7 @@ def register_mcp_tools(
                     )
                 except Exception as exc:
                     output = {"error": str(exc)}
-                event = {
+                event = { # Record trace
                     "type": "tool_call",
                     "name": str(_spec.get("name") or registered_name),
                     "registered_name": registered_name,
@@ -54,6 +59,7 @@ def register_mcp_tools(
                 }
                 if trace_sink:
                     trace_sink(event)
+                # AgentScope doesn't directly recognize Python dict, so it should be packaged as the ToolResponse it knows.
                 return ToolResponse(content=[TextBlock(type="text", text=_serialize_tool_output(output))])
 
             _tool.__name__ = registered_name
