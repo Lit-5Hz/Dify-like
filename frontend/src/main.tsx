@@ -292,6 +292,20 @@ function getWorkflowMcpEndpoint(serverSlug: string) {
   return `${window.location.protocol}//${window.location.hostname}:8000/mcp/${serverSlug}`;
 }
 
+function getMcpSlugFromServerUrl(serverUrl: string) {
+  const value = serverUrl.trim();
+  if (!value) return "";
+  try {
+    const pathname = new URL(value).pathname.replace(/\/+$/, "");
+    const match = pathname.match(/\/mcp\/([^/]+)$/);
+    return match ? decodeURIComponent(match[1]).trim().toLowerCase() : "";
+  } catch {
+    const pathname = value.split("?")[0].split("#")[0].replace(/\/+$/, "");
+    const match = pathname.match(/\/mcp\/([^/]+)$/);
+    return match ? decodeURIComponent(match[1]).trim().toLowerCase() : "";
+  }
+}
+
 function buildDefaultWorkflowMcpServerDraft(workflow: WorkflowItem, existing: WorkflowMcpServerItem | null): WorkflowMcpServerDraft {
   if (existing) {
     return {
@@ -426,6 +440,7 @@ function App() {
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowItem | null>(null);
   const [workflowVersions, setWorkflowVersions] = useState<WorkflowVersionItem[]>([]);
   const [workflowMcpServer, setWorkflowMcpServer] = useState<WorkflowMcpServerItem | null>(null);
+  const [workflowMcpServersByWorkflowId, setWorkflowMcpServersByWorkflowId] = useState<Record<string, WorkflowMcpServerItem>>({});
   const [workflowMcpDraft, setWorkflowMcpDraft] = useState<WorkflowMcpServerDraft | null>(null);
   const [workflowMcpToken, setWorkflowMcpToken] = useState("");
   const [draftSpecText, setDraftSpecText] = useState("");
@@ -439,6 +454,7 @@ function App() {
   const [tools, setTools] = useState<ToolItem[]>([]);
   const [externalMcpServers, setExternalMcpServers] = useState<ExternalMcpServerItem[]>([]);
   const [selectedExternalMcpServerId, setSelectedExternalMcpServerId] = useState("");
+  const [syncingExternalMcpServerId, setSyncingExternalMcpServerId] = useState("");
   const [externalMcpDraft, setExternalMcpDraft] = useState<ExternalMcpServerDraft>(emptyExternalMcpServerDraft);
   const [runs, setRuns] = useState<RunItem[]>([]);
   const [runSteps, setRunSteps] = useState<RunStepItem[]>([]);
@@ -465,7 +481,25 @@ function App() {
       stableStringify(selectedWorkflow.draft_spec ?? {}) !== stableStringify(selectedPublishedVersion.spec_json ?? {}),
   );
   const selectedKnowledgeBase = knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId) ?? null;
-  const selectedExternalMcpServer = externalMcpServers.find((item) => item.id === selectedExternalMcpServerId) ?? null;
+  const currentAppWorkflowMcpSlugs = useMemo(() => {
+    const slugs = new Set<string>();
+    workflows.forEach((workflow) => {
+      const server = workflowMcpServersByWorkflowId[workflow.id];
+      if (server?.server_slug) {
+        slugs.add(server.server_slug.trim().toLowerCase());
+      }
+    });
+    if (workflowMcpServer?.server_slug) {
+      slugs.add(workflowMcpServer.server_slug.trim().toLowerCase());
+    }
+    return slugs;
+  }, [workflowMcpServer?.server_slug, workflowMcpServersByWorkflowId, workflows]);
+  const visibleExternalMcpServers = useMemo(
+    () => externalMcpServers.filter((server) => !currentAppWorkflowMcpSlugs.has(getMcpSlugFromServerUrl(server.server_url))),
+    [currentAppWorkflowMcpSlugs, externalMcpServers],
+  );
+  const hiddenSelfExternalMcpServerCount = externalMcpServers.length - visibleExternalMcpServers.length;
+  const selectedExternalMcpServer = visibleExternalMcpServers.find((item) => item.id === selectedExternalMcpServerId) ?? null;
   const canEditSelectedApp = Boolean(selectedOwnedApp);
   const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
   const workflowNodes = useMemo(() => (selectedWorkflow ? getWorkflowNodes(selectedWorkflow) : []), [selectedWorkflow]);
@@ -502,6 +536,7 @@ function App() {
     setSelectedWorkflow(null);
     setWorkflowVersions([]);
     setWorkflowMcpServer(null);
+    setWorkflowMcpServersByWorkflowId({});
     setWorkflowMcpDraft(null);
     setWorkflowMcpToken("");
     setDraftSpecText("");
@@ -513,6 +548,7 @@ function App() {
     setTools([]);
     setExternalMcpServers([]);
     setSelectedExternalMcpServerId("");
+    setSyncingExternalMcpServerId("");
     setExternalMcpDraft(emptyExternalMcpServerDraft());
     setRuns([]);
     setRunSteps([]);
@@ -538,7 +574,7 @@ function App() {
     }
   }
 
-  async function selectWorkflow(workflow: WorkflowItem | null) {
+  async function selectWorkflow(workflow: WorkflowItem | null, preloadedMcpServer?: WorkflowMcpServerItem | null) {
     setSelectedWorkflow(workflow);
     setWorkflowVersions([]);
     setWorkflowMcpServer(null);
@@ -558,10 +594,13 @@ function App() {
     const [versionList, runList, mcpServer] = await Promise.all([
       api.listWorkflowVersions(workflow.id),
       api.listWorkflowRuns(workflow.id),
-      api.getWorkflowMcpServer(workflow.id).catch(() => null),
+      preloadedMcpServer !== undefined ? Promise.resolve(preloadedMcpServer) : api.getWorkflowMcpServer(workflow.id).catch(() => null),
     ]);
     setWorkflowVersions(versionList);
     setWorkflowMcpServer(mcpServer);
+    if (mcpServer) {
+      setWorkflowMcpServersByWorkflowId((current) => ({ ...current, [workflow.id]: mcpServer }));
+    }
     setWorkflowMcpDraft(buildDefaultWorkflowMcpServerDraft(workflow, mcpServer));
     setRuns(runList);
 
@@ -589,6 +628,10 @@ function App() {
     setWorkflows([]);
     setSelectedWorkflow(null);
     setWorkflowVersions([]);
+    setWorkflowMcpServer(null);
+    setWorkflowMcpServersByWorkflowId({});
+    setWorkflowMcpDraft(null);
+    setWorkflowMcpToken("");
     setMessages([]);
     setTrace([]);
     setActiveConversationId(null);
@@ -603,13 +646,20 @@ function App() {
 
     const workflowList = await api.listWorkflows(app.id);
     setWorkflows(workflowList);
+    const mcpServerEntries = await Promise.all(
+      workflowList.map(async (workflow) => [workflow.id, await api.getWorkflowMcpServer(workflow.id).catch(() => null)] as const),
+    );
+    const nextWorkflowMcpServersByWorkflowId = Object.fromEntries(
+      mcpServerEntries.flatMap(([workflowId, server]) => (server ? [[workflowId, server]] : [])),
+    ) as Record<string, WorkflowMcpServerItem>;
+    setWorkflowMcpServersByWorkflowId(nextWorkflowMcpServersByWorkflowId);
     const currentWorkflowId = selectedWorkflow?.app_id === app.id ? selectedWorkflow.id : null;
     const workflow =
       workflowList.find((item) => item.id === preferredWorkflowId) ??
       workflowList.find((item) => item.id === currentWorkflowId) ??
       workflowList[0] ??
       null;
-    await selectWorkflow(workflow);
+    await selectWorkflow(workflow, workflow ? nextWorkflowMcpServersByWorkflowId[workflow.id] ?? null : undefined);
   }
 
   async function openApp(app: AppItem) {
@@ -723,9 +773,9 @@ function App() {
 
   useEffect(() => {
     if (selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID) return;
-    if (selectedExternalMcpServerId && externalMcpServers.some((server) => server.id === selectedExternalMcpServerId)) return;
-    setSelectedExternalMcpServerId(externalMcpServers[0]?.id ?? "");
-  }, [selectedExternalMcpServerId, externalMcpServers]);
+    if (selectedExternalMcpServerId && visibleExternalMcpServers.some((server) => server.id === selectedExternalMcpServerId)) return;
+    setSelectedExternalMcpServerId(visibleExternalMcpServers[0]?.id ?? "");
+  }, [selectedExternalMcpServerId, visibleExternalMcpServers]);
 
   useEffect(() => {
     if (!canEditSelectedApp || !selectedKnowledgeBaseId) {
@@ -901,6 +951,7 @@ function App() {
       updated_at: saved.updated_at,
     };
     setWorkflowMcpServer(normalized);
+    setWorkflowMcpServersByWorkflowId((current) => ({ ...current, [saved.workflow_id]: normalized }));
     setWorkflowMcpDraft(buildDefaultWorkflowMcpServerDraft(selectedWorkflow as WorkflowItem, normalized));
     setWorkflowMcpToken(saved.token ?? "");
   }
@@ -1094,6 +1145,11 @@ function App() {
     }
   }
 
+  function isExternalMcpUrlOwnedByCurrentApp(serverUrl: string) {
+    const slug = getMcpSlugFromServerUrl(serverUrl);
+    return Boolean(slug && currentAppWorkflowMcpSlugs.has(slug));
+  }
+
   async function saveExternalMcpServer() {
     const payload = {
       name: externalMcpDraft.name.trim(),
@@ -1105,6 +1161,10 @@ function App() {
     };
     if (!payload.name || !payload.server_url) {
       setNotice("外部 MCP Server 名称和 URL 都不能为空。");
+      return;
+    }
+    if (isExternalMcpUrlOwnedByCurrentApp(payload.server_url)) {
+      setNotice("这个 URL 指向当前 App 自己暴露的 MCP Server。请在上方 MCP Server 区域管理发布配置，不要作为外部连接注册。");
       return;
     }
     if (payload.auth_type === "bearer" && !payload.auth_secret && !selectedExternalMcpServer?.has_auth_secret) {
@@ -1126,14 +1186,26 @@ function App() {
 
   async function syncSelectedExternalMcpServer() {
     if (!selectedExternalMcpServer) return;
+    const serverId = selectedExternalMcpServer.id;
+    setSyncingExternalMcpServerId(serverId);
+    setNotice(`正在同步外部 MCP Server「${selectedExternalMcpServer.name}」的 tools...`);
     try {
-      const saved = await api.syncExternalMcpServer(selectedExternalMcpServer.id);
+      const saved = await api.syncExternalMcpServer(serverId);
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list.map((item) => (item.id === saved.id ? saved : item)));
       setSelectedExternalMcpServerId(saved.id);
-      setNotice("外部 MCP tools 已同步。");
+      setNotice(`外部 MCP tools 已同步：${getExternalServerTools(saved).length} 个 tools。`);
     } catch (error) {
+      try {
+        const latest = await api.getExternalMcpServer(serverId);
+        setExternalMcpServers((items) => items.map((item) => (item.id === latest.id ? latest : item)));
+        setSelectedExternalMcpServerId(latest.id);
+      } catch (refreshError) {
+        console.warn(refreshError);
+      }
       setNotice(`同步外部 MCP tools 失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSyncingExternalMcpServerId("");
     }
   }
 
@@ -1143,7 +1215,7 @@ function App() {
       await api.deleteExternalMcpServer(selectedExternalMcpServer.id);
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list);
-      setSelectedExternalMcpServerId(list[0]?.id ?? "");
+      setSelectedExternalMcpServerId(list.find((server) => !isExternalMcpUrlOwnedByCurrentApp(server.server_url))?.id ?? "");
       setNotice("外部 MCP Server 已删除。");
     } catch (error) {
       setNotice(`删除外部 MCP Server 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -1812,8 +1884,8 @@ function App() {
           <p className="muted-copy">平台暂未返回内置工具 catalog。</p>
         )}
         <div className="field-section-title">外部 MCP 工具</div>
-        {externalMcpServers.length === 0 ? <p className="muted-copy">先到 MCP 页面注册并同步外部 Server。</p> : null}
-        {externalMcpServers.map((server) => {
+        {visibleExternalMcpServers.length === 0 ? <p className="muted-copy">先到 MCP 页面注册并同步外部 Server。</p> : null}
+        {visibleExternalMcpServers.map((server) => {
           const serverTools = getExternalServerTools(server);
           return (
             <div className="tool-server-group" key={server.id}>
@@ -2310,6 +2382,9 @@ function App() {
   function renderExternalMcpPanel() {
     const selectedServerTools = getExternalServerTools(selectedExternalMcpServer);
     const creatingNewServer = selectedExternalMcpServerId === NEW_EXTERNAL_MCP_SERVER_ID;
+    const syncingSelectedExternalMcpServer = Boolean(
+      selectedExternalMcpServer && syncingExternalMcpServerId === selectedExternalMcpServer.id,
+    );
     return (
       <section className="work-panel">
         <div className="panel-heading">
@@ -2321,9 +2396,14 @@ function App() {
             <Plus size={15} /> 新建连接
           </button>
         </div>
+        {hiddenSelfExternalMcpServerCount > 0 ? (
+          <div className="inline-alert">
+            已隐藏 {hiddenSelfExternalMcpServerCount} 个指向当前 App 自己发布 endpoint 的连接。发布方请在上方 MCP Server 区域修改，不作为外部 MCP Server 管理。
+          </div>
+        ) : null}
         <div className="mcp-split">
           <div className="stack-list">
-            {externalMcpServers.map((server) => {
+            {visibleExternalMcpServers.map((server) => {
               const serverTools = getExternalServerTools(server);
               return (
                 <button
@@ -2348,7 +2428,7 @@ function App() {
                 <span className="badge muted">草稿</span>
               </div>
             ) : null}
-            {!externalMcpServers.length && !creatingNewServer ? <p className="muted-copy">还没有外部 MCP Server。</p> : null}
+            {!visibleExternalMcpServers.length && !creatingNewServer ? <p className="muted-copy">还没有可用于当前 App 的外部 MCP Server。</p> : null}
           </div>
           <div className="form-grid">
             <label>
@@ -2419,8 +2499,13 @@ function App() {
               <button className="secondary-button" onClick={saveExternalMcpServer}>
                 <Save size={15} /> {selectedExternalMcpServer ? "保存 Server" : "创建 Server"}
               </button>
-              <button className="secondary-button" disabled={!selectedExternalMcpServer} onClick={syncSelectedExternalMcpServer}>
-                <RefreshCw size={15} /> 同步 tools
+              <button
+                className="secondary-button"
+                disabled={!selectedExternalMcpServer || syncingSelectedExternalMcpServer}
+                onClick={syncSelectedExternalMcpServer}
+              >
+                {syncingSelectedExternalMcpServer ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                {syncingSelectedExternalMcpServer ? "同步中..." : "同步 tools"}
               </button>
               <button className="ghost-danger-button" disabled={!selectedExternalMcpServer} onClick={deleteSelectedExternalMcpServer}>
                 <Trash2 size={15} /> 删除
