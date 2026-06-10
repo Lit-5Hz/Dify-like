@@ -81,29 +81,21 @@ docker compose down -v
 
 ## 6. 后端启动方式
 
-进入后端目录：
+进入后端目录、激活虚拟环境、安装依赖、启动后端：
 
 ```powershell
 cd F:\my_folder\Work\LLM\Project\Dify-like\backend
-```
-
-激活虚拟环境：
-
-```powershell
 conda activate dify
-```
-
-安装依赖：
-
-```powershell
 python -m pip install -e .
-```
-
-启动后端：
-
-```powershell
 python -m uvicorn app.main:app --reload --port 8000
 ```
+
+```powershell
+cd F:\my_folder\Work\LLM\Project\Dify-like\backend
+conda activate dify
+python -m uvicorn app.main:app --reload --port 8000
+```
+
 
 启动 Celery worker：
 
@@ -127,21 +119,16 @@ http://localhost:8000/docs
 
 ## 7. 前端启动方式
 
-进入前端目录：
+进入前端目录、安装依赖、启动前端：
 
 ```powershell
 cd F:\my_folder\Work\LLM\Project\Dify-like\frontend
-```
-
-安装依赖：
-
-```powershell
 npm install
+npm run dev
 ```
 
-启动前端：
-
 ```powershell
+cd F:\my_folder\Work\LLM\Project\Dify-like\frontend
 npm run dev
 ```
 
