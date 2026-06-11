@@ -1499,3 +1499,379 @@ top_k: 10
 - 本轮没有加入 metadata、query enhancement、parent-child 等变量。
 
 因此，本实验最适合支撑“模块是否有必要”的相对结论，而不是声称系统在 C-MTEB 上达到了某个通用绝对水平。
+
+
+## MCP
+
+### 1. 同端口下AppA调用AppB的MCP服务超时的问题
+
+可以。整条线可以分成 5 层看。
+
+**1. 最初的问题**
+
+你最开始以为问题可能是：
+
+```text
+MCP 服务绑定在后端 8000 端口上
+App A 调 App B 的 MCP
+会不会发生端口占用
+```
+
+后来澄清后，真正问题不是端口占用，而是：
+
+```text
+同一个后端进程正在处理 App A 请求
+App A 内部又用同步 HTTP 请求同一个后端的 /mcp/{slug}
+当前执行资源被同步等待占住
+被调用的 /mcp/{slug} 又需要同一个后端处理
+于是可能自己等自己
+```
+
+也就是这条链路：
+
+```text
+前端
+-> 8000: /api/workflows/A/chat
+-> Workflow A 运行
+-> Agent 调 MCP tool run_workflow
+-> httpx.Client 同步请求 http://localhost:8000/mcp/after-sales
+-> 8000 需要处理 Workflow B
+```
+
+危险点在旧代码里的同步 HTTP：
+
+```python
+with httpx.Client(...) as client:
+    response = client.post(...)
+```
+
+这会原地等待响应。
+
+**2. 为什么要修改**
+
+修改目标不是“让 MCP 绑定到别的端口”，而是：
+
+```text
+保持 MCP 协议路径
+仍然用 HTTP JSON-RPC 调 /mcp/{slug}
+但等待 HTTP 响应时不要把后端执行能力占死
+```
+
+你明确选择了方案 A：
+
+```text
+异步 HTTP 调用
+不做内部 direct runtime 分流
+最大程度贴近 MCP 协议
+```
+
+也就是说，App A 调 App B 仍然像真实 MCP client 调 MCP server 一样走：
+
+```text
+initialize
+tools/list
+tools/call
+```
+
+而不是在 Python 进程内直接调用 Workflow B。
+
+**3. 为什么异步能解决核心问题**
+
+同步是：
+
+```text
+我发请求
+我原地等
+等到返回前我不让出执行权
+```
+
+异步是：
+
+```text
+我发请求
+我需要结果
+但等待期间我把执行权还给 event loop
+结果回来后再从 await 后面继续
+```
+
+所以现在链路变成：
+
+```text
+8000 处理 App A
+App A await 请求 8000/mcp/after-sales
+App A 当前协程暂停
+8000 的 event loop 空出来
+8000 可以接住 /mcp/after-sales
+处理 App B
+App B 返回
+App A 被唤醒继续执行
+```
+
+关键不是“异步让代码乱序执行”。逻辑顺序仍然是顺序的：
+
+```python
+await initialize_mcp_server()
+tools = await list_mcp_tools()
+```
+
+保证先 `initialize`，再 `tools/list`。
+
+区别是：每次 `await` 等网络响应时，后端可以先处理别的请求。
+
+**4. 实际做了哪些代码改动**
+
+主要改了后端 MCP Client 调用链路。
+
+`backend/app/mcp/client.py`：
+
+```text
+initialize_mcp_server()
+list_mcp_tools()
+call_mcp_tool()
+```
+
+全部从普通函数改成：
+
+```python
+async def ...
+```
+
+内部从：
+
+```python
+httpx.Client
+```
+
+改成：
+
+```python
+httpx.AsyncClient
+```
+
+**5. 过程中额外讲过的关键知识点**
+
+你主要补齐了这些概念：
+
+```text
+MCP Server 不等于新端口
+```
+
+你的后端可以在同一个 8000 上暴露多个 MCP server：
+
+```text
+http://localhost:8000/mcp/app-b
+http://localhost:8000/mcp/after-sales
+```
+
+它们靠 URL 路径区分，不靠端口区分。
+
+```text
+同步 HTTP 自调用的问题不是端口占用，而是执行资源被等待占住
+```
+
+开第二个后端 8001 能解决，是因为：
+
+```text
+8000 负责调用方
+8001 负责被调用方
+```
+
+它们是两个独立进程，所以 8000 等待时，8001 还能处理请求。
+
+```text
+async / await 的作用是等待时让出执行权
+```
+
+`await` 不是不等结果，也不是跳过逻辑。它是：
+
+```text
+我等这个结果
+但等待期间允许 event loop 处理别的任务
+```
+
+```text
+异步有传染性
+```
+
+里面用了 `await`，外层通常也要变成：
+
+```python
+async def
+```
+
+所以 MCP client 改成 async 后，调用它的 service、route、tool wrapper 也要跟着改。
+
+```text
+异步不是高并发的完整答案
+```
+
+它解决的是：
+
+```text
+等待网络时不要阻塞 event loop
+```
+
+但不能自动解决：
+
+```text
+DB 连接池打满
+LLM API 限流
+递归 workflow 调用
+单次请求放大成多次 workflow run
+连接池复用
+超时控制
+并发限制
+```
+
+所以后续生产化还需要考虑：
+
+```text
+MCP 调用超时
+MCP 并发限制
+最大调用深度
+DB session 持有时间
+共享 AsyncClient 连接池
+更好的错误可观测性
+```
+
+**最终结论**
+
+这次修改解决的是最核心的结构性问题：
+
+```text
+旧逻辑：同步 HTTP 自调用，容易自己等自己。
+新逻辑：异步 HTTP 自调用，等待时释放 event loop，后端可以处理被调用的 /mcp/{slug}。
+```
+
+但它不是把系统变成完整高并发架构。它只是把 MCP Client 这条最危险的同步阻塞链路改掉了。后续如果继续强化，优先级应该是：超时、并发限制、调用深度限制、DB session 生命周期、共享 AsyncClient。
+
+### 2. OAuth
+
+**正确流程**
+
+1. 你在前端点 `Connect OAuth`。
+2. 你的后端生成一个随机原始码：
+
+```text
+code_verifier
+```
+
+然后用 SHA256 + base64url 生成：
+
+```text
+code_challenge
+```
+
+可以理解为：
+
+```text
+code_challenge = 单向转换(code_verifier)
+```
+
+3. 后端把浏览器重定向到第三方的 `Authorization URL`，并带上：
+
+```text
+client_id
+redirect_uri
+scope
+resource
+state
+code_challenge
+code_challenge_method=S256
+```
+
+注意：这是浏览器跳转，不是后端直接请求 MCP 工具。
+
+4. 第三方在这个页面上让用户登录、确认授权。
+
+真实服务里这里通常会出现登录页、授权页。我们本地 mock 为了测试方便，直接自动同意并跳回来了。
+
+5. 用户同意后，第三方把浏览器重定向回你的后端 callback：
+
+```text
+http://localhost:8000/api/mcp/oauth/callback?code=xxx&state=xxx
+```
+
+这里返回的是：
+
+```text
+Authorization Code
+```
+
+6. 你的后端拿到 `Authorization Code` 后，调用第三方的 `Token URL`，并带上：
+
+```text
+code
+code_verifier
+client_id
+client_secret
+redirect_uri
+resource
+```
+
+7. 第三方用你这次传来的 `code_verifier` 再算一次 `code_challenge`，和第 3 步保存的 `code_challenge` 对比。
+
+匹配成功，说明这个 code 的兑换者确实是最初发起授权流程的人。
+
+8. 第三方返回 token：
+
+```text
+access_token
+refresh_token
+expires_in
+```
+
+9. 之后你的平台调用外部 MCP Server 时，实际带的是：
+
+```http
+Authorization: Bearer <access_token>
+```
+
+也就是说 OAuth 最终仍然变成 Bearer token 调用，只是这个 token 不是用户手填的，而是 OAuth 流程拿到和刷新的。
+
+---
+
+
+几个字段的含义：
+
+`Client ID`
+你的应用在第三方平台上的公开身份。可以理解为“这个 OAuth 应用是谁”。
+
+`Client Secret`
+你的应用在第三方平台上的密钥。只应该放在后端，不能暴露给浏览器。你的项目里会加密保存。
+
+`Authorization URL`
+让用户登录并授权的入口地址。浏览器会跳到这里。
+
+`Token URL`
+你的后端用 `Authorization Code` 换 `access_token` 的地址。之后刷新 token 也调用它。
+
+`Scopes`
+权限范围。比如：
+
+```text
+read tools
+```
+
+意思是“允许读取工具、调用工具”之类。不同平台定义不同。
+
+`Resource`
+目标资源，也叫 token audience。表示这个 token 是发给哪个服务用的。
+
+在你的 MCP 场景里，通常可以填外部 MCP Server 地址，例如：
+
+```text
+http://localhost:8002/mcp
+```
+
+有些服务要求填，有些服务不需要。我们支持它，是为了兼容更严格的 OAuth 服务。
+
+`state`
+防 CSRF，也用于让你的后端知道这次 callback 属于哪个 `ExternalMcpServer`。用户不需要手动理解或填写。
+
+`code_verifier / code_challenge`
+PKCE 的核心。它防止别人截获 Authorization Code 后直接拿去换 token。第三方只有同时拿到 code 和正确的 code_verifier，才会发 token。
+
+一句话总结：
+
+OAuth2 + PKCE 的本质是：用户在第三方授权，你的后端用一次性的 Authorization Code 加上之前保存的 code_verifier 去换 access_token，之后你的平台用这个 access_token 调外部 MCP Server。
