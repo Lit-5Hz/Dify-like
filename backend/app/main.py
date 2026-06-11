@@ -41,6 +41,7 @@ app.include_router(runs.router, prefix="/api")
 app.include_router(workflows.router, prefix="/api")
 app.include_router(mcp_server.api_router, prefix="/api")
 app.include_router(external_mcp_servers.router, prefix="/api")
+app.include_router(external_mcp_servers.oauth_router, prefix="/api")
 app.include_router(mcp_server.public_router)
 
 

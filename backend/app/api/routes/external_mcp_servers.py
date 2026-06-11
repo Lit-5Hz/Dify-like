@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
+from app.core.config import get_settings
 from app.db.models import User
 from app.db.session import get_db
 from app.schemas import (
     ExternalMcpServerCreate,
+    ExternalMcpOAuthConnectOut,
     ExternalMcpServerOut,
     ExternalMcpServerUpdate,
     ExternalMcpToolOut,
+)
+from app.services.external_mcp_oauth_service import (
+    complete_external_mcp_oauth_callback,
+    disconnect_external_mcp_oauth,
+    external_mcp_oauth_callback_error_url,
+    external_mcp_oauth_callback_success_url,
+    start_external_mcp_oauth_flow,
 )
 from app.services.external_mcp_server_service import (
     create_external_mcp_server,
@@ -25,6 +35,7 @@ from app.services.external_mcp_server_service import (
 
 
 router = APIRouter(prefix="/mcp/servers", tags=["external-mcp-servers"])
+oauth_router = APIRouter(prefix="/mcp/oauth", tags=["external-mcp-oauth"])
 
 
 @router.post("", response_model=ExternalMcpServerOut)
@@ -87,6 +98,35 @@ def delete(
     return {"ok": True, "removed_workflow_draft_tool_references": removed_references}
 
 
+@router.post("/{server_id}/oauth/connect", response_model=ExternalMcpOAuthConnectOut)
+def connect_oauth(
+    server_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    server = get_external_mcp_server(db, server_id, current_user.id)
+    if not server:
+        raise HTTPException(status_code=404, detail="External MCP server not found")
+    try:
+        authorization_url = start_external_mcp_oauth_flow(db, server)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"authorization_url": authorization_url}
+
+
+@router.post("/{server_id}/oauth/disconnect", response_model=ExternalMcpServerOut)
+def disconnect_oauth(
+    server_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    server = get_external_mcp_server(db, server_id, current_user.id)
+    if not server:
+        raise HTTPException(status_code=404, detail="External MCP server not found")
+    server = disconnect_external_mcp_oauth(db, server)
+    return external_mcp_server_to_out(server)
+
+
 @router.post("/{server_id}/sync", response_model=ExternalMcpServerOut)
 async def sync_tools( # Synchronize/refresh the tool list asynchronously
     server_id: str,
@@ -125,3 +165,22 @@ def tools(
         }
         for tool in list_external_mcp_tools(server)
     ]
+
+
+@oauth_router.get("/callback")
+async def oauth_callback(
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+    error_description: str = Query(default=""),
+    db: Session = Depends(get_db),
+):
+    settings = get_settings()
+    if error:
+        message = error_description or error
+        return RedirectResponse(external_mcp_oauth_callback_error_url(message, settings))
+    try:
+        server = await complete_external_mcp_oauth_callback(db, state, code, settings)
+    except ValueError as exc:
+        return RedirectResponse(external_mcp_oauth_callback_error_url(str(exc), settings))
+    return RedirectResponse(external_mcp_oauth_callback_success_url(server, settings))

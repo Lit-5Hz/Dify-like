@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     storage_dir: Path = Path("./storage")
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    public_api_base_url: str = "http://localhost:8000"
+    frontend_base_url: str = "http://localhost:5173"
 
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 

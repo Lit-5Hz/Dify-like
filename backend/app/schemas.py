@@ -161,6 +161,12 @@ class ExternalMcpServerCreate(BaseModel):
     auth_type: str = "none"
     auth_secret: str = ""
     custom_headers: dict[str, str] | None = None
+    oauth_authorization_url: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_scopes: str = ""
+    oauth_resource: str | None = None
 
 
 class ExternalMcpServerUpdate(BaseModel):
@@ -171,6 +177,12 @@ class ExternalMcpServerUpdate(BaseModel):
     auth_type: str | None = None
     auth_secret: str | None = None
     custom_headers: dict[str, str] | None = None
+    oauth_authorization_url: str | None = None
+    oauth_token_url: str | None = None
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = None
+    oauth_scopes: str | None = None
+    oauth_resource: str | None = None
 
 
 class ExternalMcpServerOut(BaseModel):
@@ -185,6 +197,14 @@ class ExternalMcpServerOut(BaseModel):
     has_custom_headers: bool
     custom_header_names: list[str]
     has_mcp_session: bool
+    oauth_authorization_url: str
+    oauth_token_url: str
+    oauth_client_id: str
+    oauth_scopes: str
+    oauth_resource: str
+    oauth_connected: bool
+    oauth_token_expires_at: datetime | None
+    oauth_last_error: str
     status: str
     last_sync_at: datetime | None
     last_sync_error: str
@@ -200,6 +220,10 @@ class ExternalMcpToolOut(BaseModel):
     name: str
     description: str
     input_schema: dict[str, Any]
+
+
+class ExternalMcpOAuthConnectOut(BaseModel):
+    authorization_url: str
 
 
 class UserCreate(BaseModel):

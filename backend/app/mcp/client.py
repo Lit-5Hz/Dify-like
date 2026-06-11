@@ -235,6 +235,19 @@ def is_session_error(exc: Exception) -> bool:
     )
 
 
+def is_auth_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "http 401" in message
+        or "http 403" in message
+        or "unauthorized" in message
+        or "forbidden" in message
+        or "invalid token" in message
+        or "expired token" in message
+        or "invalid_token" in message
+    )
+
+
 def _normalize_input_schema(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value

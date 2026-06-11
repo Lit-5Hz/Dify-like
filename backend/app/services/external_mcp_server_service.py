@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.core.credential_crypto import decrypt_secret, encrypt_secret
 from app.db.models import App, ExternalMcpServer, Workflow
-from app.mcp.client import call_mcp_tool, initialize_mcp_server, is_session_error, list_mcp_tools
+from app.mcp.client import call_mcp_tool, initialize_mcp_server, is_auth_error, is_session_error, list_mcp_tools
 from app.schemas import ExternalMcpServerCreate, ExternalMcpServerUpdate
 from app.services.agent_tool_spec import normalize_agent_tools
+from app.services.external_mcp_oauth_service import resolve_external_mcp_auth_context
 
 """
 SUPPORTED_TRANSPORT_TYPES:
@@ -30,7 +31,7 @@ SUPPORTED_AUTH_TYPES:
         Bearer = call external MCP Server with Authorization header.
 """
 SUPPORTED_TRANSPORT_TYPES = {"streamable_http"}
-SUPPORTED_AUTH_TYPES = {"none", "bearer"}
+SUPPORTED_AUTH_TYPES = {"none", "bearer", "oauth2"}
 RESERVED_CUSTOM_HEADER_NAMES = {
     "accept",
     "content-length",
@@ -78,6 +79,7 @@ def create_external_mcp_server(
     if auth_type == "bearer" and not payload.auth_secret.strip():
         raise ValueError("Bearer auth requires an auth secret.")
     custom_headers = normalize_custom_headers(payload.custom_headers, auth_type)
+    oauth_resource = payload.oauth_resource if payload.oauth_resource is not None else server_url
 
     server = ExternalMcpServer(
         owner_user_id=owner_user_id,
@@ -86,11 +88,18 @@ def create_external_mcp_server(
         transport_type=transport_type,
         server_url=server_url,
         auth_type=auth_type,
-        encrypted_auth_secret=_encrypt_optional_secret(payload.auth_secret),
+        encrypted_auth_secret=_encrypt_optional_secret(payload.auth_secret) if auth_type == "bearer" else "",
         encrypted_headers_json=_encrypt_headers_json(custom_headers),
+        oauth_authorization_url=payload.oauth_authorization_url.strip(),
+        oauth_token_url=payload.oauth_token_url.strip(),
+        oauth_client_id=payload.oauth_client_id.strip(),
+        encrypted_oauth_client_secret=_encrypt_optional_secret(payload.oauth_client_secret) if auth_type == "oauth2" else "",
+        oauth_scopes=payload.oauth_scopes.strip(),
+        oauth_resource=str(oauth_resource or "").strip(),
         status="pending_sync",
         tool_manifest_json={"tools": []},
     )
+    _validate_external_mcp_auth_config(server)
     db.add(server)
     db.commit()
     db.refresh(server)
@@ -104,6 +113,7 @@ def update_external_mcp_server(
 ) -> ExternalMcpServer:
     values = payload.model_dump(exclude_unset=True)
     needs_resync = False
+    oauth_config_changed = False
     if "name" in values and values["name"] is not None:
         name = str(values["name"]).strip()
         if not name:
@@ -126,16 +136,45 @@ def update_external_mcp_server(
     if "auth_secret" in values and values["auth_secret"] is not None:
         server.encrypted_auth_secret = _encrypt_optional_secret(values["auth_secret"])
         needs_resync = True
+    if "oauth_authorization_url" in values and values["oauth_authorization_url"] is not None:
+        server.oauth_authorization_url = str(values["oauth_authorization_url"]).strip()
+        needs_resync = True
+        oauth_config_changed = True
+    if "oauth_token_url" in values and values["oauth_token_url"] is not None:
+        server.oauth_token_url = str(values["oauth_token_url"]).strip()
+        needs_resync = True
+        oauth_config_changed = True
+    if "oauth_client_id" in values and values["oauth_client_id"] is not None:
+        server.oauth_client_id = str(values["oauth_client_id"]).strip()
+        needs_resync = True
+        oauth_config_changed = True
+    if "oauth_client_secret" in values and values["oauth_client_secret"] is not None:
+        secret = str(values["oauth_client_secret"]).strip()
+        if secret:
+            server.encrypted_oauth_client_secret = _encrypt_optional_secret(secret)
+            needs_resync = True
+            oauth_config_changed = True
+    if "oauth_scopes" in values and values["oauth_scopes"] is not None:
+        server.oauth_scopes = str(values["oauth_scopes"]).strip()
+        needs_resync = True
+        oauth_config_changed = True
+    if "oauth_resource" in values and values["oauth_resource"] is not None:
+        server.oauth_resource = str(values["oauth_resource"]).strip()
+        needs_resync = True
+        oauth_config_changed = True
     if "custom_headers" in values and values["custom_headers"] is not None:
         server.encrypted_headers_json = _encrypt_headers_json(
             normalize_custom_headers(values["custom_headers"], server.auth_type)
         )
         needs_resync = True
-    if server.auth_type == "none":
+    if server.auth_type in {"none", "oauth2"}:
         server.encrypted_auth_secret = ""
-    if server.auth_type == "bearer" and not server.encrypted_auth_secret:
-        raise ValueError("Bearer auth requires an auth secret.")
+    if server.auth_type != "oauth2":
+        _clear_external_mcp_oauth_state(server, clear_config_secret=True)
+    elif oauth_config_changed:
+        _clear_external_mcp_oauth_state(server, clear_config_secret=False)
     normalize_custom_headers(resolve_external_mcp_custom_headers(server), server.auth_type)
+    _validate_external_mcp_auth_config(server)
     if needs_resync:
         server.status = "pending_sync"
         server.last_sync_at = None
@@ -174,17 +213,41 @@ async def refresh_external_mcp_server_tool_manifest(db: Session, server: Externa
     Initialize the remote MCP server, refresh tools/list, and persist sync status.
     """
     try:
-        auth_secret = resolve_external_mcp_auth_secret(server)
+        auth_context = await resolve_external_mcp_auth_context(db, server)
         custom_headers = resolve_external_mcp_custom_headers(server)
-        init_response = await initialize_mcp_server(server.server_url, server.auth_type, auth_secret, custom_headers)
-        server.mcp_session_id = init_response.session_id
-        tools = await list_mcp_tools(
-            server.server_url,
-            server.auth_type,
-            auth_secret,
-            custom_headers,
-            server.mcp_session_id,
-        )
+        try:
+            init_response = await initialize_mcp_server(
+                server.server_url,
+                auth_context.request_auth_type,
+                auth_context.auth_secret,
+                custom_headers,
+            )
+            server.mcp_session_id = init_response.session_id
+            tools = await list_mcp_tools(
+                server.server_url,
+                auth_context.request_auth_type,
+                auth_context.auth_secret,
+                custom_headers,
+                server.mcp_session_id,
+            )
+        except ValueError as exc:
+            if str(server.auth_type or "").strip().lower() != "oauth2" or not is_auth_error(exc):
+                raise
+            auth_context = await resolve_external_mcp_auth_context(db, server, force_oauth_refresh=True)
+            init_response = await initialize_mcp_server(
+                server.server_url,
+                auth_context.request_auth_type,
+                auth_context.auth_secret,
+                custom_headers,
+            )
+            server.mcp_session_id = init_response.session_id
+            tools = await list_mcp_tools(
+                server.server_url,
+                auth_context.request_auth_type,
+                auth_context.auth_secret,
+                custom_headers,
+                server.mcp_session_id,
+            )
         server.tool_manifest_json = {"tools": tools}
         server.status = "active"
         server.last_sync_error = ""
@@ -244,35 +307,46 @@ async def call_external_mcp_tool_with_session_retry(
     if not server:
         raise ValueError(f"External MCP server not found: {server_id}")
 
-    auth_secret = resolve_external_mcp_auth_secret(server)
     custom_headers = resolve_external_mcp_custom_headers(server)
-    try:
-        return await call_mcp_tool(
-            server.server_url,
-            server.auth_type,
-            tool_name,
-            arguments,
-            auth_secret,
-            custom_headers,
-            server.mcp_session_id,
-        )
-    except ValueError as exc:
-        if not is_session_error(exc):
-            raise
+    retried_auth = False
+    retried_session = False
+    force_oauth_refresh = False
 
-    init_response = await initialize_mcp_server(server.server_url, server.auth_type, auth_secret, custom_headers)
-    server.mcp_session_id = init_response.session_id
-    db.commit()
-    db.refresh(server)
-    return await call_mcp_tool(
-        server.server_url,
-        server.auth_type,
-        tool_name,
-        arguments,
-        auth_secret,
-        custom_headers,
-        server.mcp_session_id,
-    )
+    while True:
+        auth_context = await resolve_external_mcp_auth_context(
+            db,
+            server,
+            force_oauth_refresh=force_oauth_refresh,
+        )
+        force_oauth_refresh = False
+        try:
+            return await call_mcp_tool(
+                server.server_url,
+                auth_context.request_auth_type,
+                tool_name,
+                arguments,
+                auth_context.auth_secret,
+                custom_headers,
+                server.mcp_session_id,
+            )
+        except ValueError as exc:
+            if str(server.auth_type or "").strip().lower() == "oauth2" and is_auth_error(exc) and not retried_auth:
+                retried_auth = True
+                force_oauth_refresh = True
+                continue
+            if is_session_error(exc) and not retried_session:
+                retried_session = True
+                init_response = await initialize_mcp_server(
+                    server.server_url,
+                    auth_context.request_auth_type,
+                    auth_context.auth_secret,
+                    custom_headers,
+                )
+                server.mcp_session_id = init_response.session_id
+                db.commit()
+                db.refresh(server)
+                continue
+            raise
 
 
 def resolve_agent_mcp_tool_runtime_specs(
@@ -301,7 +375,7 @@ def resolve_agent_mcp_tool_runtime_specs(
                 "server_name": server.name,
                 "server_url": server.server_url,
                 "auth_type": server.auth_type,
-                "auth_secret": resolve_external_mcp_auth_secret(server),
+                "auth_secret": resolve_external_mcp_auth_secret(server) if server.auth_type == "bearer" else "",
                 "custom_headers": resolve_external_mcp_custom_headers(server),
                 "session_id": server.mcp_session_id,
                 "db": db,
@@ -328,6 +402,14 @@ def external_mcp_server_to_out(server: ExternalMcpServer) -> dict[str, Any]:
         "has_custom_headers": bool(server.encrypted_headers_json),
         "custom_header_names": list(resolve_external_mcp_custom_headers(server).keys()),
         "has_mcp_session": bool(server.mcp_session_id),
+        "oauth_authorization_url": server.oauth_authorization_url,
+        "oauth_token_url": server.oauth_token_url,
+        "oauth_client_id": server.oauth_client_id,
+        "oauth_scopes": server.oauth_scopes,
+        "oauth_resource": server.oauth_resource,
+        "oauth_connected": bool(server.encrypted_oauth_access_token),
+        "oauth_token_expires_at": server.oauth_token_expires_at,
+        "oauth_last_error": server.oauth_last_error,
         "status": server.status,
         "last_sync_at": server.last_sync_at,
         "last_sync_error": server.last_sync_error,
@@ -349,6 +431,32 @@ def _normalize_auth_type(value: str) -> str:
     if auth_type not in SUPPORTED_AUTH_TYPES:
         raise ValueError(f"Unsupported MCP auth type: {auth_type or 'empty'}")
     return auth_type
+
+
+def _validate_external_mcp_auth_config(server: ExternalMcpServer) -> None:
+    auth_type = str(server.auth_type or "none").strip().lower()
+    if auth_type == "bearer" and not server.encrypted_auth_secret:
+        raise ValueError("Bearer auth requires an auth secret.")
+    if auth_type == "oauth2":
+        if not str(server.oauth_authorization_url or "").strip():
+            raise ValueError("OAuth authorization URL is required.")
+        if not str(server.oauth_token_url or "").strip():
+            raise ValueError("OAuth token URL is required.")
+        if not str(server.oauth_client_id or "").strip():
+            raise ValueError("OAuth client ID is required.")
+
+
+def _clear_external_mcp_oauth_state(server: ExternalMcpServer, *, clear_config_secret: bool = False) -> None:
+    if clear_config_secret:
+        server.encrypted_oauth_client_secret = ""
+    server.encrypted_oauth_access_token = ""
+    server.encrypted_oauth_refresh_token = ""
+    server.oauth_token_expires_at = None
+    server.oauth_connected_at = None
+    server.oauth_last_error = ""
+    server.oauth_state = ""
+    server.encrypted_oauth_code_verifier = ""
+    server.oauth_state_expires_at = None
 
 
 def _encrypt_optional_secret(value: str | None) -> str:
@@ -377,8 +485,8 @@ def normalize_custom_headers(value: Any, auth_type: str = "none") -> dict[str, s
             raise ValueError(f"Invalid MCP custom header name: {name}")
         if lower_name in RESERVED_CUSTOM_HEADER_NAMES:
             raise ValueError(f"MCP custom header is reserved: {name}")
-        if normalized_auth_type == "bearer" and lower_name == "authorization":
-            raise ValueError("Authorization custom header is not allowed when bearer auth is enabled.")
+        if normalized_auth_type in {"bearer", "oauth2"} and lower_name == "authorization":
+            raise ValueError("Authorization custom header is not allowed when bearer or OAuth auth is enabled.")
         if not isinstance(raw_value, str):
             raise ValueError(f"MCP custom header value must be a string: {name}")
         headers[name] = raw_value.strip()
