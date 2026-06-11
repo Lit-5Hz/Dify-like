@@ -51,7 +51,7 @@ const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "m
 const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
 const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
 const MCP_TRANSPORT_TYPES = ["streamable_http"];
-const MCP_AUTH_TYPES = ["none", "bearer"];
+const MCP_AUTH_TYPES = ["none", "bearer", "oauth2"];
 const NEW_EXTERNAL_MCP_SERVER_ID = "__new_external_mcp_server__";
 const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
 
@@ -127,6 +127,12 @@ type ExternalMcpServerDraft = {
   server_url: string;
   auth_type: string;
   auth_secret: string;
+  oauth_authorization_url: string;
+  oauth_token_url: string;
+  oauth_client_id: string;
+  oauth_client_secret: string;
+  oauth_scopes: string;
+  oauth_resource: string;
   custom_headers: ExternalMcpHeaderDraft[];
   custom_headers_dirty: boolean;
 };
@@ -384,6 +390,12 @@ function emptyExternalMcpServerDraft(): ExternalMcpServerDraft {
     server_url: "",
     auth_type: "none",
     auth_secret: "",
+    oauth_authorization_url: "",
+    oauth_token_url: "",
+    oauth_client_id: "",
+    oauth_client_secret: "",
+    oauth_scopes: "",
+    oauth_resource: "",
     custom_headers: [],
     custom_headers_dirty: false,
   };
@@ -807,6 +819,24 @@ function App() {
   }, [user?.id]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    const oauthStatus = params.get("mcp_oauth");
+    if (!oauthStatus) return;
+    if (oauthStatus === "connected") {
+      setNotice("OAuth 连接成功。现在可以同步 tools。");
+    } else {
+      setNotice(`OAuth 连接失败：${params.get("message") || "unknown error"}`);
+    }
+    params.delete("mcp_oauth");
+    params.delete("server_id");
+    params.delete("message");
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+    window.history.replaceState({}, "", nextUrl);
+  }, []);
+
+  useEffect(() => {
     if (!workflowNodes.length) {
       setSelectedWorkflowNodeId("");
       return;
@@ -839,6 +869,12 @@ function App() {
         server_url: selectedExternalMcpServer.server_url,
         auth_type: selectedExternalMcpServer.auth_type,
         auth_secret: "",
+        oauth_authorization_url: selectedExternalMcpServer.oauth_authorization_url ?? "",
+        oauth_token_url: selectedExternalMcpServer.oauth_token_url ?? "",
+        oauth_client_id: selectedExternalMcpServer.oauth_client_id ?? "",
+        oauth_client_secret: "",
+        oauth_scopes: selectedExternalMcpServer.oauth_scopes ?? "",
+        oauth_resource: selectedExternalMcpServer.oauth_resource ?? "",
         custom_headers: (selectedExternalMcpServer.custom_header_names ?? []).map((name) => ({
           name,
           value: "",
@@ -1285,16 +1321,31 @@ function App() {
       auth_type: string;
       auth_secret?: string;
       custom_headers?: Record<string, string>;
+      oauth_authorization_url?: string;
+      oauth_token_url?: string;
+      oauth_client_id?: string;
+      oauth_client_secret?: string;
+      oauth_scopes?: string;
+      oauth_resource?: string;
     } = {
       name: externalMcpDraft.name.trim(),
       description: externalMcpDraft.description.trim(),
       transport_type: externalMcpDraft.transport_type,
       server_url: externalMcpDraft.server_url.trim(),
       auth_type: externalMcpDraft.auth_type,
+      oauth_authorization_url: externalMcpDraft.oauth_authorization_url.trim(),
+      oauth_token_url: externalMcpDraft.oauth_token_url.trim(),
+      oauth_client_id: externalMcpDraft.oauth_client_id.trim(),
+      oauth_scopes: externalMcpDraft.oauth_scopes.trim(),
+      oauth_resource: externalMcpDraft.oauth_resource.trim(),
     };
     const nextAuthSecret = externalMcpDraft.auth_secret.trim();
     if (!selectedExternalMcpServer || nextAuthSecret) {
       payload.auth_secret = nextAuthSecret;
+    }
+    const nextOAuthClientSecret = externalMcpDraft.oauth_client_secret.trim();
+    if (!selectedExternalMcpServer || nextOAuthClientSecret) {
+      payload.oauth_client_secret = nextOAuthClientSecret;
     }
     if (!selectedExternalMcpServer || externalMcpDraft.custom_headers_dirty) {
       payload.custom_headers = buildCustomHeadersPayload(externalMcpDraft.custom_headers);
@@ -1309,6 +1360,13 @@ function App() {
     }
     if (payload.auth_type === "bearer" && !payload.auth_secret && !selectedExternalMcpServer?.has_auth_secret) {
       setNotice("Bearer 认证需要填写 token。");
+      return;
+    }
+    if (
+      payload.auth_type === "oauth2" &&
+      (!payload.oauth_authorization_url || !payload.oauth_token_url || !payload.oauth_client_id)
+    ) {
+      setNotice("OAuth2 认证需要填写 authorization URL、token URL 和 client ID。");
       return;
     }
     try {
@@ -1326,6 +1384,10 @@ function App() {
 
   async function syncSelectedExternalMcpServer() {
     if (!selectedExternalMcpServer) return;
+    if (selectedExternalMcpServer.auth_type === "oauth2" && !selectedExternalMcpServer.oauth_connected) {
+      setNotice("请先完成 OAuth Connect，再同步 tools。");
+      return;
+    }
     const serverId = selectedExternalMcpServer.id;
     setSyncingExternalMcpServerId(serverId);
     setNotice(`正在同步外部 MCP Server「${selectedExternalMcpServer.name}」的 tools...`);
@@ -1346,6 +1408,28 @@ function App() {
       setNotice(`同步外部 MCP tools 失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       setSyncingExternalMcpServerId("");
+    }
+  }
+
+  async function connectSelectedExternalMcpServerOAuth() {
+    if (!selectedExternalMcpServer) return;
+    try {
+      const result = await api.connectExternalMcpServerOAuth(selectedExternalMcpServer.id);
+      window.location.href = result.authorization_url;
+    } catch (error) {
+      setNotice(`启动 OAuth Connect 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function disconnectSelectedExternalMcpServerOAuth() {
+    if (!selectedExternalMcpServer) return;
+    try {
+      const saved = await api.disconnectExternalMcpServerOAuth(selectedExternalMcpServer.id);
+      setExternalMcpServers((items) => items.map((item) => (item.id === saved.id ? saved : item)));
+      setSelectedExternalMcpServerId(saved.id);
+      setNotice("OAuth 连接已断开。");
+    } catch (error) {
+      setNotice(`断开 OAuth 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -2572,6 +2656,9 @@ function App() {
     const syncingSelectedExternalMcpServer = Boolean(
       selectedExternalMcpServer && syncingExternalMcpServerId === selectedExternalMcpServer.id,
     );
+    const selectedExternalMcpServerRequiresOAuthConnect = Boolean(
+      selectedExternalMcpServer?.auth_type === "oauth2" && !selectedExternalMcpServer.oauth_connected,
+    );
     return (
       <section className="work-panel">
         <div className="panel-heading">
@@ -2674,6 +2761,89 @@ function App() {
                 />
               </label>
             ) : null}
+            {externalMcpDraft.auth_type === "oauth2" ? (
+              <div className="oauth-config">
+                <div className="field-row-title">
+                  <span>OAuth2</span>
+                  {selectedExternalMcpServer?.auth_type === "oauth2" ? (
+                    <span className={selectedExternalMcpServer.oauth_connected ? "badge success" : "badge warning"}>
+                      {selectedExternalMcpServer.oauth_connected ? "connected" : "not connected"}
+                    </span>
+                  ) : null}
+                </div>
+                <label>
+                  Authorization URL
+                  <input
+                    placeholder="https://provider.example.com/oauth/authorize"
+                    value={externalMcpDraft.oauth_authorization_url}
+                    onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_authorization_url: event.target.value })}
+                  />
+                </label>
+                <label>
+                  Token URL
+                  <input
+                    placeholder="https://provider.example.com/oauth/token"
+                    value={externalMcpDraft.oauth_token_url}
+                    onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_token_url: event.target.value })}
+                  />
+                </label>
+                <div className="two-fields">
+                  <label>
+                    Client ID
+                    <input
+                      value={externalMcpDraft.oauth_client_id}
+                      onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_client_id: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    Client Secret
+                    <input
+                      type="password"
+                      placeholder={selectedExternalMcpServer ? "Leave blank to keep saved secret" : ""}
+                      value={externalMcpDraft.oauth_client_secret}
+                      onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_client_secret: event.target.value })}
+                    />
+                  </label>
+                </div>
+                <div className="two-fields">
+                  <label>
+                    Scopes
+                    <input
+                      placeholder="openid profile offline_access"
+                      value={externalMcpDraft.oauth_scopes}
+                      onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_scopes: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    Resource
+                    <input
+                      placeholder={externalMcpDraft.server_url || "Defaults to the MCP server URL"}
+                      value={externalMcpDraft.oauth_resource}
+                      onChange={(event) => setExternalMcpDraft({ ...externalMcpDraft, oauth_resource: event.target.value })}
+                    />
+                  </label>
+                </div>
+                <div className="heading-actions compact">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={!selectedExternalMcpServer || selectedExternalMcpServer.auth_type !== "oauth2"}
+                    onClick={connectSelectedExternalMcpServerOAuth}
+                  >
+                    <Link2 size={14} /> Connect OAuth
+                  </button>
+                  <button
+                    className="ghost-danger-button"
+                    type="button"
+                    disabled={!selectedExternalMcpServer?.oauth_connected}
+                    onClick={disconnectSelectedExternalMcpServerOAuth}
+                  >
+                    Disconnect
+                  </button>
+                </div>
+                <p className="muted-copy">Save the server before connecting OAuth. Redirect URI: /api/mcp/oauth/callback</p>
+              </div>
+            ) : null}
             <div className="header-editor">
               <div className="field-row-title">
                 <span>Custom Headers</span>
@@ -2715,17 +2885,24 @@ function App() {
                 <strong>{selectedExternalMcpServer.status}</strong>
                 <small>Headers: {selectedExternalMcpServer.custom_header_names?.length ? selectedExternalMcpServer.custom_header_names.join(", ") : "none"}</small>
                 <small>Session: {selectedExternalMcpServer.has_mcp_session ? "active" : "none"}</small>
+                {selectedExternalMcpServer.auth_type === "oauth2" ? (
+                  <>
+                    <small>OAuth: {selectedExternalMcpServer.oauth_connected ? "connected" : "not connected"}</small>
+                    <small>OAuth token expires: {formatTimestamp(selectedExternalMcpServer.oauth_token_expires_at)}</small>
+                  </>
+                ) : null}
                 <small>Last sync：{formatTimestamp(selectedExternalMcpServer.last_sync_at)}</small>
               </div>
             ) : null}
             {selectedExternalMcpServer?.last_sync_error ? <div className="inline-alert error">{selectedExternalMcpServer.last_sync_error}</div> : null}
+            {selectedExternalMcpServer?.oauth_last_error ? <div className="inline-alert error">{selectedExternalMcpServer.oauth_last_error}</div> : null}
             <div className="heading-actions">
               <button className="secondary-button" onClick={saveExternalMcpServer}>
                 <Save size={15} /> {selectedExternalMcpServer ? "保存 Server" : "创建 Server"}
               </button>
               <button
                 className="secondary-button"
-                disabled={!selectedExternalMcpServer || syncingSelectedExternalMcpServer}
+                disabled={!selectedExternalMcpServer || syncingSelectedExternalMcpServer || selectedExternalMcpServerRequiresOAuthConnect}
                 onClick={syncSelectedExternalMcpServer}
               >
                 {syncingSelectedExternalMcpServer ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}

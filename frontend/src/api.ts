@@ -189,6 +189,12 @@ export const api = {
     auth_type: string;
     auth_secret?: string;
     custom_headers?: Record<string, string>;
+    oauth_authorization_url?: string;
+    oauth_token_url?: string;
+    oauth_client_id?: string;
+    oauth_client_secret?: string;
+    oauth_scopes?: string;
+    oauth_resource?: string;
   }) =>
     request<ExternalMcpServerItem>("/mcp/servers", {
       method: "POST",
@@ -205,6 +211,12 @@ export const api = {
       auth_type: string;
       auth_secret: string;
       custom_headers: Record<string, string>;
+      oauth_authorization_url: string;
+      oauth_token_url: string;
+      oauth_client_id: string;
+      oauth_client_secret: string;
+      oauth_scopes: string;
+      oauth_resource: string;
     }>,
   ) =>
     request<ExternalMcpServerItem>(`/mcp/servers/${serverId}`, {
@@ -217,6 +229,14 @@ export const api = {
     }),
   syncExternalMcpServer: (serverId: string) =>
     request<ExternalMcpServerItem>(`/mcp/servers/${serverId}/sync`, {
+      method: "POST",
+    }),
+  connectExternalMcpServerOAuth: (serverId: string) =>
+    request<{ authorization_url: string }>(`/mcp/servers/${serverId}/oauth/connect`, {
+      method: "POST",
+    }),
+  disconnectExternalMcpServerOAuth: (serverId: string) =>
+    request<ExternalMcpServerItem>(`/mcp/servers/${serverId}/oauth/disconnect`, {
       method: "POST",
     }),
   listExternalMcpTools: (serverId: string) => request<ExternalMcpToolItem[]>(`/mcp/servers/${serverId}/tools`),

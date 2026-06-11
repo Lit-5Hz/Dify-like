@@ -877,6 +877,15 @@ pre {
   gap: 8px;
 }
 
+.oauth-config {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 10px;
+  background: var(--surface-soft);
+}
+
 .header-row {
   display: grid;
   grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) 34px;

@@ -113,6 +113,14 @@ export type ExternalMcpServerItem = {
   has_custom_headers: boolean;
   custom_header_names: string[];
   has_mcp_session: boolean;
+  oauth_authorization_url: string;
+  oauth_token_url: string;
+  oauth_client_id: string;
+  oauth_scopes: string;
+  oauth_resource: string;
+  oauth_connected: boolean;
+  oauth_token_expires_at: string | null;
+  oauth_last_error: string;
   status: string;
   last_sync_at: string | null;
   last_sync_error: string;
