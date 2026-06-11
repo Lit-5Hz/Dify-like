@@ -160,6 +160,7 @@ class ExternalMcpServerCreate(BaseModel):
     server_url: str = Field(min_length=1)
     auth_type: str = "none"
     auth_secret: str = ""
+    custom_headers: dict[str, str] | None = None
 
 
 class ExternalMcpServerUpdate(BaseModel):
@@ -169,6 +170,7 @@ class ExternalMcpServerUpdate(BaseModel):
     server_url: str | None = None
     auth_type: str | None = None
     auth_secret: str | None = None
+    custom_headers: dict[str, str] | None = None
 
 
 class ExternalMcpServerOut(BaseModel):
@@ -180,6 +182,9 @@ class ExternalMcpServerOut(BaseModel):
     server_url: str
     auth_type: str
     has_auth_secret: bool
+    has_custom_headers: bool
+    custom_header_names: list[str]
+    has_mcp_session: bool
     status: str
     last_sync_at: datetime | None
     last_sync_error: str

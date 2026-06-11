@@ -99,6 +99,12 @@ type AgentToolConfig = {
   config: Record<string, unknown>;
 };
 
+type OrphanedMcpToolReference = {
+  node_id?: string;
+  server_id: string;
+  name: string;
+};
+
 type WorkflowMcpServerDraft = {
   configured: boolean;
   enabled: boolean;
@@ -108,6 +114,12 @@ type WorkflowMcpServerDraft = {
   auth_type: string;
 };
 
+type ExternalMcpHeaderDraft = {
+  name: string;
+  value: string;
+  saved: boolean;
+};
+
 type ExternalMcpServerDraft = {
   name: string;
   description: string;
@@ -115,6 +127,8 @@ type ExternalMcpServerDraft = {
   server_url: string;
   auth_type: string;
   auth_secret: string;
+  custom_headers: ExternalMcpHeaderDraft[];
+  custom_headers_dirty: boolean;
 };
 
 const NAV_ITEMS: Array<{ id: NavView; label: string; description: string; icon: React.ElementType }> = [
@@ -273,6 +287,40 @@ function getEnabledAgentMcpToolKeys(node: WorkflowNode | null): string[] {
     .map((tool) => buildMcpToolKey(typeof tool.config.server_id === "string" ? tool.config.server_id : "", tool.name));
 }
 
+function getOrphanedAgentMcpTools(
+  node: WorkflowNode | null,
+  externalServers: ExternalMcpServerItem[],
+): OrphanedMcpToolReference[] {
+  const knownServerIds = new Set(externalServers.map((server) => server.id));
+  const seen = new Set<string>();
+  return getAgentNodeTools(node).flatMap((tool) => {
+    if (tool.type !== "mcp") return [];
+    const serverId = typeof tool.config.server_id === "string" ? tool.config.server_id.trim() : "";
+    if (!serverId || knownServerIds.has(serverId)) return [];
+    const key = buildMcpToolKey(serverId, tool.name);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ server_id: serverId, name: tool.name }];
+  });
+}
+
+function getWorkflowOrphanedMcpTools(
+  workflow: WorkflowItem | null,
+  externalServers: ExternalMcpServerItem[],
+): OrphanedMcpToolReference[] {
+  if (!workflow) return [];
+  const seen = new Set<string>();
+  return getWorkflowNodes(workflow).flatMap((node, index) => {
+    const nodeId = getWorkflowNodeId(node, index);
+    return getOrphanedAgentMcpTools(node, externalServers).flatMap((tool) => {
+      const key = `${nodeId}::${buildMcpToolKey(tool.server_id, tool.name)}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{ ...tool, node_id: nodeId }];
+    });
+  });
+}
+
 function getExternalServerTools(server: ExternalMcpServerItem | null): Array<{ name: string; description: string }> {
   if (!server || !isRecord(server.tool_manifest_json)) return [];
   const tools = server.tool_manifest_json.tools;
@@ -336,6 +384,8 @@ function emptyExternalMcpServerDraft(): ExternalMcpServerDraft {
     server_url: "",
     auth_type: "none",
     auth_secret: "",
+    custom_headers: [],
+    custom_headers_dirty: false,
   };
 }
 
@@ -426,6 +476,22 @@ function pruneRetrievalKnowledgeBaseIds(workflow: WorkflowItem, knowledgeBases: 
   return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
 }
 
+function pruneOrphanedMcpTools(workflow: WorkflowItem, externalServers: ExternalMcpServerItem[]): WorkflowItem {
+  const knownServerIds = new Set(externalServers.map((server) => server.id));
+  const nextNodes = getWorkflowNodes(workflow).map((node) => {
+    const tools = node.tools;
+    if (!Array.isArray(tools)) return node;
+    const nextTools = tools.filter((tool) => {
+      if (!isRecord(tool) || tool.type !== "mcp") return true;
+      const config = isRecord(tool.config) ? tool.config : {};
+      const serverId = typeof config.server_id === "string" ? config.server_id.trim() : "";
+      return Boolean(serverId && knownServerIds.has(serverId));
+    });
+    return nextTools.length === tools.length ? node : { ...node, tools: nextTools };
+  });
+  return { ...workflow, draft_spec: { ...(workflow.draft_spec ?? {}), nodes: nextNodes } };
+}
+
 function App() {
   const [activeView, setActiveView] = useState<NavView>("workspace");
   const [activeAppView, setActiveAppView] = useState<AppView>("studio");
@@ -504,6 +570,10 @@ function App() {
   const canEditSelectedWorkflow = Boolean(selectedOwnedApp && selectedWorkflow);
   const workflowNodes = useMemo(() => (selectedWorkflow ? getWorkflowNodes(selectedWorkflow) : []), [selectedWorkflow]);
   const workflowEdges = useMemo(() => (selectedWorkflow ? getWorkflowEdges(selectedWorkflow) : []), [selectedWorkflow]);
+  const selectedWorkflowOrphanedMcpTools = useMemo(
+    () => getWorkflowOrphanedMcpTools(selectedWorkflow, externalMcpServers),
+    [externalMcpServers, selectedWorkflow],
+  );
   const selectedWorkflowNode = useMemo(() => {
     const node = workflowNodes.find((item, index) => getWorkflowNodeId(item, index) === selectedWorkflowNodeId);
     return node ?? workflowNodes[0] ?? null;
@@ -519,6 +589,10 @@ function App() {
   const retrievalNodeModel = useMemo(() => getRetrievalNodeModel(selectedWorkflowNode), [selectedWorkflowNode]);
   const enabledAgentToolNames = useMemo(() => getEnabledAgentToolNames(selectedWorkflowNode), [selectedWorkflowNode]);
   const enabledAgentMcpToolKeys = useMemo(() => getEnabledAgentMcpToolKeys(selectedWorkflowNode), [selectedWorkflowNode]);
+  const orphanedAgentMcpTools = useMemo(
+    () => getOrphanedAgentMcpTools(selectedWorkflowNode, externalMcpServers),
+    [externalMcpServers, selectedWorkflowNode],
+  );
 
   function setActiveConversationId(nextConversationId: string | null) {
     conversationIdRef.current = nextConversationId;
@@ -765,6 +839,12 @@ function App() {
         server_url: selectedExternalMcpServer.server_url,
         auth_type: selectedExternalMcpServer.auth_type,
         auth_secret: "",
+        custom_headers: (selectedExternalMcpServer.custom_header_names ?? []).map((name) => ({
+          name,
+          value: "",
+          saved: true,
+        })),
+        custom_headers_dirty: false,
       });
       return;
     }
@@ -1150,15 +1230,75 @@ function App() {
     return Boolean(slug && currentAppWorkflowMcpSlugs.has(slug));
   }
 
+  function buildCustomHeadersPayload(headers: ExternalMcpHeaderDraft[]) {
+    const next: Record<string, string> = {};
+    headers.forEach((header) => {
+      const name = header.name.trim();
+      const value = header.value;
+      if (name && value) {
+        next[name] = value;
+      }
+    });
+    return next;
+  }
+
+  function updateExternalHeader(index: number, patch: Partial<ExternalMcpHeaderDraft>) {
+    setExternalMcpDraft((current) => ({
+      ...current,
+      custom_headers: current.custom_headers.map((header, itemIndex) =>
+        itemIndex === index ? { ...header, ...patch, saved: false } : header,
+      ),
+      custom_headers_dirty: true,
+    }));
+  }
+
+  function addExternalHeader() {
+    setExternalMcpDraft((current) => ({
+      ...current,
+      custom_headers: [...current.custom_headers, { name: "", value: "", saved: false }],
+      custom_headers_dirty: true,
+    }));
+  }
+
+  function removeExternalHeader(index: number) {
+    setExternalMcpDraft((current) => ({
+      ...current,
+      custom_headers: current.custom_headers.filter((_, itemIndex) => itemIndex !== index),
+      custom_headers_dirty: true,
+    }));
+  }
+
+  function clearExternalHeaders() {
+    setExternalMcpDraft((current) => ({
+      ...current,
+      custom_headers: [],
+      custom_headers_dirty: true,
+    }));
+  }
+
   async function saveExternalMcpServer() {
-    const payload = {
+    const payload: {
+      name: string;
+      description: string;
+      transport_type: string;
+      server_url: string;
+      auth_type: string;
+      auth_secret?: string;
+      custom_headers?: Record<string, string>;
+    } = {
       name: externalMcpDraft.name.trim(),
       description: externalMcpDraft.description.trim(),
       transport_type: externalMcpDraft.transport_type,
       server_url: externalMcpDraft.server_url.trim(),
       auth_type: externalMcpDraft.auth_type,
-      auth_secret: externalMcpDraft.auth_secret.trim(),
     };
+    const nextAuthSecret = externalMcpDraft.auth_secret.trim();
+    if (!selectedExternalMcpServer || nextAuthSecret) {
+      payload.auth_secret = nextAuthSecret;
+    }
+    if (!selectedExternalMcpServer || externalMcpDraft.custom_headers_dirty) {
+      payload.custom_headers = buildCustomHeadersPayload(externalMcpDraft.custom_headers);
+    }
     if (!payload.name || !payload.server_url) {
       setNotice("外部 MCP Server 名称和 URL 都不能为空。");
       return;
@@ -1216,6 +1356,9 @@ function App() {
       const list = await api.listExternalMcpServers();
       setExternalMcpServers(list);
       setSelectedExternalMcpServerId(list.find((server) => !isExternalMcpUrlOwnedByCurrentApp(server.server_url))?.id ?? "");
+      if (selectedApp) {
+        await refresh(selectedApp.id, selectedWorkflow?.id);
+      }
       setNotice("外部 MCP Server 已删除。");
     } catch (error) {
       setNotice(`删除外部 MCP Server 失败：${error instanceof Error ? error.message : String(error)}`);
@@ -1240,6 +1383,16 @@ function App() {
     const toolKey = buildMcpToolKey(serverId, toolName);
     const enabled = !enabledAgentMcpToolKeys.includes(toolKey);
     setSelectedWorkflow(updateAgentNodeMcpTool(selectedWorkflow, selectedWorkflowNodeKey, serverId, toolName, enabled));
+  }
+
+  function removeOrphanedMcpTool(serverId: string, toolName: string) {
+    if (!canEditSelectedWorkflow || !selectedWorkflow || !selectedWorkflowNodeIsAgent) return;
+    setSelectedWorkflow(updateAgentNodeMcpTool(selectedWorkflow, selectedWorkflowNodeKey, serverId, toolName, false));
+  }
+
+  function removeAllOrphanedMcpTools() {
+    if (!canEditSelectedWorkflow || !selectedWorkflow) return;
+    setSelectedWorkflow(pruneOrphanedMcpTools(selectedWorkflow, externalMcpServers));
   }
 
   function updateAgentConfig(key: keyof AgentNodeModel, value: string | number) {
@@ -1592,6 +1745,17 @@ function App() {
           </div>
         ) : null}
         {!selectedWorkflowPublished ? <div className="inline-alert">该 Workflow 尚未发布，发布后才能聊天或通过 MCP 调用。</div> : null}
+        {selectedWorkflowOrphanedMcpTools.length ? (
+          <div className="orphan-workflow-alert">
+            <div className="inline-alert warning">
+              This workflow has {selectedWorkflowOrphanedMcpTools.length} MCP tool reference
+              {selectedWorkflowOrphanedMcpTools.length > 1 ? "s" : ""} whose external server no longer exists.
+            </div>
+            <button className="ghost-danger-button" type="button" onClick={removeAllOrphanedMcpTools}>
+              <Trash2 size={14} /> Remove all invalid MCP tools
+            </button>
+          </div>
+        ) : null}
         <div className="workflow-board">
           {workflowNodes.map((node, index) => {
             const id = getWorkflowNodeId(node, index);
@@ -1884,6 +2048,29 @@ function App() {
           <p className="muted-copy">平台暂未返回内置工具 catalog。</p>
         )}
         <div className="field-section-title">外部 MCP 工具</div>
+        {orphanedAgentMcpTools.length ? (
+          <div className="orphan-tool-list">
+            <div className="inline-alert warning">
+              This agent references MCP tools whose external server was deleted or is unavailable. Remove them before
+              saving the workflow.
+            </div>
+            {orphanedAgentMcpTools.map((tool) => (
+              <div className="orphan-tool-row" key={buildMcpToolKey(tool.server_id, tool.name)}>
+                <span>
+                  <strong>{tool.name}</strong>
+                  <small>Missing server: {tool.server_id}</small>
+                </span>
+                <button
+                  className="ghost-danger-button"
+                  type="button"
+                  onClick={() => removeOrphanedMcpTool(tool.server_id, tool.name)}
+                >
+                  <Trash2 size={14} /> Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {visibleExternalMcpServers.length === 0 ? <p className="muted-copy">先到 MCP 页面注册并同步外部 Server。</p> : null}
         {visibleExternalMcpServers.map((server) => {
           const serverTools = getExternalServerTools(server);
@@ -2487,10 +2674,47 @@ function App() {
                 />
               </label>
             ) : null}
+            <div className="header-editor">
+              <div className="field-row-title">
+                <span>Custom Headers</span>
+                <div className="heading-actions compact">
+                  <button className="secondary-button" type="button" onClick={addExternalHeader}>
+                    <Plus size={14} /> Add
+                  </button>
+                  <button className="ghost-danger-button" type="button" disabled={!externalMcpDraft.custom_headers.length} onClick={clearExternalHeaders}>
+                    Clear
+                  </button>
+                </div>
+              </div>
+              {externalMcpDraft.custom_headers.map((header, index) => (
+                <div className="header-row" key={`${header.name}-${index}`}>
+                  <input
+                    placeholder="x-api-key"
+                    value={header.name}
+                    onChange={(event) => updateExternalHeader(index, { name: event.target.value })}
+                  />
+                  <input
+                    type="password"
+                    placeholder={header.saved ? "Saved value hidden; enter a new value to replace" : "Header value"}
+                    value={header.value}
+                    onChange={(event) => updateExternalHeader(index, { value: event.target.value })}
+                  />
+                  <button className="icon-danger-button" type="button" title="Remove header" onClick={() => removeExternalHeader(index)}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+              {!externalMcpDraft.custom_headers.length ? <p className="muted-copy">No custom headers configured.</p> : null}
+              {externalMcpDraft.custom_headers.some((header) => header.saved) ? (
+                <p className="muted-copy">Saved header values are hidden. Editing this section replaces the saved header set.</p>
+              ) : null}
+            </div>
             {selectedExternalMcpServer ? (
               <div className="readonly-card">
                 <small>同步状态</small>
                 <strong>{selectedExternalMcpServer.status}</strong>
+                <small>Headers: {selectedExternalMcpServer.custom_header_names?.length ? selectedExternalMcpServer.custom_header_names.join(", ") : "none"}</small>
+                <small>Session: {selectedExternalMcpServer.has_mcp_session ? "active" : "none"}</small>
                 <small>Last sync：{formatTimestamp(selectedExternalMcpServer.last_sync_at)}</small>
               </div>
             ) : null}

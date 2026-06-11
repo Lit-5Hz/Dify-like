@@ -37,13 +37,23 @@ def register_mcp_tools(
 
                 started = perf_counter()
                 try:
-                    output = await call_mcp_tool( # Actually call the remote MCP tool
-                        str(_spec.get("server_url") or ""),
-                        str(_spec.get("auth_type") or "none"),
-                        str(_spec.get("name") or ""),
-                        kwargs,
-                        str(_spec.get("auth_secret") or ""),
-                    )
+                    db = _spec.get("db")
+                    server_id = str(_spec.get("server_id") or "")
+                    tool_name = str(_spec.get("name") or "")
+                    if db is not None and server_id:
+                        from app.services.external_mcp_server_service import call_external_mcp_tool_with_session_retry
+
+                        output = await call_external_mcp_tool_with_session_retry(db, server_id, tool_name, kwargs)
+                    else:
+                        output = await call_mcp_tool(
+                            str(_spec.get("server_url") or ""),
+                            str(_spec.get("auth_type") or "none"),
+                            tool_name,
+                            kwargs,
+                            str(_spec.get("auth_secret") or ""),
+                            _spec.get("custom_headers") if isinstance(_spec.get("custom_headers"), dict) else {},
+                            str(_spec.get("session_id") or ""),
+                        )
                 except Exception as exc:
                     output = {"error": str(exc)}
                 event = { # Record trace

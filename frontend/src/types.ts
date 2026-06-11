@@ -110,6 +110,9 @@ export type ExternalMcpServerItem = {
   server_url: string;
   auth_type: string;
   has_auth_secret: boolean;
+  has_custom_headers: boolean;
+  custom_header_names: string[];
+  has_mcp_session: boolean;
   status: string;
   last_sync_at: string | null;
   last_sync_error: string;

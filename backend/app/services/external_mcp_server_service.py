@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -7,8 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.credential_crypto import decrypt_secret, encrypt_secret
-from app.db.models import ExternalMcpServer
-from app.mcp.client import initialize_mcp_server, list_mcp_tools
+from app.db.models import App, ExternalMcpServer, Workflow
+from app.mcp.client import call_mcp_tool, initialize_mcp_server, is_session_error, list_mcp_tools
 from app.schemas import ExternalMcpServerCreate, ExternalMcpServerUpdate
 from app.services.agent_tool_spec import normalize_agent_tools
 
@@ -29,6 +31,14 @@ SUPPORTED_AUTH_TYPES:
 """
 SUPPORTED_TRANSPORT_TYPES = {"streamable_http"}
 SUPPORTED_AUTH_TYPES = {"none", "bearer"}
+RESERVED_CUSTOM_HEADER_NAMES = {
+    "accept",
+    "content-length",
+    "content-type",
+    "host",
+    "mcp-protocol-version",
+}
+HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
 
 def list_external_mcp_servers(db: Session, owner_user_id: str) -> list[ExternalMcpServer]:
@@ -67,6 +77,7 @@ def create_external_mcp_server(
         raise ValueError("MCP server URL is required.")
     if auth_type == "bearer" and not payload.auth_secret.strip():
         raise ValueError("Bearer auth requires an auth secret.")
+    custom_headers = normalize_custom_headers(payload.custom_headers, auth_type)
 
     server = ExternalMcpServer(
         owner_user_id=owner_user_id,
@@ -76,6 +87,7 @@ def create_external_mcp_server(
         server_url=server_url,
         auth_type=auth_type,
         encrypted_auth_secret=_encrypt_optional_secret(payload.auth_secret),
+        encrypted_headers_json=_encrypt_headers_json(custom_headers),
         status="pending_sync",
         tool_manifest_json={"tools": []},
     )
@@ -114,37 +126,65 @@ def update_external_mcp_server(
     if "auth_secret" in values and values["auth_secret"] is not None:
         server.encrypted_auth_secret = _encrypt_optional_secret(values["auth_secret"])
         needs_resync = True
+    if "custom_headers" in values and values["custom_headers"] is not None:
+        server.encrypted_headers_json = _encrypt_headers_json(
+            normalize_custom_headers(values["custom_headers"], server.auth_type)
+        )
+        needs_resync = True
     if server.auth_type == "none":
         server.encrypted_auth_secret = ""
     if server.auth_type == "bearer" and not server.encrypted_auth_secret:
         raise ValueError("Bearer auth requires an auth secret.")
+    normalize_custom_headers(resolve_external_mcp_custom_headers(server), server.auth_type)
     if needs_resync:
         server.status = "pending_sync"
         server.last_sync_at = None
         server.last_sync_error = ""
         server.tool_manifest_json = {"tools": []}
+        server.mcp_session_id = ""
     db.commit()
     db.refresh(server)
     return server
 
 
-def delete_external_mcp_server(db: Session, server: ExternalMcpServer) -> None:
+def delete_external_mcp_server(db: Session, server: ExternalMcpServer) -> int:
+    removed_references = remove_external_mcp_server_from_workflow_drafts(db, server.owner_user_id, server.id)
     db.delete(server)
     db.commit()
+    return removed_references
+
+
+def remove_external_mcp_server_from_workflow_drafts(db: Session, owner_user_id: str, server_id: str) -> int:
+    removed_references = 0
+    rows = db.scalars(
+        select(Workflow)
+        .join(App, App.id == Workflow.app_id)
+        .where(App.owner_user_id == owner_user_id)
+    )
+    for workflow in rows:
+        next_spec, removed = _remove_external_mcp_server_from_spec(workflow.draft_spec, server_id)
+        if removed:
+            workflow.draft_spec = next_spec
+            removed_references += removed
+    return removed_references
 
 
 async def refresh_external_mcp_server_tool_manifest(db: Session, server: ExternalMcpServer) -> ExternalMcpServer:
     """
-        → Adjust the remote initialization
-        → Adjust remote tools/list.
-        → Save the tool list returned from the remote end to tool_manifest_json.
-        → Update status/last_sync_at/last_sync_error.
-        → Return to the updated ExternalMcpServer.
+    Initialize the remote MCP server, refresh tools/list, and persist sync status.
     """
     try:
         auth_secret = resolve_external_mcp_auth_secret(server)
-        await initialize_mcp_server(server.server_url, server.auth_type, auth_secret)
-        tools = await list_mcp_tools(server.server_url, server.auth_type, auth_secret)
+        custom_headers = resolve_external_mcp_custom_headers(server)
+        init_response = await initialize_mcp_server(server.server_url, server.auth_type, auth_secret, custom_headers)
+        server.mcp_session_id = init_response.session_id
+        tools = await list_mcp_tools(
+            server.server_url,
+            server.auth_type,
+            auth_secret,
+            custom_headers,
+            server.mcp_session_id,
+        )
         server.tool_manifest_json = {"tools": tools}
         server.status = "active"
         server.last_sync_error = ""
@@ -182,6 +222,59 @@ def resolve_external_mcp_auth_secret(server: ExternalMcpServer) -> str:
     return decrypt_secret(server.encrypted_auth_secret)
 
 
+def resolve_external_mcp_custom_headers(server: ExternalMcpServer) -> dict[str, str]:
+    encrypted = str(server.encrypted_headers_json or "").strip()
+    if not encrypted:
+        return {}
+    try:
+        decoded = decrypt_secret(encrypted)
+        parsed = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Unable to decrypt stored MCP custom headers.") from exc
+    return normalize_custom_headers(parsed, server.auth_type)
+
+
+async def call_external_mcp_tool_with_session_retry(
+    db: Session,
+    server_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    server = db.get(ExternalMcpServer, server_id)
+    if not server:
+        raise ValueError(f"External MCP server not found: {server_id}")
+
+    auth_secret = resolve_external_mcp_auth_secret(server)
+    custom_headers = resolve_external_mcp_custom_headers(server)
+    try:
+        return await call_mcp_tool(
+            server.server_url,
+            server.auth_type,
+            tool_name,
+            arguments,
+            auth_secret,
+            custom_headers,
+            server.mcp_session_id,
+        )
+    except ValueError as exc:
+        if not is_session_error(exc):
+            raise
+
+    init_response = await initialize_mcp_server(server.server_url, server.auth_type, auth_secret, custom_headers)
+    server.mcp_session_id = init_response.session_id
+    db.commit()
+    db.refresh(server)
+    return await call_mcp_tool(
+        server.server_url,
+        server.auth_type,
+        tool_name,
+        arguments,
+        auth_secret,
+        custom_headers,
+        server.mcp_session_id,
+    )
+
+
 def resolve_agent_mcp_tool_runtime_specs(
     db: Session,
     owner_user_id: str,
@@ -209,6 +302,9 @@ def resolve_agent_mcp_tool_runtime_specs(
                 "server_url": server.server_url,
                 "auth_type": server.auth_type,
                 "auth_secret": resolve_external_mcp_auth_secret(server),
+                "custom_headers": resolve_external_mcp_custom_headers(server),
+                "session_id": server.mcp_session_id,
+                "db": db,
                 "name": str(manifest_tool.get("name") or tool["name"]),
                 "description": str(manifest_tool.get("description") or ""),
                 "input_schema": manifest_tool.get("input_schema")
@@ -229,6 +325,9 @@ def external_mcp_server_to_out(server: ExternalMcpServer) -> dict[str, Any]:
         "server_url": server.server_url,
         "auth_type": server.auth_type,
         "has_auth_secret": bool(server.encrypted_auth_secret),
+        "has_custom_headers": bool(server.encrypted_headers_json),
+        "custom_header_names": list(resolve_external_mcp_custom_headers(server).keys()),
+        "has_mcp_session": bool(server.mcp_session_id),
         "status": server.status,
         "last_sync_at": server.last_sync_at,
         "last_sync_error": server.last_sync_error,
@@ -257,3 +356,84 @@ def _encrypt_optional_secret(value: str | None) -> str:
     if not secret:
         return ""
     return encrypt_secret(secret)
+
+
+def normalize_custom_headers(value: Any, auth_type: str = "none") -> dict[str, str]:
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("MCP custom headers must be an object.")
+    headers: dict[str, str] = {}
+    seen: set[str] = set()
+    normalized_auth_type = str(auth_type or "none").strip().lower()
+    for raw_name, raw_value in value.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            raise ValueError("MCP custom header name is required.")
+        lower_name = name.lower()
+        if lower_name in seen:
+            raise ValueError(f"Duplicate MCP custom header: {name}")
+        if not HEADER_NAME_PATTERN.match(name):
+            raise ValueError(f"Invalid MCP custom header name: {name}")
+        if lower_name in RESERVED_CUSTOM_HEADER_NAMES:
+            raise ValueError(f"MCP custom header is reserved: {name}")
+        if normalized_auth_type == "bearer" and lower_name == "authorization":
+            raise ValueError("Authorization custom header is not allowed when bearer auth is enabled.")
+        if not isinstance(raw_value, str):
+            raise ValueError(f"MCP custom header value must be a string: {name}")
+        headers[name] = raw_value.strip()
+        seen.add(lower_name)
+    return headers
+
+
+def _encrypt_headers_json(headers: dict[str, str]) -> str:
+    if not headers:
+        return ""
+    return encrypt_secret(json.dumps(headers, ensure_ascii=False, sort_keys=True))
+
+
+def _remove_external_mcp_server_from_spec(workflow_spec: Any, server_id: str) -> tuple[dict[str, Any], int]:
+    if not isinstance(workflow_spec, dict):
+        return {}, 0
+    nodes = workflow_spec.get("nodes")
+    if not isinstance(nodes, list):
+        return dict(workflow_spec), 0
+
+    removed = 0
+    next_nodes: list[Any] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            next_nodes.append(node)
+            continue
+        tools = node.get("tools")
+        if not isinstance(tools, list):
+            next_nodes.append(node)
+            continue
+
+        next_tools: list[Any] = []
+        for tool in tools:
+            if _tool_references_external_mcp_server(tool, server_id):
+                removed += 1
+                continue
+            next_tools.append(tool)
+
+        next_node = dict(node)
+        next_node["tools"] = next_tools
+        next_nodes.append(next_node)
+
+    if not removed:
+        return dict(workflow_spec), 0
+    next_spec = dict(workflow_spec)
+    next_spec["nodes"] = next_nodes
+    return next_spec, removed
+
+
+def _tool_references_external_mcp_server(tool: Any, server_id: str) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if str(tool.get("type") or "").strip() != "mcp":
+        return False
+    config = tool.get("config")
+    if not isinstance(config, dict):
+        return False
+    return str(config.get("server_id") or "").strip() == server_id

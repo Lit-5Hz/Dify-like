@@ -187,7 +187,8 @@ export const api = {
     transport_type: string;
     server_url: string;
     auth_type: string;
-    auth_secret: string;
+    auth_secret?: string;
+    custom_headers?: Record<string, string>;
   }) =>
     request<ExternalMcpServerItem>("/mcp/servers", {
       method: "POST",
@@ -203,6 +204,7 @@ export const api = {
       server_url: string;
       auth_type: string;
       auth_secret: string;
+      custom_headers: Record<string, string>;
     }>,
   ) =>
     request<ExternalMcpServerItem>(`/mcp/servers/${serverId}`, {

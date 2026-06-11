@@ -208,6 +208,8 @@ class ExternalMcpServer(Base):
     server_url: Mapped[str] = mapped_column(Text, nullable=False)
     auth_type: Mapped[str] = mapped_column(String(32), default="none")
     encrypted_auth_secret: Mapped[str] = mapped_column(Text, default="")
+    encrypted_headers_json: Mapped[str] = mapped_column(Text, default="")
+    mcp_session_id: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_error: Mapped[str] = mapped_column(Text, default="")

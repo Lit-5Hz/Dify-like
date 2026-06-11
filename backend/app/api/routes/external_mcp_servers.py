@@ -83,8 +83,8 @@ def delete(
     server = get_external_mcp_server(db, server_id, current_user.id)
     if not server:
         raise HTTPException(status_code=404, detail="External MCP server not found")
-    delete_external_mcp_server(db, server)
-    return {"ok": True}
+    removed_references = delete_external_mcp_server(db, server)
+    return {"ok": True, "removed_workflow_draft_tool_references": removed_references}
 
 
 @router.post("/{server_id}/sync", response_model=ExternalMcpServerOut)
