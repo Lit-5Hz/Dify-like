@@ -27,7 +27,7 @@ import {
   UserRound,
   Wrench,
 } from "lucide-react";
-import { api, streamChat } from "./api";
+import { api, downloadSkill, streamChat } from "./api";
 import type {
   AppItem,
   ChatMessage,
@@ -35,6 +35,8 @@ import type {
   KnowledgeBase,
   KnowledgeDocument,
   ModelCredential,
+  PlatformAssistantChatResponse,
+  PlatformSkillItem,
   RunItem,
   RunStepItem,
   ToolItem,
@@ -55,7 +57,7 @@ const MCP_AUTH_TYPES = ["none", "bearer", "oauth2"];
 const NEW_EXTERNAL_MCP_SERVER_ID = "__new_external_mcp_server__";
 const PROCESSING_DOCUMENT_STATUSES = new Set(["queued", "parsing", "chunking", "embedding"]);
 
-type NavView = "workspace" | "knowledge" | "credentials";
+type NavView = "workspace" | "assistant" | "skills" | "knowledge" | "credentials";
 type AppView = "studio" | "mcp" | "logs";
 type AuthAction = "login" | "register";
 type WorkflowNode = Record<string, unknown>;
@@ -138,6 +140,8 @@ type ExternalMcpServerDraft = {
 };
 
 const NAV_ITEMS: Array<{ id: NavView; label: string; description: string; icon: React.ElementType }> = [
+  { id: "assistant", label: "平台助手", description: "Build App", icon: MessageSquare },
+  { id: "skills", label: "私有 Skills", description: "Private Skills", icon: FileText },
   { id: "workspace", label: "工作室", description: "Apps", icon: Bot },
   { id: "knowledge", label: "知识库", description: "Knowledge Bases", icon: Database },
   { id: "credentials", label: "模型凭证", description: "Provider Keys", icon: KeyRound },
@@ -530,6 +534,17 @@ function App() {
   const [knowledgeDocuments, setKnowledgeDocuments] = useState<KnowledgeDocument[]>([]);
   const [knowledgeDraft, setKnowledgeDraft] = useState({ name: "", description: "" });
   const [tools, setTools] = useState<ToolItem[]>([]);
+  const [platformSkills, setPlatformSkills] = useState<PlatformSkillItem[]>([]);
+  const [publishedPlatformSkills, setPublishedPlatformSkills] = useState<PlatformSkillItem[]>([]);
+  const [assistantPrompt, setAssistantPrompt] = useState("");
+  const [assistantConversationId, setAssistantConversationId] = useState<string | null>(null);
+  const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>([]);
+  const [assistantSelectedSkillIds, setAssistantSelectedSkillIds] = useState<string[]>([]);
+  const [assistantResponse, setAssistantResponse] = useState<PlatformAssistantChatResponse | null>(null);
+  const [assistantBusy, setAssistantBusy] = useState(false);
+  const [assistantApplyBusy, setAssistantApplyBusy] = useState(false);
+  const [skillFeedback, setSkillFeedback] = useState("");
+  const [skillNameDraft, setSkillNameDraft] = useState("");
   const [externalMcpServers, setExternalMcpServers] = useState<ExternalMcpServerItem[]>([]);
   const [selectedExternalMcpServerId, setSelectedExternalMcpServerId] = useState("");
   const [syncingExternalMcpServerId, setSyncingExternalMcpServerId] = useState("");
@@ -605,6 +620,10 @@ function App() {
     () => getOrphanedAgentMcpTools(selectedWorkflowNode, externalMcpServers),
     [externalMcpServers, selectedWorkflowNode],
   );
+  const visibleAssistantSkills = useMemo(
+    () => [...platformSkills, ...publishedPlatformSkills.filter((skill) => !platformSkills.some((item) => item.id === skill.id))],
+    [platformSkills, publishedPlatformSkills],
+  );
 
   function setActiveConversationId(nextConversationId: string | null) {
     conversationIdRef.current = nextConversationId;
@@ -632,6 +651,15 @@ function App() {
     setSelectedKnowledgeBaseId("");
     setKnowledgeDocuments([]);
     setTools([]);
+    setPlatformSkills([]);
+    setPublishedPlatformSkills([]);
+    setAssistantPrompt("");
+    setAssistantConversationId(null);
+    setAssistantMessages([]);
+    setAssistantSelectedSkillIds([]);
+    setAssistantResponse(null);
+    setSkillFeedback("");
+    setSkillNameDraft("");
     setExternalMcpServers([]);
     setSelectedExternalMcpServerId("");
     setSyncingExternalMcpServerId("");
@@ -761,18 +789,22 @@ function App() {
 
   async function refresh(preferredAppId?: string | null, preferredWorkflowId?: string | null) {
     if (!user) return;
-    const [appList, toolList, credentialList, kbList, mcpServerList] = await Promise.all([
+    const [appList, toolList, credentialList, kbList, mcpServerList, skillList, publicSkillList] = await Promise.all([
       api.listApps(),
       api.listTools(),
       api.listModelCredentials(),
       api.listKnowledgeBases(),
       api.listExternalMcpServers(),
+      api.listSkills(),
+      api.listPlatformSkills(),
     ]);
     setApps(appList);
     setTools(toolList);
     setCredentials(credentialList);
     setKnowledgeBases(kbList);
     setExternalMcpServers(mcpServerList);
+    setPlatformSkills(skillList);
+    setPublishedPlatformSkills(publicSkillList);
     if (!selectedKnowledgeBaseId && kbList[0]) {
       setSelectedKnowledgeBaseId(kbList[0].id);
     }
@@ -1018,6 +1050,154 @@ function App() {
       setNotice("Workflow 已创建。");
     } catch (error) {
       setNotice(`创建 Workflow 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function toggleAssistantSkill(skillId: string) {
+    setAssistantSelectedSkillIds((current) =>
+      current.includes(skillId) ? current.filter((id) => id !== skillId) : [...current, skillId],
+    );
+  }
+
+  function startNewAssistantConversation() {
+    setAssistantConversationId(null);
+    setAssistantMessages([]);
+    setAssistantResponse(null);
+    setAssistantPrompt("");
+  }
+
+  async function askPlatformAssistant() {
+    const message = assistantPrompt.trim();
+    if (!message) {
+      setNotice("请输入你想创建的 workflow app 需求。");
+      return;
+    }
+    try {
+      setAssistantBusy(true);
+      const response = await api.platformAssistantChat({
+        message,
+        conversation_id: assistantConversationId,
+        skill_ids: assistantSelectedSkillIds,
+      });
+      setAssistantConversationId(response.conversation_id);
+      setAssistantMessages(response.messages);
+      setAssistantResponse(response);
+      setAssistantPrompt("");
+      if (response.created_app && response.created_workflow) {
+        await refresh(response.created_app.id, response.created_workflow.id);
+        setActiveView("workspace");
+        setActiveAppView("studio");
+        setNotice("平台助手已根据确认创建 app。");
+      } else {
+        setNotice("平台助手已更新草稿。");
+      }
+    } catch (error) {
+      setNotice(`平台助手失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setAssistantBusy(false);
+    }
+  }
+
+  async function applyAssistantSuggestion() {
+    const workflow = assistantResponse?.suggested_workflow ?? {};
+    const draftSpec = isRecord(workflow.draft_spec) ? workflow.draft_spec : null;
+    if (!assistantResponse || !draftSpec) {
+      setNotice("请先让平台助手生成可写入的 workflow draft。");
+      return;
+    }
+    try {
+      setAssistantApplyBusy(true);
+      const appName = String(assistantResponse.suggested_app.name ?? "Assisted Workflow App");
+      const workflowName = String(workflow.name ?? "Assisted Workflow");
+      const result = await api.platformAssistantApply({
+        app_name: appName,
+        app_description: String(assistantResponse.suggested_app.description ?? ""),
+        workflow_name: workflowName,
+        workflow_description: String(workflow.description ?? ""),
+        draft_spec: draftSpec,
+      });
+      await refresh(result.app.id, result.workflow.id);
+      setActiveView("workspace");
+      setActiveAppView("studio");
+      setNotice("平台助手已创建 app 并写入 workflow draft。");
+    } catch (error) {
+      setNotice(`创建 app 失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setAssistantApplyBusy(false);
+    }
+  }
+
+  async function synthesizeSelectedRunSkill() {
+    if (!selectedRunId) {
+      setNotice("请先选择一条 run。");
+      return;
+    }
+    try {
+      setBusy(true);
+      const skill = await api.synthesizeSkill({
+        run_id: selectedRunId,
+        feedback: skillFeedback,
+        skill_name: skillNameDraft || undefined,
+      });
+      setPlatformSkills(await api.listSkills());
+      setSkillFeedback("");
+      setSkillNameDraft("");
+      setNotice(`已沉淀私有 skill：${skill.name}`);
+    } catch (error) {
+      setNotice(`沉淀 skill 失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deletePrivateSkill(skillId: string) {
+    if (!window.confirm("确定删除这个私有 skill 吗？")) return;
+    try {
+      await api.deleteSkill(skillId);
+      setPlatformSkills(await api.listSkills());
+      setAssistantSelectedSkillIds((current) => current.filter((id) => id !== skillId));
+      setNotice("Skill 已删除。");
+    } catch (error) {
+      setNotice(`删除 skill 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function downloadPrivateSkill(skill: PlatformSkillItem) {
+    try {
+      const blob = await downloadSkill(skill.id);
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${skill.name.replace(/[^\p{L}\p{N}._-]+/gu, "_")}-${skill.id.slice(0, 8)}.zip`;
+      anchor.click();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      setNotice(`下载 skill 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function publishPrivateSkill(skill: PlatformSkillItem) {
+    if (!window.confirm("发布后 skill 文件夹快照会对平台用户可见，包括 references/ 内容。确认发布吗？")) return;
+    try {
+      await api.publishSkill(skill.id);
+      const [privateList, publicList] = await Promise.all([api.listSkills(), api.listPlatformSkills()]);
+      setPlatformSkills(privateList);
+      setPublishedPlatformSkills(publicList);
+      setNotice(`Skill 已发布为平台 skill：${skill.name}`);
+    } catch (error) {
+      setNotice(`发布 skill 失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function revokePlatformSkill(skill: PlatformSkillItem) {
+    if (!window.confirm("确认撤回这个平台 skill 吗？撤回后其他用户不会再检索到它。")) return;
+    try {
+      await api.revokeSkill(skill.id);
+      setPublishedPlatformSkills(await api.listPlatformSkills());
+      setAssistantSelectedSkillIds((current) => current.filter((id) => id !== skill.id));
+      setNotice(`平台 skill 已撤回：${skill.name}`);
+    } catch (error) {
+      setNotice(`撤回 skill 失败：${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1614,6 +1794,370 @@ function App() {
         <strong>{title}</strong>
         <span>{detail}</span>
         {action}
+      </div>
+    );
+  }
+
+  function renderPlatformAssistantView() {
+    const suggestedWorkflow = assistantResponse?.suggested_workflow ?? {};
+    const draftSpec = isRecord(suggestedWorkflow.draft_spec) ? suggestedWorkflow.draft_spec : null;
+    return (
+      <div className="assistant-layout">
+        <section className="work-panel assistant-chat-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Platform Assistant</span>
+              <h2>辅助建立 workflow app</h2>
+            </div>
+            <span className="badge muted">isolated</span>
+          </div>
+          <label>
+            需求
+            <textarea
+              rows={5}
+              placeholder="描述你想创建的 app、输入输出、需要参考的流程或限制。"
+              value={assistantPrompt}
+              onChange={(event) => setAssistantPrompt(event.target.value)}
+            />
+          </label>
+          <div className="heading-actions">
+            <button className="primary-button" disabled={assistantBusy} onClick={askPlatformAssistant}>
+              {assistantBusy ? <Loader2 className="spin" size={15} /> : <Send size={15} />}
+              生成建议
+            </button>
+            <button className="secondary-button" disabled={!draftSpec || assistantApplyBusy} onClick={applyAssistantSuggestion}>
+              {assistantApplyBusy ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+              创建 App
+            </button>
+          </div>
+          {assistantResponse ? (
+            <div className="assistant-answer">
+              <div className="heading-actions compact">
+                <span className={assistantResponse.model_status === "model" ? "badge success" : "badge warning"}>
+                  {assistantResponse.model_status === "model" ? "model" : "basic"}
+                </span>
+                {assistantResponse.model_message ? <small>{assistantResponse.model_message}</small> : null}
+              </div>
+              <pre>{assistantResponse.answer}</pre>
+            </div>
+          ) : (
+            renderEmptyState("等待需求", "平台助手会推荐已发布 workflow，并渐进式加载你的私有 skill。")
+          )}
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Private Skills</span>
+              <h2>渐进式加载</h2>
+            </div>
+            <span className="badge muted">{visibleAssistantSkills.length}</span>
+          </div>
+          <div className="stack-list roomy">
+            {visibleAssistantSkills.map((skill) => (
+              <button
+                className={assistantSelectedSkillIds.includes(skill.id) ? "list-card active" : "list-card"}
+                key={skill.id}
+                onClick={() => toggleAssistantSkill(skill.id)}
+              >
+                <span className="list-card-main">
+                  <strong>{skill.name}</strong>
+                  <small>{skill.description || `v${skill.version}`}</small>
+                </span>
+                <span className="badge muted">{assistantSelectedSkillIds.includes(skill.id) ? "selected" : skill.visibility}</span>
+              </button>
+            ))}
+            {!visibleAssistantSkills.length ? <p className="muted-copy">暂无可用 skill。可以从运行日志中沉淀私有 skill，或发布平台 skill。</p> : null}
+          </div>
+          {assistantResponse?.loaded_skills.length ? (
+            <div className="table-list">
+              {assistantResponse.loaded_skills.map((skill) => (
+                <div className="step-card" key={skill.skill_id}>
+                  <div className="step-heading">
+                    <strong>{skill.name}</strong>
+                    <span className="badge success">{skill.visibility} v{skill.version}</span>
+                  </div>
+                  <small>{skill.load_stages.join(" -> ")} · {skill.match_summary || `score=${skill.score.toFixed(3)}`}</small>
+                  <small>{skill.loaded_files.join(", ")}</small>
+                  <p className="muted-copy">{skill.summary}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Draft</span>
+              <h2>建议草稿</h2>
+            </div>
+          </div>
+          {assistantResponse?.recommendations.length ? (
+            <div className="table-list">
+              {assistantResponse.recommendations.map((item) => (
+                <div className="step-card" key={item.workflow_id}>
+                  <div className="step-heading">
+                    <strong>{item.workflow_name}</strong>
+                    <span className="badge muted">{item.app_name}</span>
+                  </div>
+                  <small>{item.description || `Workflow ${shortId(item.workflow_id)}`}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <pre className="trace-json">{draftSpec ? JSON.stringify(draftSpec, null, 2) : "暂无 workflow draft"}</pre>
+        </section>
+      </div>
+    );
+  }
+
+  function renderConversationalPlatformAssistantView() {
+    const suggestedWorkflow = assistantResponse?.suggested_workflow ?? {};
+    const draftSpec = isRecord(suggestedWorkflow.draft_spec) ? suggestedWorkflow.draft_spec : null;
+    const explanation = assistantResponse?.draft_explanation ?? {};
+    const explanationNodes = Array.isArray(explanation.nodes) ? explanation.nodes.filter(isRecord) : [];
+    const explanationBranches = Array.isArray(explanation.branches) ? explanation.branches.filter(isRecord) : [];
+    return (
+      <div className="assistant-layout">
+        <section className="work-panel assistant-chat-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Platform Assistant</span>
+              <h2>辅助建立 workflow app</h2>
+            </div>
+            <div className="heading-actions compact">
+              <span className="badge muted">isolated</span>
+              <button className="secondary-button" onClick={startNewAssistantConversation}>
+                <Plus size={14} /> 新对话
+              </button>
+            </div>
+          </div>
+          <div className="assistant-thread">
+            {assistantMessages.map((message, index) => (
+              <div className={`message ${message.role}`} key={`${message.role}-${index}`}>
+                <span>{message.content}</span>
+              </div>
+            ))}
+            {!assistantMessages.length ? renderEmptyState("等待需求", "你可以连续对话来调整草稿，最后直接说“确认创建”。") : null}
+          </div>
+          <label>
+            需求
+            <textarea
+              rows={4}
+              placeholder="描述你想创建的 app；也可以继续说要修改哪里，或直接说“确认创建”。Ctrl+Enter 发送。"
+              value={assistantPrompt}
+              onChange={(event) => setAssistantPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault();
+                  askPlatformAssistant();
+                }
+              }}
+            />
+          </label>
+          <div className="heading-actions">
+            <button className="primary-button" disabled={assistantBusy} onClick={askPlatformAssistant}>
+              {assistantBusy ? <Loader2 className="spin" size={15} /> : <Send size={15} />}
+              发送
+            </button>
+            <button className="secondary-button" disabled={!draftSpec || assistantApplyBusy} onClick={applyAssistantSuggestion}>
+              {assistantApplyBusy ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+              创建 App
+            </button>
+          </div>
+          {assistantResponse ? (
+            <div className="assistant-answer">
+              <div className="heading-actions compact">
+                <span className={assistantResponse.model_status === "model" ? "badge success" : "badge warning"}>
+                  {assistantResponse.model_status === "model" ? "model" : "basic"}
+                </span>
+                {assistantResponse.model_message ? <small>{assistantResponse.model_message}</small> : null}
+              </div>
+            </div>
+          ) : null}
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Private Skills</span>
+              <h2>渐进式加载</h2>
+            </div>
+            <span className="badge muted">{visibleAssistantSkills.length}</span>
+          </div>
+          <div className="stack-list roomy">
+            {visibleAssistantSkills.map((skill) => (
+              <button
+                className={assistantSelectedSkillIds.includes(skill.id) ? "list-card active" : "list-card"}
+                key={skill.id}
+                onClick={() => toggleAssistantSkill(skill.id)}
+              >
+                <span className="list-card-main">
+                  <strong>{skill.name}</strong>
+                  <small>{skill.description || `v${skill.version}`}</small>
+                </span>
+                <span className="badge muted">{assistantSelectedSkillIds.includes(skill.id) ? "selected" : skill.visibility}</span>
+              </button>
+            ))}
+            {!visibleAssistantSkills.length ? <p className="muted-copy">暂无可用 skill。可以从运行日志中沉淀私有 skill，或发布平台 skill。</p> : null}
+          </div>
+          {assistantResponse?.loaded_skills.length ? (
+            <div className="table-list">
+              {assistantResponse.loaded_skills.map((skill) => (
+                <div className="step-card" key={skill.skill_id}>
+                  <div className="step-heading">
+                    <strong>{skill.name}</strong>
+                    <span className="badge success">{skill.visibility} v{skill.version}</span>
+                  </div>
+                  <small>{skill.load_stages.join(" -> ")} · {skill.match_summary || `score=${skill.score.toFixed(3)}`}</small>
+                  <small>{skill.loaded_files.join(", ")}</small>
+                  <p className="muted-copy">{skill.summary}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Draft</span>
+              <h2>当前草稿</h2>
+            </div>
+          </div>
+          {explanation.summary ? <p className="muted-copy">{String(explanation.summary)}</p> : null}
+          {explanationNodes.length ? (
+            <div className="table-list">
+              {explanationNodes.map((node) => (
+                <div className="step-card" key={String(node.id)}>
+                  <div className="step-heading">
+                    <strong>{String(node.id)}</strong>
+                    <span className="badge muted">{String(node.type)}</span>
+                  </div>
+                  <small>{String(node.summary)}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {explanationBranches.length ? (
+            <details>
+              <summary>查看分支 / 连线含义</summary>
+              <div className="table-list">
+                {explanationBranches.map((branch, index) => (
+                  <div className="step-card" key={`${String(branch.from)}-${String(branch.to)}-${index}`}>
+                    <strong>{`${String(branch.from)} -> ${String(branch.to)}`}</strong>
+                    <small>{String(branch.meaning)}</small>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
+          {assistantResponse?.recommendations.length ? (
+            <div className="table-list">
+              {assistantResponse.recommendations.map((item) => (
+                <div className="step-card" key={item.workflow_id}>
+                  <div className="step-heading">
+                    <strong>{item.workflow_name}</strong>
+                    <span className="badge muted">{item.app_name}</span>
+                  </div>
+                  <small>{item.description || `Workflow ${shortId(item.workflow_id)}`}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          <pre className="trace-json">{draftSpec ? JSON.stringify(draftSpec, null, 2) : "暂无 workflow draft"}</pre>
+        </section>
+      </div>
+    );
+  }
+
+  function renderSkillsView() {
+    const authoredPlatformSkills = publishedPlatformSkills.filter((skill) => skill.owner_user_id === user?.id);
+    return (
+      <div className="skills-layout">
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Private Skill Registry</span>
+              <h2>私有 Skills</h2>
+            </div>
+            <button
+              className="secondary-button"
+              onClick={() =>
+                Promise.all([api.listSkills(), api.listPlatformSkills()])
+                  .then(([privateList, publicList]) => {
+                    setPlatformSkills(privateList);
+                    setPublishedPlatformSkills(publicList);
+                  })
+                  .catch(console.error)
+              }
+            >
+              <RefreshCw size={15} /> 刷新
+            </button>
+          </div>
+          <div className="table-list">
+            {platformSkills.map((skill) => (
+              <div className="step-card" key={skill.id}>
+                <div className="step-heading">
+                  <strong>{skill.name}</strong>
+                  <span className="badge success">{skill.status}</span>
+                </div>
+                <small>
+                  v{skill.version} · source run {shortId(skill.source_run_id)} · {formatTimestamp(skill.updated_at)}
+                </small>
+                <p className="muted-copy">{skill.description}</p>
+                <div className="heading-actions compact">
+                  <button className="secondary-button" onClick={() => downloadPrivateSkill(skill)}>
+                    <FileText size={14} /> 下载
+                  </button>
+                  <button
+                    className="secondary-button"
+                    disabled={publishedPlatformSkills.some((item) => item.source_skill_id === skill.id && item.owner_user_id === user?.id)}
+                    onClick={() => publishPrivateSkill(skill)}
+                  >
+                    <FileUp size={14} /> 发布平台
+                  </button>
+                  <button className="ghost-danger-button" onClick={() => deletePrivateSkill(skill.id)}>
+                    <Trash2 size={14} /> 删除
+                  </button>
+                </div>
+              </div>
+            ))}
+            {!platformSkills.length ? renderEmptyState("暂无私有 skill", "在运行日志中选择成功 run 后，可以显式沉淀为 skill。") : null}
+          </div>
+        </section>
+        <section className="work-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">Platform Skill Registry</span>
+              <h2>平台 Skills</h2>
+            </div>
+            <span className="badge muted">{publishedPlatformSkills.length}</span>
+          </div>
+          <div className="table-list">
+            {publishedPlatformSkills.map((skill) => (
+              <div className="step-card" key={skill.id}>
+                <div className="step-heading">
+                  <strong>{skill.name}</strong>
+                  <span className="badge success">{skill.publish_status}</span>
+                </div>
+                <small>
+                  v{skill.version} · author {shortId(skill.owner_user_id)} · used {skill.usage_count}
+                  {skill.published_at ? ` · ${formatTimestamp(skill.published_at)}` : ""}
+                </small>
+                <p className="muted-copy">{skill.description}</p>
+                {skill.owner_user_id === user?.id ? (
+                  <div className="heading-actions compact">
+                    <button className="ghost-danger-button" onClick={() => revokePlatformSkill(skill)}>
+                      <Trash2 size={14} /> 撤回
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+            {!publishedPlatformSkills.length ? renderEmptyState("暂无平台 skill", "用户主动发布后，平台 skill 会在这里显示。") : null}
+          </div>
+          {authoredPlatformSkills.length ? (
+            <p className="muted-copy">你已发布 {authoredPlatformSkills.length} 个平台 skill，可随时撤回。</p>
+          ) : null}
+        </section>
       </div>
     );
   }
@@ -2949,6 +3493,19 @@ function App() {
             </div>
             <span className="badge muted">{runs.length}</span>
           </div>
+          <div className="form-grid">
+            <label>
+              Skill 名称
+              <input value={skillNameDraft} onChange={(event) => setSkillNameDraft(event.target.value)} placeholder="留空则使用 workflow 名称" />
+            </label>
+            <label>
+              用户反馈
+              <textarea rows={3} value={skillFeedback} onChange={(event) => setSkillFeedback(event.target.value)} />
+            </label>
+            <button className="secondary-button" disabled={!selectedRunId || busy} onClick={synthesizeSelectedRunSkill}>
+              <FileText size={15} /> 沉淀为私有 skill
+            </button>
+          </div>
           <div className="stack-list roomy">
             {runs.map((run) => (
               <button className={selectedRunId === run.id ? "list-card active" : "list-card"} key={run.id} onClick={() => selectRun(run)}>
@@ -3006,6 +3563,8 @@ function App() {
 
   function renderActiveView() {
     if (activeView === "workspace") return selectedApp ? renderAppDetailView() : renderWorkspaceHome();
+    if (activeView === "assistant") return renderConversationalPlatformAssistantView();
+    if (activeView === "skills") return renderSkillsView();
     if (activeView === "knowledge") return renderKnowledgeView();
     if (activeView === "credentials") return renderCredentialsView();
     return renderWorkspaceHome();

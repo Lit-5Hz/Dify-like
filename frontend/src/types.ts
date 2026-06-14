@@ -186,3 +186,72 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
 };
+
+export type PlatformSkillItem = {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  description: string;
+  version: string;
+  status: string;
+  visibility: string;
+  publish_status: string;
+  source_skill_id: string;
+  source_app_id: string;
+  source_workflow_id: string;
+  source_run_id: string;
+  published_at: string | null;
+  revoked_at: string | null;
+  usage_count: number;
+  last_used_at: string | null;
+  metadata_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+};
+
+export type AssistantWorkflowRecommendation = {
+  workflow_id: string;
+  app_id: string;
+  app_name: string;
+  workflow_name: string;
+  description: string;
+  version_id: string;
+};
+
+export type AssistantLoadedSkill = {
+  skill_id: string;
+  name: string;
+  version: string;
+  visibility: string;
+  loaded_files: string[];
+  load_stages: string[];
+  summary: string;
+  score: number;
+  match_summary: string;
+  deferred_references: string[];
+  loaded_references: string[];
+};
+
+export type PlatformAssistantChatResponse = {
+  conversation_id: string;
+  answer: string;
+  messages: ChatMessage[];
+  recommendations: AssistantWorkflowRecommendation[];
+  loaded_skills: AssistantLoadedSkill[];
+  load_stages: Record<string, unknown>[];
+  deferred_references: Record<string, unknown>[];
+  loaded_references: Record<string, unknown>[];
+  suggested_app: Record<string, unknown>;
+  suggested_workflow: Record<string, unknown>;
+  draft_explanation: Record<string, unknown>;
+  created_app: AppItem | null;
+  created_workflow: WorkflowItem | null;
+  allowed_actions: string[];
+  model_status: string;
+  model_message: string;
+};
+
+export type PlatformAssistantApplyResponse = {
+  app: AppItem;
+  workflow: WorkflowItem;
+};

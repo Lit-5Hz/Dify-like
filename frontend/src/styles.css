@@ -1612,3 +1612,37 @@ pre {
     max-width: 94%;
   }
 }
+
+.assistant-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.1fr) minmax(280px, 0.8fr) minmax(320px, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.skills-layout {
+  max-width: 980px;
+}
+
+.assistant-chat-panel textarea {
+  min-height: 140px;
+}
+
+.assistant-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 340px;
+  overflow: auto;
+  padding: 4px;
+}
+
+.assistant-answer pre {
+  white-space: pre-wrap;
+}
+
+@media (max-width: 1180px) {
+  .assistant-layout {
+    grid-template-columns: 1fr;
+  }
+}

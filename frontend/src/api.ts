@@ -5,6 +5,9 @@ import type {
   KnowledgeDocument,
   MessageItem,
   ModelCredential,
+  PlatformAssistantApplyResponse,
+  PlatformAssistantChatResponse,
+  PlatformSkillItem,
   RunItem,
   RunStepItem,
   ExternalMcpServerItem,
@@ -253,7 +256,52 @@ export const api = {
   listWorkflowRuns: (workflowId: string) => request<RunItem[]>(`/workflows/${workflowId}/runs`),
   listRunSteps: (runId: string) => request<RunStepItem[]>(`/runs/${runId}/steps`),
   listMessages: (conversationId: string) => request<MessageItem[]>(`/conversations/${conversationId}/messages`),
+  listSkills: () => request<PlatformSkillItem[]>("/skills"),
+  listPlatformSkills: () => request<PlatformSkillItem[]>("/skills/platform"),
+  listVisibleSkills: () => request<PlatformSkillItem[]>("/skills/visible"),
+  publishSkill: (skillId: string) =>
+    request<PlatformSkillItem>(`/skills/${skillId}/publish`, {
+      method: "POST",
+    }),
+  revokeSkill: (skillId: string) =>
+    request<PlatformSkillItem>(`/skills/${skillId}/revoke`, {
+      method: "POST",
+    }),
+  deleteSkill: (skillId: string) =>
+    request<{ ok: boolean }>(`/skills/${skillId}`, {
+      method: "DELETE",
+    }),
+  synthesizeSkill: (payload: { run_id: string; feedback?: string; skill_name?: string; skill_id?: string }) =>
+    request<PlatformSkillItem>("/skills/synthesize", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  platformAssistantChat: (payload: { message: string; conversation_id?: string | null; skill_ids?: string[] }) =>
+    request<PlatformAssistantChatResponse>("/platform-assistant/chat", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  platformAssistantApply: (payload: {
+    app_name: string;
+    app_description?: string;
+    workflow_name: string;
+    workflow_description?: string;
+    draft_spec: Record<string, unknown>;
+  }) =>
+    request<PlatformAssistantApplyResponse>("/platform-assistant/apply", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };
+
+export async function downloadSkill(skillId: string) {
+  const headers = getRequestHeaders();
+  const response = await fetch(`${API_BASE}/skills/${skillId}/download`, { headers });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+  return response.blob();
+}
 
 export async function streamChat(
   workflowId: string,
