@@ -9,8 +9,10 @@ from app.api.routes import (
     knowledge_bases,
     mcp_server,
     model_credentials,
+    platform_assistant,
     retrieval,
     runs,
+    skills,
     tools,
     workflows,
 )
@@ -35,6 +37,8 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(model_credentials.router, prefix="/api")
 app.include_router(tools.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(platform_assistant.router, prefix="/api")
+app.include_router(skills.router, prefix="/api")
 app.include_router(knowledge_bases.router, prefix="/api")
 app.include_router(retrieval.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")

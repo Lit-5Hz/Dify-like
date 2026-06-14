@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     public_api_base_url: str = "http://localhost:8000"
     frontend_base_url: str = "http://localhost:5173"
 
+    platform_assistant_api_base_url: str = ""
+    platform_assistant_api_key: str = ""
+    platform_assistant_model: str = ""
+    platform_assistant_temperature: float = 0.2
+    platform_assistant_timeout_seconds: int = 30
+
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 
     @property

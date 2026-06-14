@@ -197,6 +197,78 @@ class WorkflowMcpServer(Base):
     workflow: Mapped[Workflow] = relationship(back_populates="mcp_server")
 
 
+class PlatformSkill(Base):
+    __tablename__ = "platform_skills"
+
+    id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[str] = mapped_column(String(32), default="1.0.0")
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    visibility: Mapped[str] = mapped_column(String(32), default="private", index=True)
+    publish_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    source_skill_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    storage_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_app_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    source_workflow_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    source_run_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    usage_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SkillSearchDocument(Base):
+    __tablename__ = "skill_search_documents"
+
+    id: Mapped[str] = uuid_pk()
+    skill_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("platform_skills.id", ondelete="CASCADE"), index=True)
+    visibility: Mapped[str] = mapped_column(String(32), default="private", index=True)
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    publish_status: Mapped[str] = mapped_column(String(32), default="draft", index=True)
+    tokenizer: Mapped[str] = mapped_column(String(32), default="jieba_v1")
+    index_version: Mapped[str] = mapped_column(String(64), default="skill_search_v1", index=True)
+    search_text_hash: Mapped[str] = mapped_column(String(64), default="")
+    field_tokens_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    field_token_counts_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    field_lengths_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    all_token_counts_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    doc_length: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SkillUsageEvent(Base):
+    __tablename__ = "skill_usage_events"
+
+    id: Mapped[str] = uuid_pk()
+    skill_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("platform_skills.id", ondelete="CASCADE"), index=True)
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    assistant_session_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    usage_stage: Mapped[str] = mapped_column(String(32), default="manifest", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+
+
+class PlatformAssistantSession(Base):
+    __tablename__ = "platform_assistant_sessions"
+
+    id: Mapped[str] = uuid_pk()
+    owner_user_id: Mapped[str] = mapped_column(String(120), default="anonymous", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="drafting", index=True)
+    messages_json: Mapped[list] = mapped_column(JSONB, default=list)
+    draft_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_app_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    created_workflow_id: Mapped[str] = mapped_column(String(120), default="", index=True)
+    metadata_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = now_col()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class ExternalMcpServer(Base):
     __tablename__ = "external_mcp_servers"
 
