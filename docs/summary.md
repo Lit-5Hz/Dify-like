@@ -1875,3 +1875,88 @@ PKCE 的核心。它防止别人截获 Authorization Code 后直接拿去换 tok
 一句话总结：
 
 OAuth2 + PKCE 的本质是：用户在第三方授权，你的后端用一次性的 Authorization Code 加上之前保存的 code_verifier 去换 access_token，之后你的平台用这个 access_token 调外部 MCP Server。
+
+
+## Skills
+
+## 整体逻辑、需求与流程
+
+现在需求可以收敛成这样。
+
+你要做的是一个**平台级、对话型 workflow app 搭建助手**。它是平台业务模块，负责帮用户设计 app、生成 workflow draft、解释草稿、确认后创建 app，并把成功经验沉淀成 skill。
+
+核心流程是：
+
+1. 用户和平台助手对话，说自己想做什么 app。
+2. 平台助手读取用户可见的 skill：
+   - 用户自己的私有 skill
+   - 用户或他人发布成平台可见的 platform skill
+3. SkillLoader 先做 skill 检索，不直接加载全部内容。
+4. 检索基于数据库里的 skill 搜索索引：
+   - skill name
+   - description
+   - task_patterns
+   - tags
+   - inputs
+   - outputs
+5. 这些字段用 `jieba` 分词，并用 BM25 做相关性排序。
+6. 选出相关 skill 后，才渐进式加载：
+   - 先加载 `skill.yaml`
+   - 再加载 `rules.md` 摘要和 `tool_policy.yaml`
+   - 如果用户要创建/修改 workflow，再加载 `workflow_template.json`
+   - `references/` 默认不加载，只有用户明确需要或模型请求具体文件时才读
+7. 平台助手基于对话和加载到的 skill，生成或修改 workflow draft。
+8. 平台助手要向用户解释：
+   - 当前草稿完成了什么
+   - 每个节点是什么意思
+   - 每条连线 / 分支是什么意思
+   - 还缺什么信息
+9. 用户如果不满意，可以继续对话修改草稿。
+10. 用户说“确认创建”或点击创建后，平台助手把草稿写入后端：
+   - 创建 app
+   - 创建/更新 workflow draft
+   - 经过 schema 校验和权限校验
+11. 用户运行这个 workflow，产生 run trace。
+12. 用户认为这次经验有复用价值，就显式点击“沉淀为 skill”。
+13. Skill Synthesizer 从 workflow、run trace、用户反馈中抽取：
+   - task pattern
+   - tool usage pattern
+   - decision heuristics
+   - optional workflow template
+14. 生成用户私有 skill 文件夹。
+15. 用户可以选择：
+   - 保持私有
+   - 下载
+   - 发布为平台 skill
+16. 如果发布为平台 skill：
+   - 创建平台 skill 快照
+   - 全平台用户可检索和加载
+   - 作者可以撤回
+   - 不直接暴露用户私有目录
+
+所以整体闭环是：
+
+```text
+用户对话需求
+ -> 平台助手检索 skill
+ -> 渐进式加载相关 skill
+ -> 生成/解释/修改 workflow draft
+ -> 用户确认
+ -> 创建 app + workflow
+ -> 运行产生 trace
+ -> 用户显式沉淀为私有 skill
+ -> 用户选择发布为平台 skill
+ -> 其他用户后续可检索复用
+```
+
+这里最关键的边界是：
+
+```text
+模型负责理解和建议
+SkillLoader 负责检索和渐进式加载
+后端业务逻辑负责绑定真实资源 ID
+schema/权限校验负责最终合法性
+Skill Synthesizer 只从 trace 中沉淀经验，不从单轮对话直接生成 prompt blob
+```
+
+这就是当前需求和流程。
