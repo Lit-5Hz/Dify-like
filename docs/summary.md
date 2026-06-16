@@ -1960,3 +1960,145 @@ Skill Synthesizer 只从 trace 中沉淀经验，不从单轮对话直接生成 
 ```
 
 这就是当前需求和流程。
+
+## 渐进式加载整体流程
+
+现在的渐进式加载不是“把所有 skill 文件夹一次性读进 prompt”，而是由平台助手调用独立的 `SkillLoader`，按阶段逐步扩大读取范围。
+
+入口在后端平台助手：[platform_assistant_service.py](F:/my_folder/Work/LLM/Project/Dify-like/backend/app/services/platform_assistant_service.py)。用户发消息后，它会调用 `load_skills_progressively(...)`，这个实现放在：[skill_loader_service.py](F:/my_folder/Work/LLM/Project/Dify-like/backend/app/services/skill_loader_service.py)。
+
+**实际流程**
+
+1. **Stage 0：候选发现**
+
+   后端先找当前用户可见的 skill：
+
+   - 当前用户自己的私有 skill：`visibility = private`
+   - 全平台已发布 skill：`visibility = platform AND publish_status = published`
+
+   这个阶段只使用数据库里的 skill 元数据和 `skill_search_documents` 搜索索引，不读取 `rules.md`、`tool_policy.yaml`、`workflow_template.json`、`references/`。
+
+2. **Stage 1：BM25 相关性筛选**
+
+   检索逻辑在：[platform_skill_search_service.py](F:/my_folder/Work/LLM/Project/Dify-like/backend/app/services/platform_skill_search_service.py)。
+
+   索引字段只来自轻量摘要：
+
+   - `PlatformSkill.name`
+   - `PlatformSkill.description`
+   - `skill.yaml.task_patterns`
+   - `skill.yaml.tags`
+   - `skill.yaml.inputs`
+   - `skill.yaml.outputs`
+
+   这些字段会用现有的 `tokenize_for_sparse`，也就是 `jieba_v1` 分词，然后写入数据库表 `skill_search_documents`。
+
+   查询时按字段 BM25 打分：
+
+   - `task_patterns`: `3.0`
+   - `name`: `2.5`
+   - `tags`: `2.0`
+   - `description`: `1.2`
+   - `inputs`: `1.0`
+   - `outputs`: `1.0`
+
+   用户显式选择的 skill 一定进入加载集合；非显式 skill 按 BM25 Top K，默认最多 5 个。同分时私有 skill 优先于平台 skill。
+
+3. **Stage 2：策略加载**
+
+   只对 Stage 1 选中的 skill 加载：
+
+   - `skill.yaml`
+   - `tool_policy.yaml`
+   - `rules.md` 的前 2000 字符摘要
+
+   这里的 `tool_policy.yaml` 只作为平台助手生成建议时的约束，不会变成 workflow agent node 的工具，也不会进入 MCP/runtime。
+
+4. **Stage 3：模板加载**
+
+   如果当前平台助手正在创建或修改 workflow，加载最高优先级 skill 的：
+
+   - `workflow_template.json`
+
+   代码里目前是对排序后的第一个 skill 加载 template。这个 template 会作为平台助手生成 draft 的 base template 之一，之后仍然要经过 workflow draft schema 校验和真实资源权限校验。
+
+5. **Stage 4：references 按需加载**
+
+   当前第一版默认不加载 `references/`。
+
+   `SkillLoader` 已经保留了 `reference_requests` 参数和 `load_skill_reference(...)` 逻辑，但平台助手当前还没有让模型主动返回具体 `reference_requests` 并二次加载。因此实际运行中：
+
+   - `references/` 不参与检索
+   - 默认不读 reference 文件
+   - 返回值里会有 `deferred_references`
+   - 只有后续接入“用户明确请求某个 reference / 模型请求具体文件”时才会读指定文件
+
+6. **Stage 5：使用记录**
+
+   每次加载阶段都会写入：
+
+   - `skill_usage_events`
+   - 更新 `platform_skills.usage_count`
+   - 更新 `platform_skills.last_used_at`
+
+   当前会记录的阶段包括：
+
+   - `manifest`
+   - `rules`
+   - `template`
+   - `references`，但 references 当前默认不会触发
+
+**发布后的平台 skill 如何参与加载**
+
+私有 skill 发布时不会直接暴露用户私有目录。后端会复制一份 skill 文件夹快照到：
+
+```text
+storage/skills/platform/{platform_skill_id}
+```
+
+并创建一条新的 `platform_skills` 记录：
+
+```text
+visibility = platform
+publish_status = published
+source_skill_id = 原私有 skill id
+```
+
+然后为这个平台副本生成 `skill_search_documents` 索引。
+
+所以后续其他用户对话时，SkillLoader 会把这个平台 skill 纳入候选集合，但读取的是平台快照目录，不是作者的私有 skill 目录。
+
+**平台助手拿到什么**
+
+平台助手 prompt 里现在会拿到：
+
+- `loaded_skills`
+- 每个 skill 的 `manifest`
+- `rules_excerpt`
+- `tool_policy`
+- `workflow_template`，只来自最高优先级 skill
+- `loaded_files`
+- `load_stages`
+- `score`
+- `match_summary`
+- `deferred_references`
+
+前端也会显示：
+
+- skill 是 `private` 还是 `platform`
+- 加载阶段，例如 `manifest -> rules -> template`
+- BM25 命中摘要，例如匹配了 `task_patterns/name/tags`
+- 分数摘要
+
+**关键边界**
+
+这个 SkillLoader 只属于平台助手业务模块：
+
+- 不调用 `WorkflowExecutor`
+- 不调用 `build_agent_adapter`
+- 不使用 workflow agent node 的 `tools`
+- 不调用 MCP runtime
+- 不注册成 workflow node
+- 不运行用户 workflow
+
+它只是帮平台助手“检索、选择、逐步读取 skill 内容”，再让平台助手生成建议或 workflow draft。真正写入 app/workflow 时仍走后端业务服务和 schema/权限校验。
