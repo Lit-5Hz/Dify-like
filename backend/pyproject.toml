@@ -24,12 +24,14 @@ dependencies = [
   "langchain-text-splitters>=0.3.0",
   "tiktoken>=0.7.0",
   "jieba>=0.42.1",
-  "unstructured[pdf,docx,pptx,xlsx]>=0.18.0",
 ]
 
 [project.optional-dependencies]
 agentscope = [
   "agentscope[full]==1.0.19.post1",
+]
+documents = [
+  "unstructured[pdf,docx,pptx,xlsx]>=0.18.0",
 ]
 
 [tool.setuptools.packages.find]
