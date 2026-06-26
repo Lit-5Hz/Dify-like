@@ -25,6 +25,7 @@ class AgentInvocation:
     enabled_mcp_tools: list[dict[str, Any]] = field(default_factory=list)
     retrieved_chunks: list[dict[str, Any]] = field(default_factory=list)
     context_metadata: dict[str, Any] = field(default_factory=dict)
+    history_messages: list[dict[str, str]] = field(default_factory=list)
 
 
 class BaseAgentAdapter:
@@ -178,7 +179,7 @@ class AgentScopeAdapter(BaseAgentAdapter):
         tool_events: list[RuntimeEvent] = []
         try:
             # 1.创建 AgentScope agent，并把 trace_sink 传给工具层，让工具执行时能回推 tool_call 事件
-            agent = self._create_agent(invocation, tool_events.append)
+            agent = await self._create_agent(invocation, tool_events.append)
             # 2.导入 AgentScope 的消息和流式工具:
             from agentscope.message import Msg  # Msg 用来把用户输入包装成 AgentScope 能识别的消息
             from agentscope.pipeline import stream_printing_messages  # stream_printing_messages 用来接收 AgentScope 运行中的流式输出
@@ -259,7 +260,7 @@ class AgentScopeAdapter(BaseAgentAdapter):
             "source": "agentscope",
         }
 
-    def _create_agent(self, invocation: AgentInvocation, trace_sink):
+    async def _create_agent(self, invocation: AgentInvocation, trace_sink):
         """
         创建模型
         创建 formatter
@@ -269,7 +270,6 @@ class AgentScopeAdapter(BaseAgentAdapter):
         创建 ReActAgent
         """
         from agentscope.agent import ReActAgent
-        from agentscope.memory import InMemoryMemory
 
         # formatter 是 LLM 消息协议适配器，告诉 AgentScope 怎么把消息整理给这个品牌的 LLM 模型。
         model, formatter = self._build_model_and_formatter(invocation)
@@ -286,8 +286,25 @@ class AgentScopeAdapter(BaseAgentAdapter):
             model=model,
             formatter=formatter,
             toolkit=toolkit,
-            memory=InMemoryMemory(),
+            memory=await self._build_memory(invocation),
         )
+
+    async def _build_memory(self, invocation: AgentInvocation):
+        from agentscope.memory import InMemoryMemory
+        from agentscope.message import Msg
+
+        memory = InMemoryMemory()
+        messages = []
+        for item in invocation.history_messages:
+            role = str(item.get("role") or "").strip()
+            content = str(item.get("content") or "")
+            if role not in {"user", "assistant"} or not content:
+                continue
+            name = "assistant" if role == "assistant" else "user"
+            messages.append(Msg(name, content, role))
+        if messages:
+            await memory.add(messages, marks="history")
+        return memory
 
     def _build_model_and_formatter(self, invocation: AgentInvocation):
         # 统一解析 provider/model/base_url/API key，并按 AgentScope 1.0.19.post1 的真实签名创建模型对象。

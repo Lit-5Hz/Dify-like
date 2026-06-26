@@ -47,11 +47,13 @@ class WorkflowExecutor:
         query: str,
         conversation_id: str = "",
         user_id: str = "",
+        history_messages: list[dict[str, str]] | None = None,
     ) -> AsyncIterator[RuntimeEvent]:
         context: dict[str, Any] = {
             "query": query,
             "conversation_id": conversation_id,
             "user_id": user_id,
+            "history_messages": history_messages or [],
         }
 
         for node in self._ordered_nodes(self.workflow_spec):
@@ -191,6 +193,7 @@ class WorkflowExecutor:
             enabled_tools=enabled_tools,
             enabled_mcp_tools=enabled_mcp_tools,
             retrieved_chunks=self.result.retrieved_chunks,
+            history_messages=context["history_messages"],
         )
 
         final_answer = ""

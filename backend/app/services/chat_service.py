@@ -10,6 +10,9 @@ from app.runtime.workflow_executor import WorkflowExecutor
 from app.services.run_log_service import add_step, create_run, finish_run
 
 
+MAX_AGENT_HISTORY_MESSAGES = 20
+
+
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -65,13 +68,17 @@ async def chat_once(
 ) -> dict:
     started = perf_counter()
     conversation = get_or_create_conversation(db, app.id, workflow.id, user_id, conversation_id)
+    history_messages = [
+        {"role": message.role, "content": message.content}
+        for message in list_messages(db, conversation.id, user_id)[-MAX_AGENT_HISTORY_MESSAGES:]
+    ]
     user_message = add_message(db, conversation.id, "user", query)
     run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
 
     executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
     adapter_error = ""
     try:
-        async for event in executor.execute(query, conversation.id, user_id):
+        async for event in executor.execute(query, conversation.id, user_id, history_messages=history_messages):
             if event["type"] == "adapter_error":
                 adapter_error = str(event.get("message", "Agent adapter error"))
                 break
@@ -115,6 +122,10 @@ async def chat_stream(
 ) -> AsyncIterator[str]:
     started = perf_counter()
     conversation = get_or_create_conversation(db, app.id, workflow.id, user_id, conversation_id)
+    history_messages = [
+        {"role": message.role, "content": message.content}
+        for message in list_messages(db, conversation.id, user_id)[-MAX_AGENT_HISTORY_MESSAGES:]
+    ]
     user_message = add_message(db, conversation.id, "user", query)
     run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
 
@@ -130,7 +141,7 @@ async def chat_stream(
     executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
     final_sent = False
     try:
-        async for event in executor.execute(query, conversation.id, user_id):
+        async for event in executor.execute(query, conversation.id, user_id, history_messages=history_messages):
             if event["type"] == "retrieval":
                 yield _sse("retrieval", event)
             elif event["type"] == "tool_call":
