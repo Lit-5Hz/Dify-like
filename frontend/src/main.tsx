@@ -48,8 +48,8 @@ import type {
 } from "./types";
 import "./styles.css";
 
-const MODEL_PROVIDERS = ["mock", "openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm"];
-const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS.filter((provider) => provider !== "mock");
+const MODEL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm"];
+const QUERY_LLM_PROVIDERS = MODEL_PROVIDERS;
 const CREDENTIAL_PROVIDERS = ["openai", "openai_compatible", "deepseek", "dashscope", "qwen", "vllm", "zhipu", "zhipuai"];
 const QUERY_ENHANCEMENT_STRATEGIES = ["rewrite", "hyde", "multi_query"];
 const MCP_TRANSPORT_TYPES = ["streamable_http"];
@@ -171,7 +171,7 @@ function stableStringify(value: unknown): string {
 }
 
 function defaultCredentialProvider(provider: string) {
-  return provider && provider !== "mock" ? provider : "openai_compatible";
+  return provider || "openai_compatible";
 }
 
 function formatTimestamp(value: string | null | undefined) {

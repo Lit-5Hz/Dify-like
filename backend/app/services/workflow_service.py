@@ -162,11 +162,14 @@ def _validate_workflow_spec(db: Session, app: App, spec: dict[str, Any]) -> None
 
     for node in _agent_nodes(spec):
         node_id = str(node.get("id") or "agent")
-        uses_mcp = False
+        adapter_name = str(node.get("adapter") or "").strip().lower()
+        if adapter_name == "mock":
+            raise ValueError(f"Agent node {node_id} uses removed mock adapter. Configure AgentScope instead.")
+        if adapter_name and adapter_name != "agentscope":
+            raise ValueError(f"Unsupported agent adapter on node {node_id}: {adapter_name}")
         for tool in normalize_agent_tools(node.get("tools", [])):
             if tool["type"] != "mcp":
                 continue
-            uses_mcp = True
             config = tool.get("config") if isinstance(tool.get("config"), dict) else {}
             server_id = str(config.get("server_id") or "").strip()
             server = get_external_mcp_server(db, server_id, owner_user_id)
@@ -176,8 +179,6 @@ def _validate_workflow_spec(db: Session, app: App, spec: dict[str, Any]) -> None
                 raise ValueError(f"External MCP server is not synced yet: {server.name}")
             if not get_external_mcp_tool(server, tool["name"]):
                 raise ValueError(f"External MCP tool not found on server {server.name}: {tool['name']}")
-        if uses_mcp and not _agent_node_uses_agentscope(node, app):
-            raise ValueError(f"Agent node {node_id} uses MCP tools and must run with AgentScope.")
 
 
 def _remove_knowledge_base_id(workflow_spec: dict | None, kb_id: str) -> tuple[dict[str, Any], bool]:
@@ -219,13 +220,3 @@ def _agent_nodes(workflow_spec: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(node, dict) and str(node.get("type") or "") in {"agent", "react_agent"}
     ]
 
-
-def _agent_node_uses_agentscope(node: dict[str, Any], app: App) -> bool:
-    adapter_name = str(node.get("adapter") or "").strip().lower()
-    if adapter_name == "agentscope":
-        return True
-    if adapter_name == "mock":
-        return False
-    model = node.get("model") if isinstance(node.get("model"), dict) else {}
-    provider = str(model.get("provider") or app.model_provider or "").strip().lower()
-    return provider not in {"", "mock"}

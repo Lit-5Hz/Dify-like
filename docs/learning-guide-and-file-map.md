@@ -255,20 +255,16 @@ agent 节点适配层。
 
 - 定义 agent 执行输入 `AgentInvocation`
 - 定义基础 adapter 接口
-- 提供 `MockAgentAdapter`
 - 提供 `AgentScopeAdapter`
-- 根据配置选择 adapter
+- 根据配置校验并创建 AgentScope adapter
 
 重要类：
 
 - `AgentInvocation`
 - `BaseAgentAdapter`
-- `MockAgentAdapter`
 - `AgentScopeAdapter`
 
-当前实际稳定运行的是 `MockAgentAdapter`。
-
-`AgentScopeAdapter` 是为了后续接真实 AgentScope 准备的嵌入点。
+当前 agent 运行统一走 `AgentScopeAdapter`，`MockAgentAdapter` 已移除。
 
 ### backend/app/runtime/agent_runner.py
 
@@ -498,7 +494,7 @@ Pydantic schema。
                 -> retrieval node
                   -> rag_service.retrieve_chunks()
                 -> agent node
-                  -> MockAgentAdapter / AgentScopeAdapter
+                  -> AgentScopeAdapter
                   -> tools.registry.run_tool()
                 -> end node
               -> save assistant message
@@ -516,7 +512,7 @@ Pydantic schema。
 workflow_spec
   -> WorkflowExecutor
     -> Agent Adapter
-      -> Mock / AgentScope
+      -> AgentScope
     -> run_steps
 ```
 

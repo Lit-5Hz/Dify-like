@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.tools.registry import build_agentscope_toolkit, run_tool
+from app.tools.registry import build_agentscope_toolkit
 
 
 RuntimeEvent = dict[str, Any]
@@ -152,65 +151,6 @@ def _to_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-class MockAgentAdapter(BaseAgentAdapter):
-    name = "mock"
-
-    async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
-        answer_parts: list[str] = []
-        query = invocation.query
-        enabled_tools = set(invocation.enabled_tools)
-
-        order_match = re.search(r"\b(\d{4,})\b", query)
-        if order_match and "query_order" in enabled_tools:
-            order_id = order_match.group(1)
-            tool_result = run_tool("query_order", {"order_id": order_id})
-            yield {
-                "type": "tool_call",
-                "name": "query_order",
-                "input": {"order_id": order_id},
-                "output": tool_result,
-                "source": "mock",
-            }
-            answer_parts.append(str(tool_result.get("status", tool_result)))
-
-        if any(word in query for word in ["几点", "时间", "现在"]) and "current_time" in enabled_tools:
-            tool_result = run_tool("current_time", {})
-            yield {
-                "type": "tool_call",
-                "name": "current_time",
-                "input": {},
-                "output": tool_result,
-                "source": "mock",
-            }
-            answer_parts.append(f"当前时间是 {tool_result['result']}。")
-
-        if any(word in query for word in ["天气", "气温"]) and "mock_weather" in enabled_tools:
-            city = "上海"
-            tool_result = run_tool("mock_weather", {"city": city})
-            yield {
-                "type": "tool_call",
-                "name": "mock_weather",
-                "input": {"city": city},
-                "output": tool_result,
-                "source": "mock",
-            }
-            answer_parts.append(tool_result["weather"])
-
-        context_block, context_metadata = build_agent_context(invocation)
-        invocation.context_metadata = context_metadata
-        if context_block:
-            context = context_block
-            answer_parts.append(f"根据知识库：{context[:260]}")
-
-        if not answer_parts:
-            answer_parts.append("我已经收到你的问题。当前 demo 使用 mock adapter；接入模型后会由 AgentScope 执行 agent。")
-
-        final_answer = "\n\n".join(answer_parts)
-        for token in final_answer:
-            yield {"type": "message_delta", "content": token, "source": "mock"}
-        yield {"type": "final", "content": final_answer, "source": "mock"}
 
 
 class AgentScopeAdapter(BaseAgentAdapter):
@@ -465,11 +405,8 @@ class AgentScopeAdapter(BaseAgentAdapter):
 
 def build_agent_adapter(adapter_name: str | None, model_provider: str) -> BaseAgentAdapter:
     selected = (adapter_name or "").lower()
-    provider = (model_provider or "").lower()
+    if selected in {"", "agentscope"}:
+        return AgentScopeAdapter()
     if selected == "mock":
-        return MockAgentAdapter()
-    if selected == "agentscope":
-        return AgentScopeAdapter()
-    if provider not in {"", "mock"}:
-        return AgentScopeAdapter()
-    return MockAgentAdapter()
+        raise ValueError("Mock agent adapter has been removed. Configure the agent to use AgentScope.")
+    raise ValueError(f"Unsupported agent adapter: {selected}")

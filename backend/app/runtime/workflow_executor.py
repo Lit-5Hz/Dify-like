@@ -158,15 +158,19 @@ class WorkflowExecutor:
         model_config = self._resolve_model_config(node)
         provider = model_config.get("provider") or self.app.model_provider
         adapter = build_agent_adapter(adapter_name, provider)
+        provider = str(provider or "").strip()
+        model_name = str(model_config.get("model_name") or self.app.model_name or "").strip()
+        if not provider or provider.lower() == "mock":
+            raise ValueError("AgentScope requires a real model provider. Configure the app or agent node model provider.")
+        if not model_name or model_name.lower() == "mock-react":
+            raise ValueError("AgentScope requires a real model name. Configure the app or agent node model name.")
         credential_id = str(model_config.get("credential_id") or "").strip()
-        api_key = ""
-        if adapter.name == "agentscope":
-            if not credential_id:
-                raise ValueError("Missing model credential. Choose a credential in the app or agent node config.")
-            try:
-                api_key = resolve_model_api_key(self.db, credential_id, getattr(self.app, "owner_user_id", ""))
-            except Exception as exc:
-                raise ValueError(str(exc)) from exc
+        if not credential_id:
+            raise ValueError("Missing model credential. Choose a credential in the app or agent node config.")
+        try:
+            api_key = resolve_model_api_key(self.db, credential_id, getattr(self.app, "owner_user_id", ""))
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
 
         enabled_tools = resolve_agent_enabled_builtin_tool_names(node)
         enabled_mcp_tools = resolve_agent_mcp_tool_runtime_specs(
@@ -179,7 +183,7 @@ class WorkflowExecutor:
             query=context["query"],
             system_prompt=self.app.system_prompt,
             model_provider=provider,
-            model_name=model_config.get("model_name") or self.app.model_name,
+            model_name=model_name,
             model_config=model_config,
             model_credential_id=credential_id,
             api_key=api_key,
@@ -304,8 +308,8 @@ class WorkflowExecutor:
     def _resolve_model_config(self, node: dict[str, Any]) -> dict[str, Any]:
         node_model = node.get("model") if isinstance(node.get("model"), dict) else {}
         app_model = {
-            "provider": getattr(self.app, "model_provider", "mock"),
-            "model_name": getattr(self.app, "model_name", "mock-react"),
+            "provider": getattr(self.app, "model_provider", ""),
+            "model_name": getattr(self.app, "model_name", ""),
             "credential_id": getattr(self.app, "model_credential_id", ""),
             "base_url": getattr(self.app, "model_base_url", ""),
             "temperature": getattr(self.app, "temperature", None),

@@ -52,8 +52,8 @@ class AppCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
     system_prompt: str = "你是一个专业、耐心、简洁的智能体。"
-    model_provider: str = "mock"
-    model_name: str = "mock-react"
+    model_provider: str = "openai_compatible"
+    model_name: str = ""
     model_credential_id: str = ""
     model_base_url: str = ""
     temperature: int = 70
