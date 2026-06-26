@@ -271,10 +271,10 @@ def _create_from_session_draft(
         name=app_name,
         description=str(draft.get("app_description") or ""),
         system_prompt="",
-        model_provider="openai_compatible",
-        model_name="",
+        model_provider="deepseek",
+        model_name="deepseek-v4-pro",
         model_credential_id="",
-        model_base_url="",
+        model_base_url="https://api.deepseek.com/v1",
     )
     _validate_workflow_spec(db, validation_app, draft_spec)
     app = create_app(
@@ -283,10 +283,10 @@ def _create_from_session_draft(
             name=app_name,
             description=str(draft.get("app_description") or ""),
             system_prompt="You are a workflow app created by the platform assistant.",
-            model_provider="openai_compatible",
-            model_name="",
+            model_provider="deepseek",
+            model_name="deepseek-v4-pro",
             model_credential_id="",
-            model_base_url="",
+            model_base_url="https://api.deepseek.com/v1",
             temperature=70,
             top_p=100,
             max_tokens=1024,

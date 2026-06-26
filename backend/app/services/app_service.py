@@ -14,6 +14,8 @@ from app.services.agent_tool_spec import normalize_agent_tools
 
 
 LEGACY_NODE_TYPE = "".join(["r", "a", "g"])
+DEEPSEEK_DEFAULT_MODEL_NAME = "deepseek-v4-pro"
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 
 
 def normalize_workflow_spec(workflow_spec: dict | None) -> dict:
@@ -71,15 +73,21 @@ def get_app(db: Session, app_id: str, owner_user_id: str) -> App | None:
 
 def create_app(db: Session, payload: AppCreate, owner_user_id: str) -> App:
     _validate_app_model_credential(db, owner_user_id, payload.model_credential_id)
+    model_provider = payload.model_provider.strip()
+    model_name = payload.model_name.strip()
+    model_base_url = payload.model_base_url.strip()
+    if model_provider == "deepseek":
+        model_name = model_name or DEEPSEEK_DEFAULT_MODEL_NAME
+        model_base_url = model_base_url or DEEPSEEK_DEFAULT_BASE_URL
     app = App(
         owner_user_id=owner_user_id,
         name=payload.name,
         description=payload.description,
         system_prompt=payload.system_prompt,
-        model_provider=payload.model_provider,
-        model_name=payload.model_name,
+        model_provider=model_provider,
+        model_name=model_name,
         model_credential_id=payload.model_credential_id,
-        model_base_url=payload.model_base_url,
+        model_base_url=model_base_url,
         temperature=payload.temperature,
         top_p=payload.top_p,
         max_tokens=payload.max_tokens,

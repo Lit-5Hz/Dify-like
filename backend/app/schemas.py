@@ -52,10 +52,10 @@ class AppCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = ""
     system_prompt: str = "你是一个专业、耐心、简洁的智能体。"
-    model_provider: str = "openai_compatible"
-    model_name: str = ""
+    model_provider: str = "deepseek"
+    model_name: str = "deepseek-v4-pro"
     model_credential_id: str = ""
-    model_base_url: str = ""
+    model_base_url: str = "https://api.deepseek.com/v1"
     temperature: int = 70
     top_p: int = 100
     max_tokens: int = 1024
