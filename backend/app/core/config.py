@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     public_api_base_url: str = "http://localhost:8000"
     frontend_base_url: str = "http://localhost:5173"
+    mcp_tool_timeout_seconds: float = 120.0
 
     platform_assistant_api_base_url: str = ""
     platform_assistant_api_key: str = ""

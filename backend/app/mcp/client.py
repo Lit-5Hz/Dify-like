@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from app.core.config import get_settings
 from app.mcp.protocol import MCP_PROTOCOL_VERSION, extract_jsonrpc_result
 
 
@@ -124,6 +125,7 @@ async def call_mcp_tool(
         },
         custom_headers=custom_headers,
         session_id=session_id,
+        timeout_seconds=get_settings().mcp_tool_timeout_seconds,
     )
     return response.result
 
@@ -135,11 +137,12 @@ async def _post_jsonrpc(
     payload: dict[str, Any],
     custom_headers: dict[str, str] | None = None,
     session_id: str = "",
+    timeout_seconds: float = DEFAULT_MCP_TIMEOUT,
 ) -> McpJsonRpcResponse:
     """Unified "send JSON-RPC request" function on MCP Client side."""
     headers = _build_auth_headers(auth_type, auth_secret, custom_headers, session_id)
     try:
-        async with httpx.AsyncClient(timeout=DEFAULT_MCP_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(server_url, json=payload, headers=headers)
             response.raise_for_status()
             content_type = response.headers.get("content-type", "").lower()
@@ -150,8 +153,14 @@ async def _post_jsonrpc(
     except httpx.HTTPStatusError as exc:
         response_text = exc.response.text if exc.response is not None else ""
         raise ValueError(f"MCP request failed with HTTP {exc.response.status_code}: {response_text}") from exc
+    except httpx.TimeoutException as exc:
+        raise ValueError(
+            f"MCP request timed out after {timeout_seconds:g}s ({type(exc).__name__})."
+        ) from exc
     except Exception as exc:
-        raise ValueError(f"MCP request failed: {exc}") from exc
+        detail = str(exc).strip()
+        message = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        raise ValueError(f"MCP request failed: {message}") from exc
     return McpJsonRpcResponse(
         result=extract_jsonrpc_result(body),
         session_id=_extract_session_id(response.headers),
