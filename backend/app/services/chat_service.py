@@ -1,6 +1,7 @@
 import json
 from collections.abc import AsyncIterator
 from time import perf_counter
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,6 +16,92 @@ MAX_AGENT_HISTORY_MESSAGES = 20
 
 def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _ensure_generation(timeline: list[dict[str, Any]], message_id: str) -> dict[str, Any]:
+    for item in timeline:
+        if item.get("kind") == "generation" and item.get("message_id") == message_id:
+            return item
+    generation = {
+        "id": f"generation-{message_id}",
+        "kind": "generation",
+        "message_id": message_id,
+        "phase": "resume" if any(item.get("kind") == "generation" for item in timeline) else "start",
+        "thinking": "",
+    }
+    timeline.append(generation)
+    return generation
+
+
+def _record_timeline_event(timeline: list[dict[str, Any]], event: dict[str, Any]) -> None:
+    event_type = event.get("type")
+    if event_type == "retrieval":
+        timeline.append(
+            {
+                "id": f"retrieval-{len(timeline)}",
+                "kind": "retrieval",
+                "chunks": event.get("chunks") if isinstance(event.get("chunks"), list) else [],
+            }
+        )
+    elif event_type == "thinking_delta":
+        generation = _ensure_generation(timeline, str(event.get("message_id") or ""))
+        generation["thinking"] = str(generation.get("thinking") or "") + str(event.get("content") or "")
+    elif event_type == "message_delta":
+        _ensure_generation(timeline, str(event.get("message_id") or ""))
+    elif event_type == "tool_call":
+        _ensure_generation(timeline, str(event.get("message_id") or ""))
+        tool_call_id = str(event.get("tool_call_id") or "")
+        if not any(item.get("kind") == "tool" and item.get("tool_call_id") == tool_call_id for item in timeline):
+            timeline.append(
+                {
+                    "id": f"tool-{tool_call_id}",
+                    "kind": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": str(event.get("name") or "unknown"),
+                    "input": event.get("input") if isinstance(event.get("input"), dict) else {},
+                    "status": "running",
+                }
+            )
+    elif event_type == "tool_result":
+        tool_call_id = str(event.get("tool_call_id") or "")
+        for item in reversed(timeline):
+            if item.get("kind") == "tool" and item.get("tool_call_id") == tool_call_id:
+                item["output"] = event.get("output")
+                item["status"] = "completed"
+                break
+    elif event_type == "workflow_warning":
+        timeline.append(
+            {
+                "id": f"warning-{len(timeline)}",
+                "kind": "notice",
+                "level": "warning",
+                "message": str(event.get("message") or "工作流警告"),
+            }
+        )
+
+
+def _append_error(timeline: list[dict[str, Any]], message: str) -> None:
+    timeline.append(
+        {
+            "id": f"error-{len(timeline)}",
+            "kind": "notice",
+            "level": "error",
+            "message": message,
+        }
+    )
+
+
+def _assistant_metadata(
+    status: str,
+    timeline: list[dict[str, Any]],
+    executor: WorkflowExecutor,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "timeline": timeline,
+        "tool_calls": executor.result.tool_calls,
+        "retrieved_chunks": executor.result.retrieved_chunks,
+    }
 
 
 def get_conversation_for_user(db: Session, conversation_id: str, user_id: str) -> Conversation | None:
@@ -75,20 +162,42 @@ async def chat_once(
     user_message = add_message(db, conversation.id, "user", query)
     run = create_run(db, app.id, workflow.id, workflow_version.id, conversation.id, user_message.id)
 
-    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
+    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id, workflow.id)
     adapter_error = ""
+    timeline: list[dict[str, Any]] = []
+    partial_answer = ""
     try:
         async for event in executor.execute(query, conversation.id, user_id, history_messages=history_messages):
+            _record_timeline_event(timeline, event)
+            if event["type"] == "message_delta":
+                partial_answer += str(event.get("content") or "")
             if event["type"] == "adapter_error":
                 adapter_error = str(event.get("message", "Agent adapter error"))
                 break
     except Exception as exc:
-        finish_run(db, run, started, status="error", error=str(exc))
+        error = str(exc)
+        _append_error(timeline, error)
+        output = add_message(
+            db,
+            conversation.id,
+            "assistant",
+            partial_answer,
+            _assistant_metadata("error", timeline, executor),
+        )
+        finish_run(db, run, started, status="error", output_message_id=output.id, error=error)
         add_step(db, run.id, "error", "runtime_error", {}, {}, error=str(exc))
         raise
 
     if adapter_error:
-        finish_run(db, run, started, status="error", error=adapter_error)
+        _append_error(timeline, adapter_error)
+        output = add_message(
+            db,
+            conversation.id,
+            "assistant",
+            partial_answer,
+            _assistant_metadata("error", timeline, executor),
+        )
+        finish_run(db, run, started, status="error", output_message_id=output.id, error=adapter_error)
         raise ValueError(adapter_error)
 
     output = add_message(
@@ -96,10 +205,7 @@ async def chat_once(
         conversation.id,
         "assistant",
         executor.result.answer,
-        {
-            "tool_calls": executor.result.tool_calls,
-            "retrieved_chunks": executor.result.retrieved_chunks,
-        },
+        _assistant_metadata("completed", timeline, executor),
     )
     finish_run(db, run, started, output_message_id=output.id)
     return {
@@ -138,38 +244,60 @@ async def chat_stream(
             "workflow_version_id": workflow_version.id,
         },
     )
-    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id)
-    final_sent = False
+    executor = WorkflowExecutor(db, app, workflow_version.spec_json, run.id, workflow.id)
+    timeline: list[dict[str, Any]] = []
+    partial_answer = ""
+    output_saved = False
     try:
         async for event in executor.execute(query, conversation.id, user_id, history_messages=history_messages):
+            _record_timeline_event(timeline, event)
+            if event["type"] == "message_delta":
+                partial_answer += str(event.get("content") or "")
             if event["type"] == "retrieval":
                 yield _sse("retrieval", event)
             elif event["type"] == "tool_call":
                 yield _sse("tool_call", event)
+            elif event["type"] == "tool_result":
+                yield _sse("tool_result", event)
+            elif event["type"] == "thinking_delta":
+                yield _sse(
+                    "thinking_delta",
+                    {"message_id": event["message_id"], "content": event["content"]},
+                )
             elif event["type"] == "message_delta":
-                yield _sse("message_delta", {"content": event["content"]})
+                yield _sse(
+                    "message_delta",
+                    {"message_id": event["message_id"], "content": event["content"]},
+                )
             elif event["type"] == "workflow_warning":
                 yield _sse("workflow_warning", event)
             elif event["type"] == "workflow_node":
                 continue
             elif event["type"] == "adapter_error":
-                final_sent = True
-                finish_run(db, run, started, status="error", error=str(event["message"]))
-                yield _sse("error", {"message": event["message"], "adapter": event["adapter"]})
-                break
-            elif event["type"] == "final":
-                final_sent = True
+                error = str(event["message"])
+                _append_error(timeline, error)
                 output = add_message(
                     db,
                     conversation.id,
                     "assistant",
-                    str(event["content"]),
-                    {
-                        "tool_calls": executor.result.tool_calls,
-                        "retrieved_chunks": executor.result.retrieved_chunks,
-                    },
+                    partial_answer,
+                    _assistant_metadata("error", timeline, executor),
                 )
-                finish_run(db, run, started, output_message_id=output.id)
+                output_saved = True
+                finish_run(db, run, started, status="error", output_message_id=output.id, error=error)
+                yield _sse("error", {"message": event["message"], "adapter": event["adapter"]})
+                break
+            elif event["type"] == "final":
+                if not output_saved:
+                    output = add_message(
+                        db,
+                        conversation.id,
+                        "assistant",
+                        str(event["content"]),
+                        _assistant_metadata("completed", timeline, executor),
+                    )
+                    output_saved = True
+                    finish_run(db, run, started, output_message_id=output.id)
                 yield _sse(
                     "final",
                     {
@@ -181,17 +309,15 @@ async def chat_stream(
                     },
                 )
 
-        if not final_sent:
+        if not output_saved:
             output = add_message(
                 db,
                 conversation.id,
                 "assistant",
                 executor.result.answer,
-                {
-                    "tool_calls": executor.result.tool_calls,
-                    "retrieved_chunks": executor.result.retrieved_chunks,
-                },
+                _assistant_metadata("completed", timeline, executor),
             )
+            output_saved = True
             finish_run(db, run, started, output_message_id=output.id)
             yield _sse(
                 "final",
@@ -204,7 +330,18 @@ async def chat_stream(
                 },
             )
     except Exception as exc:
-        finish_run(db, run, started, status="error", error=str(exc))
+        error = str(exc)
+        if not output_saved:
+            _append_error(timeline, error)
+            output = add_message(
+                db,
+                conversation.id,
+                "assistant",
+                partial_answer,
+                _assistant_metadata("error", timeline, executor),
+            )
+            output_saved = True
+            finish_run(db, run, started, status="error", output_message_id=output.id, error=error)
         add_step(db, run.id, "error", "runtime_error", {}, {}, error=str(exc))
         yield _sse("error", {"message": str(exc)})
 
