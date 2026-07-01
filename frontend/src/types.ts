@@ -160,19 +160,6 @@ export type RunItem = {
   created_at: string;
 };
 
-export type RunStepItem = {
-  id: string;
-  run_id: string;
-  type: string;
-  name: string;
-  input_json: Record<string, unknown>;
-  output_json: Record<string, unknown>;
-  latency_ms: number;
-  error: string;
-  started_at: string;
-  ended_at: string | null;
-};
-
 export type MessageItem = {
   id: string;
   conversation_id: string;
@@ -185,7 +172,38 @@ export type MessageItem = {
 export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
+  timeline?: ChatTimelineItem[];
+  status?: "streaming" | "completed" | "error";
 };
+
+export type ChatTimelineItem =
+  | {
+      id: string;
+      kind: "retrieval";
+      chunks: Record<string, unknown>[];
+    }
+  | {
+      id: string;
+      kind: "generation";
+      message_id: string;
+      phase: "start" | "resume";
+      thinking: string;
+    }
+  | {
+      id: string;
+      kind: "tool";
+      tool_call_id: string;
+      name: string;
+      input: Record<string, unknown>;
+      output?: unknown;
+      status: "running" | "completed";
+    }
+  | {
+      id: string;
+      kind: "notice";
+      level: "warning" | "error";
+      message: string;
+    };
 
 export type PlatformSkillItem = {
   id: string;

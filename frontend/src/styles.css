@@ -641,7 +641,7 @@ pre {
 }
 
 .studio-center {
-  grid-template-rows: auto minmax(360px, 1fr);
+  grid-template-rows: auto auto;
 }
 
 .work-panel {
@@ -1210,7 +1210,6 @@ pre {
 
 .chat-panel {
   min-height: 360px;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 
 .messages {
@@ -1218,8 +1217,6 @@ pre {
   flex-direction: column;
   gap: 10px;
   min-height: 220px;
-  max-height: 460px;
-  overflow: auto;
   padding: 4px;
 }
 
@@ -1267,6 +1264,196 @@ pre {
 .message.system {
   align-self: flex-start;
   background: #f7f9fb;
+}
+
+.message.assistant {
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0;
+  white-space: normal;
+}
+
+.message-timeline {
+  display: grid;
+  padding: 4px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.timeline-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #e5e9ee;
+}
+
+.timeline-row:last-child {
+  border-bottom: 0;
+}
+
+.timeline-row.compact {
+  padding: 8px 0;
+}
+
+.timeline-marker {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--primary);
+  background: var(--surface);
+}
+
+.timeline-content {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.timeline-content > strong,
+.timeline-heading strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.timeline-content > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.timeline-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.timeline-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.timeline-status.complete {
+  color: var(--success);
+}
+
+.timeline-content summary {
+  width: fit-content;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.timeline-content summary:focus-visible {
+  outline: 2px solid rgba(15, 118, 110, 0.32);
+  outline-offset: 2px;
+}
+
+.timeline-thinking pre {
+  max-width: 100%;
+  margin: 8px 0 0;
+  overflow: visible;
+  color: #344054;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.timeline-chunks,
+.timeline-io {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.timeline-chunks {
+  overflow: visible;
+}
+
+.timeline-chunk {
+  display: grid;
+  gap: 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.timeline-chunk:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.timeline-chunk p {
+  color: #344054;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.timeline-io > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.timeline-io pre {
+  max-width: 100%;
+  margin: 0;
+  overflow: visible;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.timeline-row.notice.warning .timeline-marker {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.timeline-row.notice.error .timeline-marker {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.assistant-answer {
+  display: grid;
+  gap: 5px;
+  padding: 12px 14px;
+}
+
+.assistant-answer-label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.assistant-answer-content {
+  color: var(--text);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.assistant-answer-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .composer {
@@ -1380,7 +1567,7 @@ pre {
 }
 
 .logs-layout {
-  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr) minmax(300px, 420px);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .step-card {
@@ -1519,13 +1706,6 @@ pre {
     grid-template-columns: 280px minmax(380px, 1fr) 340px;
   }
 
-  .logs-layout {
-    grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
-  }
-
-  .logs-layout .work-panel:last-child {
-    grid-column: 1 / -1;
-  }
 }
 
 @media (max-width: 1120px) {
@@ -1610,6 +1790,11 @@ pre {
 
   .message {
     max-width: 94%;
+  }
+
+  .message.assistant {
+    width: fit-content;
+    max-width: 100%;
   }
 }
 

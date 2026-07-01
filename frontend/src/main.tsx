@@ -31,6 +31,7 @@ import { api, downloadSkill, streamChat } from "./api";
 import type {
   AppItem,
   ChatMessage,
+  ChatTimelineItem,
   ExternalMcpServerItem,
   KnowledgeBase,
   KnowledgeDocument,
@@ -38,7 +39,6 @@ import type {
   PlatformAssistantChatResponse,
   PlatformSkillItem,
   RunItem,
-  RunStepItem,
   ToolItem,
   UserItem,
   WorkflowItem,
@@ -157,6 +157,55 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function parseChatTimeline(value: unknown): ChatTimelineItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw): ChatTimelineItem[] => {
+    if (!isRecord(raw) || typeof raw.id !== "string") return [];
+    if (raw.kind === "retrieval" && Array.isArray(raw.chunks)) {
+      return [{ id: raw.id, kind: "retrieval", chunks: raw.chunks.filter(isRecord) }];
+    }
+    if (
+      raw.kind === "generation"
+      && typeof raw.message_id === "string"
+      && (raw.phase === "start" || raw.phase === "resume")
+      && typeof raw.thinking === "string"
+    ) {
+      return [{
+        id: raw.id,
+        kind: "generation",
+        message_id: raw.message_id,
+        phase: raw.phase,
+        thinking: raw.thinking,
+      }];
+    }
+    if (
+      raw.kind === "tool"
+      && typeof raw.tool_call_id === "string"
+      && typeof raw.name === "string"
+      && isRecord(raw.input)
+      && (raw.status === "running" || raw.status === "completed")
+    ) {
+      return [{
+        id: raw.id,
+        kind: "tool",
+        tool_call_id: raw.tool_call_id,
+        name: raw.name,
+        input: raw.input,
+        ...("output" in raw ? { output: raw.output } : {}),
+        status: raw.status,
+      }];
+    }
+    if (
+      raw.kind === "notice"
+      && (raw.level === "warning" || raw.level === "error")
+      && typeof raw.message === "string"
+    ) {
+      return [{ id: raw.id, kind: "notice", level: raw.level, message: raw.message }];
+    }
+    return [];
+  });
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(",")}]`;
@@ -168,6 +217,43 @@ function stableStringify(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function updateLastAssistantMessage(
+  messages: ChatMessage[],
+  update: (message: ChatMessage) => ChatMessage,
+): ChatMessage[] {
+  const next = [...messages];
+  const index = findLastMatchingIndex(next, (message) => message.role === "assistant");
+  if (index >= 0) next[index] = update(next[index]);
+  return next;
+}
+
+function findLastMatchingIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index])) return index;
+  }
+  return -1;
+}
+
+function withGenerationPhase(message: ChatMessage, messageId: string): ChatMessage {
+  const timeline = message.timeline ?? [];
+  if (timeline.some((item) => item.kind === "generation" && item.message_id === messageId)) return message;
+
+  const phase = timeline.some((item) => item.kind === "generation") ? "resume" : "start";
+  return {
+    ...message,
+    timeline: [
+      ...timeline,
+      {
+        id: `generation-${messageId}`,
+        kind: "generation",
+        message_id: messageId,
+        phase,
+        thinking: "",
+      },
+    ],
+  };
 }
 
 function defaultCredentialProvider(provider: string) {
@@ -550,14 +636,12 @@ function App() {
   const [syncingExternalMcpServerId, setSyncingExternalMcpServerId] = useState("");
   const [externalMcpDraft, setExternalMcpDraft] = useState<ExternalMcpServerDraft>(emptyExternalMcpServerDraft);
   const [runs, setRuns] = useState<RunItem[]>([]);
-  const [runSteps, setRunSteps] = useState<RunStepItem[]>([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversationId, setConversationId] = useState<string | null>(null);
   const conversationIdRef = useRef<string | null>(null);
   const [selectedWorkflowNodeId, setSelectedWorkflowNodeId] = useState("");
   const [input, setInput] = useState("我的订单10086到哪了？");
-  const [trace, setTrace] = useState<Record<string, unknown>[]>([]);
   const [busy, setBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
 
@@ -665,27 +749,15 @@ function App() {
     setSyncingExternalMcpServerId("");
     setExternalMcpDraft(emptyExternalMcpServerDraft());
     setRuns([]);
-    setRunSteps([]);
     setSelectedRunId("");
     setMessages([]);
-    setTrace([]);
     setActiveConversationId(null);
     setSelectedWorkflowNodeId("");
     setBusy(false);
   }
 
-  async function selectRun(run: RunItem | null) {
+  function selectRun(run: RunItem | null) {
     setSelectedRunId(run?.id ?? "");
-    if (!run) {
-      setRunSteps([]);
-      return;
-    }
-    try {
-      setRunSteps(await api.listRunSteps(run.id));
-    } catch (error) {
-      console.warn(error);
-      setRunSteps([]);
-    }
   }
 
   async function selectWorkflow(workflow: WorkflowItem | null, preloadedMcpServer?: WorkflowMcpServerItem | null) {
@@ -697,10 +769,8 @@ function App() {
     setDraftSpecText("");
     setDraftSpecError("");
     setRuns([]);
-    setRunSteps([]);
     setSelectedRunId("");
     setMessages([]);
-    setTrace([]);
     setActiveConversationId(null);
     setSelectedWorkflowNodeId("");
     if (!workflow) return;
@@ -719,7 +789,7 @@ function App() {
     setRuns(runList);
 
     const latestRun = runList[0] ?? null;
-    await selectRun(latestRun);
+    selectRun(latestRun);
     const latestConversationId = latestRun?.conversation_id ?? null;
     setActiveConversationId(latestConversationId);
     if (!latestConversationId) return;
@@ -728,7 +798,14 @@ function App() {
       setMessages(
         history
           .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
-          .map((message) => ({ role: message.role, content: message.content })),
+          .map((message) => ({
+            role: message.role,
+            content: message.content,
+            timeline: message.role === "assistant" ? parseChatTimeline(message.metadata_json.timeline) : [],
+            status: message.role === "assistant"
+              ? message.metadata_json.status === "error" ? "error" : "completed"
+              : undefined,
+          })),
       );
     } catch (error) {
       console.warn(error);
@@ -747,12 +824,10 @@ function App() {
     setWorkflowMcpDraft(null);
     setWorkflowMcpToken("");
     setMessages([]);
-    setTrace([]);
     setActiveConversationId(null);
     setStatusMessage("");
     if (!app) {
       setRuns([]);
-      setRunSteps([]);
       setSelectedRunId("");
       setSelectedWorkflowNodeId("");
       return;
@@ -1703,54 +1778,159 @@ function App() {
     const query = input.trim();
     setInput("");
     setBusy(true);
-    setTrace([]);
-    setMessages((items) => [...items, { role: "user", content: query }, { role: "assistant", content: "" }]);
+    setMessages((items) => [
+      ...items,
+      { role: "user", content: query },
+      { role: "assistant", content: "", timeline: [], status: "streaming" },
+    ]);
 
     try {
       await streamChat(selectedWorkflow.id, query, conversationIdRef.current, (event, data) => {
         if (event === "run_started") {
           setActiveConversationId(String(data.conversation_id));
+          return;
         }
-        if (event === "error") {
-          const message = String(data.message ?? "运行出错");
-          setTrace((items) => [...items, { event, ...data }]);
-          setMessages((items) => {
-            const next = [...items];
-            const last = next[next.length - 1];
-            if (last?.role === "assistant") {
-              next[next.length - 1] = { ...last, content: last.content ? `${last.content}\n\n${message}` : message };
-            }
-            return next;
-          });
+        if (event === "retrieval") {
+          const chunks = Array.isArray(data.chunks) ? data.chunks.filter(isRecord) : [];
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              timeline: [
+                ...(message.timeline ?? []),
+                { id: `retrieval-${message.timeline?.length ?? 0}`, kind: "retrieval", chunks },
+              ],
+            })),
+          );
+          return;
+        }
+        if (event === "thinking_delta") {
+          const messageId = String(data.message_id ?? "");
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => {
+              const next = withGenerationPhase(message, messageId);
+              return {
+                ...next,
+                timeline: (next.timeline ?? []).map((item) =>
+                  item.kind === "generation" && item.message_id === messageId
+                    ? { ...item, thinking: item.thinking + String(data.content ?? "") }
+                    : item,
+                ),
+              };
+            }),
+          );
+          return;
         }
         if (event === "message_delta") {
-          setMessages((items) => {
-            const next = [...items];
-            const last = next[next.length - 1];
-            if (last?.role === "assistant") {
-              next[next.length - 1] = { ...last, content: last.content + String(data.content ?? "") };
-            }
-            return next;
-          });
+          const messageId = String(data.message_id ?? "");
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => {
+              const next = withGenerationPhase(message, messageId);
+              return { ...next, content: next.content + String(data.content ?? ""), status: "streaming" };
+            }),
+          );
+          return;
         }
-        if (event === "retrieval" || event === "tool_call" || event === "final" || event === "workflow_warning") {
-          setTrace((items) => [...items, { event, ...data }]);
+        if (event === "tool_call") {
+          const messageId = String(data.message_id ?? "");
+          const toolCallId = String(data.tool_call_id ?? "");
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => {
+              const next = withGenerationPhase(message, messageId);
+              const timeline = next.timeline ?? [];
+              if (timeline.some((item) => item.kind === "tool" && item.tool_call_id === toolCallId)) return next;
+              return {
+                ...next,
+                timeline: [
+                  ...timeline,
+                  {
+                    id: `tool-${toolCallId}`,
+                    kind: "tool",
+                    tool_call_id: toolCallId,
+                    name: String(data.name ?? "unknown"),
+                    input: isRecord(data.input) ? data.input : {},
+                    status: "running",
+                  },
+                ],
+              };
+            }),
+          );
+          return;
+        }
+        if (event === "tool_result") {
+          const toolCallId = String(data.tool_call_id ?? "");
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              timeline: (message.timeline ?? []).map((item) =>
+                item.kind === "tool" && item.tool_call_id === toolCallId
+                  ? { ...item, output: data.output, status: "completed" }
+                  : item,
+              ),
+            })),
+          );
+          return;
+        }
+        if (event === "workflow_warning") {
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              timeline: [
+                ...(message.timeline ?? []),
+                {
+                  id: `warning-${message.timeline?.length ?? 0}`,
+                  kind: "notice",
+                  level: "warning",
+                  message: String(data.message ?? "工作流警告"),
+                },
+              ],
+            })),
+          );
+          return;
+        }
+        if (event === "error") {
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              status: "error",
+              timeline: [
+                ...(message.timeline ?? []),
+                {
+                  id: `error-${message.timeline?.length ?? 0}`,
+                  kind: "notice",
+                  level: "error",
+                  message: String(data.message ?? "运行出错"),
+                },
+              ],
+            })),
+          );
+          return;
+        }
+        if (event === "final") {
+          setMessages((items) =>
+            updateLastAssistantMessage(items, (message) => ({
+              ...message,
+              content: String(data.answer ?? message.content),
+              status: "completed",
+            })),
+          );
         }
       });
       const runList = await api.listWorkflowRuns(selectedWorkflow.id);
       setRuns(runList);
-      await selectRun(runList[0] ?? null);
+      selectRun(runList[0] ?? null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setNotice(`聊天运行失败：${message}`);
-      setMessages((items) => {
-        const next = [...items];
-        const last = next[next.length - 1];
-        if (last?.role === "assistant") {
-          next[next.length - 1] = { ...last, content: last.content ? `${last.content}\n\n${message}` : message };
-        }
-        return next;
-      });
+      setMessages((items) =>
+        updateLastAssistantMessage(items, (current) => ({
+          ...current,
+          status: "error",
+          timeline: [
+            ...(current.timeline ?? []),
+            { id: `error-${current.timeline?.length ?? 0}`, kind: "notice", level: "error", message },
+          ],
+        })),
+      );
     } finally {
       setBusy(false);
     }
@@ -2783,6 +2963,116 @@ function App() {
     );
   }
 
+  function renderTimelineItem(item: ChatTimelineItem) {
+    if (item.kind === "retrieval") {
+      const documents = new Set(
+        item.chunks.map((chunk) => String(chunk.source_file ?? "").trim()).filter(Boolean),
+      );
+      return (
+        <div className="timeline-row" key={item.id}>
+          <span className="timeline-marker"><Database size={15} /></span>
+          <div className="timeline-content">
+            <strong>检索知识库</strong>
+            <span>命中 {item.chunks.length} 个片段，来自 {documents.size} 个文档</span>
+            {item.chunks.length ? (
+              <details>
+                <summary>展开查看</summary>
+                <div className="timeline-chunks">
+                  {item.chunks.map((chunk, index) => (
+                    <div className="timeline-chunk" key={String(chunk.chunk_id ?? index)}>
+                      <strong>{String(chunk.source_file ?? "未知文档")}</strong>
+                      <small>
+                        {chunk.page_num ? `第 ${String(chunk.page_num)} 页` : "页码未知"}
+                        {chunk.score !== undefined ? ` · score ${Number(chunk.score).toFixed(3)}` : ""}
+                      </small>
+                      <p>{String(chunk.content ?? "")}</p>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+
+    if (item.kind === "generation") {
+      return (
+        <div className="timeline-row compact" key={item.id}>
+          <span className="timeline-marker"><Play size={14} /></span>
+          <div className="timeline-content">
+            <strong>{item.phase === "start" ? "开始生成回答" : "继续生成回答"}</strong>
+            {item.thinking ? (
+              <details className="timeline-thinking">
+                <summary>查看完整思维链</summary>
+                <pre>{item.thinking}</pre>
+              </details>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+
+    if (item.kind === "tool") {
+      return (
+        <div className="timeline-row" key={item.id}>
+          <span className="timeline-marker"><Wrench size={15} /></span>
+          <div className="timeline-content">
+            <div className="timeline-heading">
+              <strong>调用工具：{item.name}</strong>
+              <span className={item.status === "completed" ? "timeline-status complete" : "timeline-status running"}>
+                {item.status === "completed" ? <CheckCircle2 size={13} /> : <Loader2 className="spin" size={13} />}
+                {item.status === "completed" ? "已完成" : "调用中"}
+              </span>
+            </div>
+            <details>
+              <summary>展开查看</summary>
+              <div className="timeline-io">
+                <span>Input</span>
+                <pre>{JSON.stringify(item.input, null, 2)}</pre>
+                {item.status === "completed" ? (
+                  <>
+                    <span>Output</span>
+                    <pre>{JSON.stringify(item.output, null, 2)}</pre>
+                  </>
+                ) : null}
+              </div>
+            </details>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className={`timeline-row notice ${item.level}`} key={item.id} role={item.level === "error" ? "alert" : undefined}>
+        <span className="timeline-marker"><Circle size={13} /></span>
+        <div className="timeline-content">
+          <strong>{item.level === "error" ? "运行失败" : "工作流警告"}</strong>
+          <span>{item.message}</span>
+        </div>
+      </div>
+    );
+  }
+
+  function renderChatMessage(message: ChatMessage) {
+    if (message.role !== "assistant") return message.content;
+    const timeline = message.timeline ?? [];
+    const answerLabel = message.status === "completed" ? "最终回答" : message.status === "error" ? "回答中断" : "回答生成中";
+    return (
+      <>
+        {timeline.length ? <div className="message-timeline">{timeline.map(renderTimelineItem)}</div> : null}
+        <div className="assistant-answer">
+          <strong className="assistant-answer-label">{answerLabel}</strong>
+          {message.content ? (
+            <div className="assistant-answer-content">{message.content}</div>
+          ) : message.status === "streaming" ? (
+            <div className="assistant-answer-pending"><Loader2 className="spin" size={14} /> 等待模型输出</div>
+          ) : null}
+        </div>
+      </>
+    );
+  }
+
   function renderChatPanel() {
     return (
       <section className="work-panel chat-panel">
@@ -2797,17 +3087,17 @@ function App() {
           <div className="inline-alert warning">当前聊天仍运行已发布版本；草稿改动需要发布后才会生效。</div>
         ) : null}
         {selectedWorkflow && !selectedWorkflowPublished ? <div className="inline-alert">未发布 Workflow 不能聊天。</div> : null}
-        <div className="messages">
+        <div className="messages" aria-live="polite">
           {messages.length === 0 ? (
             <div className="chat-empty">
               <MessageSquare size={20} />
               <strong>发送一条问题来调试 Workflow</strong>
-              <span>回答、检索事件和工具调用会同步记录到右侧运行日志。</span>
+              <span>回答、检索过程和工具调用会实时显示在对话中。</span>
             </div>
           ) : (
             messages.map((message, index) => (
               <div key={`${message.role}-${index}`} className={`message ${message.role}`}>
-                {message.content}
+                {renderChatMessage(message)}
               </div>
             ))
           )}
@@ -3520,42 +3810,6 @@ function App() {
             ))}
             {!runs.length ? <p className="muted-copy">当前 Workflow 暂无运行记录。</p> : null}
           </div>
-        </section>
-        <section className="work-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">Run Steps</span>
-              <h2>步骤详情</h2>
-            </div>
-          </div>
-          <div className="table-list">
-            {runSteps.map((step) => (
-              <div className="step-card" key={step.id}>
-                <div className="step-heading">
-                  <strong>{step.name || step.type}</strong>
-                  <span className={step.error ? "badge danger" : "badge muted"}>{step.latency_ms} ms</span>
-                </div>
-                <small>
-                  {step.type} · {formatTimestamp(step.started_at)}
-                  {step.error ? ` · ${step.error}` : ""}
-                </small>
-                <details>
-                  <summary>查看输入输出</summary>
-                  <pre>{JSON.stringify({ input: step.input_json, output: step.output_json }, null, 2)}</pre>
-                </details>
-              </div>
-            ))}
-            {!runSteps.length ? <p className="muted-copy">选择一条 run 查看步骤。</p> : null}
-          </div>
-        </section>
-        <section className="work-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">Current Trace</span>
-              <h2>本次调试事件</h2>
-            </div>
-          </div>
-          <pre className="trace-json">{trace.length ? JSON.stringify(trace, null, 2) : "暂无 trace"}</pre>
         </section>
       </div>
     );
