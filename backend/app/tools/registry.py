@@ -3,10 +3,9 @@ from __future__ import annotations
 import ast
 import json
 import operator
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import perf_counter
 from typing import Any
 
 from app.tools.mcp_runtime_adapter import register_mcp_tools
@@ -94,7 +93,6 @@ def run_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 def build_agentscope_toolkit(
     enabled_tools: Iterable[str],
     mcp_tools: Iterable[dict[str, Any]] | None = None,
-    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ):
     from agentscope.tool import Toolkit
 
@@ -113,10 +111,10 @@ def build_agentscope_toolkit(
         tool_builder = builders.get(tool_name)
         if not tool_builder:
             continue
-        toolkit.register_tool_function(tool_builder(trace_sink))
+        toolkit.register_tool_function(tool_builder())
         used_names.add(tool_name)
 
-    register_mcp_tools(toolkit, mcp_tools or [], used_names, trace_sink)
+    register_mcp_tools(toolkit, mcp_tools or [], used_names)
     return toolkit
 
 
@@ -138,33 +136,33 @@ def _safe_eval_expression(expression: str) -> int | float:
     return evaluate(tree.body)
 
 
-def _build_calculator_tool(trace_sink: Callable[[dict[str, Any]], None] | None = None):
+def _build_calculator_tool():
     def calculator(expression: str):
         arguments = {"expression": expression}
-        return _run_agentscope_tool("calculator", arguments, trace_sink)
+        return _run_agentscope_tool("calculator", arguments)
 
     return calculator
 
 
-def _build_current_time_tool(trace_sink: Callable[[dict[str, Any]], None] | None = None):
+def _build_current_time_tool():
     def current_time():
-        return _run_agentscope_tool("current_time", {}, trace_sink)
+        return _run_agentscope_tool("current_time", {})
 
     return current_time
 
 
-def _build_query_order_tool(trace_sink: Callable[[dict[str, Any]], None] | None = None):
+def _build_query_order_tool():
     def query_order(order_id: str):
         arguments = {"order_id": order_id}
-        return _run_agentscope_tool("query_order", arguments, trace_sink)
+        return _run_agentscope_tool("query_order", arguments)
 
     return query_order
 
 
-def _build_mock_weather_tool(trace_sink: Callable[[dict[str, Any]], None] | None = None):
+def _build_mock_weather_tool():
     def mock_weather(city: str = "上海"):
         arguments = {"city": city}
-        return _run_agentscope_tool("mock_weather", arguments, trace_sink)
+        return _run_agentscope_tool("mock_weather", arguments)
 
     return mock_weather
 
@@ -172,23 +170,11 @@ def _build_mock_weather_tool(trace_sink: Callable[[dict[str, Any]], None] | None
 def _run_agentscope_tool(
     tool_name: str,
     arguments: dict[str, Any],
-    trace_sink: Callable[[dict[str, Any]], None] | None,
 ):
     from agentscope.message import TextBlock
     from agentscope.tool import ToolResponse
 
-    started = perf_counter()
     output = run_tool(tool_name, arguments)
-    event = {
-        "type": "tool_call",
-        "name": tool_name,
-        "input": arguments,
-        "output": output,
-        "source": "agentscope",
-        "latency_ms": int((perf_counter() - started) * 1000),
-    }
-    if trace_sink:
-        trace_sink(event)
     return ToolResponse(content=[TextBlock(type="text", text=_serialize_tool_output(output))])
 
 

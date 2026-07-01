@@ -35,11 +35,12 @@ class WorkflowResult:
 
 
 class WorkflowExecutor:
-    def __init__(self, db: Session, app: Any, workflow_spec: dict[str, Any], run_id: str):
+    def __init__(self, db: Session, app: Any, workflow_spec: dict[str, Any], run_id: str, workflow_id: str = ""):
         self.db = db
         self.app = app
         self.workflow_spec = workflow_spec
         self.run_id = run_id
+        self.workflow_id = workflow_id
         self.result = WorkflowResult()
 
     async def execute(
@@ -197,40 +198,45 @@ class WorkflowExecutor:
         )
 
         final_answer = ""
-        async for event in adapter.run(invocation):
-            if event["type"] == "tool_call":
-                self.result.tool_calls.append(event)
-                step_input = dict(event.get("input", {}))
-                if event.get("server_id"):
-                    step_input["_mcp"] = {
-                        "server_id": event["server_id"],
-                        "server_name": event.get("server_name", ""),
-                        "registered_name": event.get("registered_name", ""),
-                    }
-                add_step(
-                    self.db,
-                    self.run_id,
-                    "tool_call",
-                    event["name"],
-                    step_input,
-                    event.get("output", {}),
-                )
-            elif event["type"] == "final":
-                final_answer = str(event.get("content", ""))
-                self.result.answer = final_answer
-            elif event["type"] == "adapter_error":
-                add_step(
-                    self.db,
-                    self.run_id,
-                    "error",
-                    "agent_adapter",
-                    {"node": node},
-                    event,
-                    error=str(event.get("message", "")),
-                )
+        tool_calls_by_id: dict[str, dict[str, Any]] = {}
+        from opentelemetry import trace
+
+        tracer = trace.get_tracer("dify_like.agent_runtime")
+        with tracer.start_as_current_span(
+            "workflow.agent",
+            attributes={
+                "dify_like.run.id": self.run_id,
+                "dify_like.app.id": str(getattr(self.app, "id", "")),
+                "dify_like.workflow.id": self.workflow_id,
+                "dify_like.conversation.id": str(context.get("conversation_id") or ""),
+                "dify_like.node.id": str(node.get("id") or "agent"),
+            },
+        ):
+            async for event in adapter.run(invocation):
+                if event["type"] == "tool_call":
+                    tool_call = {**event, "output": None}
+                    self.result.tool_calls.append(tool_call)
+                    tool_calls_by_id[str(event.get("tool_call_id") or "")] = tool_call
+                elif event["type"] == "tool_result":
+                    tool_call = tool_calls_by_id.get(str(event.get("tool_call_id") or ""))
+                    if tool_call is not None:
+                        tool_call["output"] = event.get("output")
+                elif event["type"] == "final":
+                    final_answer = str(event.get("content", ""))
+                    self.result.answer = final_answer
+                elif event["type"] == "adapter_error":
+                    add_step(
+                        self.db,
+                        self.run_id,
+                        "error",
+                        "agent_adapter",
+                        {"node": node},
+                        event,
+                        error=str(event.get("message", "")),
+                    )
+                    yield event
+                    return
                 yield event
-                return
-            yield event
 
         add_step(
             self.db,
@@ -255,7 +261,6 @@ class WorkflowExecutor:
             },
             {
                 "answer": final_answer,
-                "tool_calls": self.result.tool_calls,
                 "context": invocation.context_metadata,
             },
             latency_ms=int((perf_counter() - started) * 1000),
@@ -264,7 +269,6 @@ class WorkflowExecutor:
     def _execute_end(self, node: dict[str, Any], context: dict[str, Any]):
         output = {
             "answer": self.result.answer,
-            "tool_calls": self.result.tool_calls,
             "retrieved_chunks": self.result.retrieved_chunks,
         }
         add_step(self.db, self.run_id, "end", node.get("id", "end"), {"query": context["query"]}, output)

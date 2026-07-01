@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Iterable
-from time import perf_counter
+from collections.abc import Iterable
 from typing import Any
 
 from app.mcp.client import call_mcp_tool
@@ -13,7 +12,6 @@ def register_mcp_tools(
     toolkit: Any,
     mcp_tools: Iterable[dict[str, Any]],
     used_names: set[str],
-    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     for spec in mcp_tools:
         if not isinstance(spec, dict):
@@ -35,7 +33,6 @@ def register_mcp_tools(
                 from agentscope.message import TextBlock
                 from agentscope.tool import ToolResponse
 
-                started = perf_counter()
                 try:
                     db = _spec.get("db")
                     server_id = str(_spec.get("server_id") or "")
@@ -56,19 +53,6 @@ def register_mcp_tools(
                         )
                 except Exception as exc:
                     output = {"error": str(exc)}
-                event = { # Record trace
-                    "type": "tool_call",
-                    "name": str(_spec.get("name") or registered_name),
-                    "registered_name": registered_name,
-                    "server_id": str(_spec.get("server_id") or ""),
-                    "server_name": str(_spec.get("server_name") or ""),
-                    "input": kwargs,
-                    "output": output,
-                    "source": "mcp",
-                    "latency_ms": int((perf_counter() - started) * 1000),
-                }
-                if trace_sink:
-                    trace_sink(event)
                 # AgentScope doesn't directly recognize Python dict, so it should be packaged as the ToolResponse it knows.
                 return ToolResponse(content=[TextBlock(type="text", text=_serialize_tool_output(output))])
 

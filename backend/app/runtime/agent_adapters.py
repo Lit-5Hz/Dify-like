@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -164,8 +165,10 @@ class AgentScopeAdapter(BaseAgentAdapter):
         -> 监听 stream_printing_messages
         -> 把 AgentScope 输出转成 RuntimeEvent
     它吐给上层的事件主要有几类：
+        thinking_delta  模型思维链增量输出
         message_delta   模型增量输出
         tool_call       AgentScope 内部调用工具
+        tool_result     AgentScope 工具执行结果
         final           这轮 agent 结束
         adapter_error   AgentScope 出错
     """
@@ -174,12 +177,9 @@ class AgentScopeAdapter(BaseAgentAdapter):
 
     async def run(self, invocation: AgentInvocation) -> AsyncIterator[RuntimeEvent]:
         # 函数作用：把项目内部的 AgentInvocation 转成 AgentScope 调用，再把 AgentScope 的输出转回项目统一的 RuntimeEvent。
-
-        # tool_events 用来接住 AgentScope 内部工具调用产生的 trace，再穿透给 workflow/chat_stream。
-        tool_events: list[RuntimeEvent] = []
         try:
-            # 1.创建 AgentScope agent，并把 trace_sink 传给工具层，让工具执行时能回推 tool_call 事件
-            agent = await self._create_agent(invocation, tool_events.append)
+            # 1.创建 AgentScope agent。
+            agent = await self._create_agent(invocation)
             # 2.导入 AgentScope 的消息和流式工具:
             from agentscope.message import Msg  # Msg 用来把用户输入包装成 AgentScope 能识别的消息
             from agentscope.pipeline import stream_printing_messages  # stream_printing_messages 用来接收 AgentScope 运行中的流式输出
@@ -209,37 +209,72 @@ class AgentScopeAdapter(BaseAgentAdapter):
         # 4.把用户输入包装成一条 user 消息，启动 AgentScope 的 ReActAgent 执行。
         # task 会被交给 stream_printing_messages() 去流式消费。
         task = agent(Msg("user", invocation.query, "user"))
-        previous = ""
         latest_text = ""
+        message_texts: dict[str, str] = {}
+        message_thinking: dict[str, str] = {}
+        emitted_tool_calls: set[str] = set()
+        emitted_tool_results: set[str] = set()
 
         try:
             # 5.把 AgentScope 输出(Msg 流)转换成项目事件(RuntimeEvent 流)，这是 adapter 的核心：
             # AgentScope 给出的通常是“当前完整文本”，而前端需要的是“增量文本”。
-            # 所以代码用 previous 记录上一次文本，然后算出这次新增的部分 delta。
+            # 所以代码按消息 ID 记录上一次文本，然后算出这次新增的部分 delta。
             async for msg, last in stream_printing_messages(agents=[agent], coroutine_task=task):
-                # 工具调用 trace 是从工具函数里同步塞进 tool_events 的；这里在模型消息之间尽快吐给上层。
-                while tool_events:
-                    yield tool_events.pop(0)
+                message_id = str(getattr(msg, "id", "") or id(msg))
+                if str(getattr(msg, "role", "")) == "assistant":
+                    current_thinking = self._extract_thinking(msg)
+                    previous_thinking = message_thinking.get(message_id, "")
+                    thinking_delta = (
+                        current_thinking[len(previous_thinking) :]
+                        if current_thinking.startswith(previous_thinking)
+                        else current_thinking
+                    )
+                    message_thinking[message_id] = current_thinking
+                    if thinking_delta:
+                        yield {
+                            "type": "thinking_delta",
+                            "message_id": message_id,
+                            "content": thinking_delta,
+                            "source": "agentscope",
+                        }
 
-                current = self._extract_text(msg)
-                if current:
-                    latest_text = current
-                # delta 是从累计文本里切出来的新增文本片段。
-                # 前端只需要不断 append delta，就能形成流式输出。
-                delta = current[len(previous) :] if current.startswith(previous) else current
-                previous = current
-                if delta:
-                    yield {
-                        "type": "message_delta",
-                        "content": delta,
-                        "source": "agentscope",
-                    }
+                    current = self._extract_text(msg)
+                    previous = message_texts.get(message_id, "")
+                    if current:
+                        latest_text = current
+                    delta = current[len(previous) :] if current.startswith(previous) else current
+                    message_texts[message_id] = current
+                    if delta:
+                        yield {
+                            "type": "message_delta",
+                            "message_id": message_id,
+                            "content": delta,
+                            "source": "agentscope",
+                        }
 
                 if last:
-                    # 注意：AgentScope 的 last=True 表示“当前打印消息结束”，不等于“整个 agent 结束”。
-                    # 因此这里不能直接 yield final，只把这一段期间累积的工具 trace 先吐出去。
-                    while tool_events:
-                        yield tool_events.pop(0)
+                    for block in self._content_blocks(msg):
+                        block_type = str(block.get("type") or "")
+                        tool_call_id = str(block.get("id") or "")
+                        if block_type == "tool_use" and tool_call_id and tool_call_id not in emitted_tool_calls:
+                            emitted_tool_calls.add(tool_call_id)
+                            yield {
+                                "type": "tool_call",
+                                "message_id": message_id,
+                                "tool_call_id": tool_call_id,
+                                "name": str(block.get("name") or ""),
+                                "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                                "source": "agentscope",
+                            }
+                        elif block_type == "tool_result" and tool_call_id and tool_call_id not in emitted_tool_results:
+                            emitted_tool_results.add(tool_call_id)
+                            yield {
+                                "type": "tool_result",
+                                "tool_call_id": tool_call_id,
+                                "name": str(block.get("name") or ""),
+                                "output": self._normalize_tool_output(block.get("output")),
+                                "source": "agentscope",
+                            }
         except Exception as exc:
             yield {
                 "type": "adapter_error",
@@ -247,20 +282,15 @@ class AgentScopeAdapter(BaseAgentAdapter):
                 "message": str(exc),
             }
             return
-        # stream_printing_messages 结束时，agent可能在最后一轮打印之后又调了一个工具（还没等模型输出新文本，循环就结束了）。这个工具事件装在 tool_events里但循环已经退出，没人消费它。
-        # 下面这两行代码做了兜底清空——确保没有任何工具事件被漏掉，然后才发 final。
-        while tool_events:
-            yield tool_events.pop(0)
-
         # 6.只有当 stream_printing_messages 整体结束后，才说明 agent 本轮执行真正完成。
         # 这里统一发一次 final，避免 ReAct 工具调用过程中提前出现空 final。
         yield {
             "type": "final",
-            "content": latest_text or previous,
+            "content": latest_text,
             "source": "agentscope",
         }
 
-    async def _create_agent(self, invocation: AgentInvocation, trace_sink):
+    async def _create_agent(self, invocation: AgentInvocation):
         """
         创建模型
         创建 formatter
@@ -277,7 +307,6 @@ class AgentScopeAdapter(BaseAgentAdapter):
         toolkit = build_agentscope_toolkit(
             invocation.enabled_tools,
             invocation.enabled_mcp_tools,
-            trace_sink=trace_sink,
         )
         sys_prompt = self._build_system_prompt(invocation)
         return ReActAgent(
@@ -362,9 +391,17 @@ class AgentScopeAdapter(BaseAgentAdapter):
     def _build_system_prompt(self, invocation: AgentInvocation) -> str:
         context_block, context_metadata = build_agent_context(invocation)
         invocation.context_metadata = context_metadata
-        if not context_block:
-            return invocation.system_prompt
-        return f"{invocation.system_prompt}\n\nKnowledge context:\n{context_block}"
+        reasoning_instructions = (
+            "Reasoning transparency requirements:\n"
+            "- Explicitly reason about whether the provided knowledge context is relevant to the user's question.\n"
+            "- Before calling a tool, reason about why the available information is insufficient and what the tool can add.\n"
+            "- After a tool returns, reason about whether its result is sufficient to answer the user.\n"
+            "- Keep the reasoning in the model's reasoning channel and keep it separate from the final answer."
+        )
+        prompt = f"{invocation.system_prompt}\n\n{reasoning_instructions}"
+        if context_block:
+            prompt = f"{prompt}\n\nKnowledge context:\n{context_block}"
+        return prompt
 
     def _build_generate_kwargs(self, invocation: AgentInvocation) -> dict[str, Any]:
         # 前端目前沿用 70/100 这种百分比式数值；真实模型 API 通常需要 0.7/1.0。
@@ -418,6 +455,31 @@ class AgentScopeAdapter(BaseAgentAdapter):
                     parts.append(str(text))
             return "".join(parts)
         return str(content or "")
+
+    def _extract_thinking(self, msg: Any) -> str:
+        return "".join(
+            str(block.get("thinking") or "")
+            for block in self._content_blocks(msg)
+            if block.get("type") == "thinking"
+        )
+
+    def _content_blocks(self, msg: Any) -> list[dict[str, Any]]:
+        content = getattr(msg, "content", None)
+        if not isinstance(content, list):
+            return []
+        return [block for block in content if isinstance(block, dict)]
+
+    def _normalize_tool_output(self, output: Any) -> Any:
+        if not isinstance(output, list):
+            return output
+        if not output or not all(isinstance(block, dict) and block.get("type") == "text" for block in output):
+            return output
+
+        text = "".join(str(block.get("text") or "") for block in output)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
 
 
 def build_agent_adapter(adapter_name: str | None, model_provider: str) -> BaseAgentAdapter:
