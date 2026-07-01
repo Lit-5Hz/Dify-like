@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     platform_assistant_temperature: float = 0.2
     platform_assistant_timeout_seconds: int = 30
 
+    agentscope_tracing_url: str = "http://localhost:4318/v1/traces"
+    agentscope_tracing_service_name: str = "dify-like-agent-runtime"
+
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
 
     @property
@@ -49,3 +53,18 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def initialize_agentscope_tracing(settings: Settings) -> None:
+    tracing_url = settings.agentscope_tracing_url.strip()
+    if not tracing_url:
+        return
+
+    os.environ.setdefault("OTEL_SERVICE_NAME", settings.agentscope_tracing_service_name)
+    import agentscope
+
+    agentscope.init(
+        project="dify-like",
+        name="backend",
+        tracing_url=tracing_url,
+    )

@@ -16,7 +16,7 @@ from app.api.routes import (
     tools,
     workflows,
 )
-from app.core.config import get_settings
+from app.core.config import get_settings, initialize_agentscope_tracing
 from app.db.session import init_db
 
 
@@ -51,6 +51,7 @@ app.include_router(mcp_server.public_router)
 
 @app.on_event("startup")
 def on_startup() -> None:
+    initialize_agentscope_tracing(settings)
     init_db()
 
 
