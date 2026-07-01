@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Bot,
   CheckCircle2,
@@ -3064,7 +3066,21 @@ function App() {
         <div className="assistant-answer">
           <strong className="assistant-answer-label">{answerLabel}</strong>
           {message.content ? (
-            <div className="assistant-answer-content">{message.content}</div>
+            <div className="assistant-answer-content">
+              <Markdown
+                remarkPlugins={[remarkGfm]}
+                skipHtml
+                components={{
+                  a: ({ children, node: _node, ...props }) => (
+                    <a {...props} target="_blank" rel="noopener noreferrer">
+                      {children}
+                    </a>
+                  ),
+                }}
+              >
+                {message.content}
+              </Markdown>
+            </div>
           ) : message.status === "streaming" ? (
             <div className="assistant-answer-pending"><Loader2 className="spin" size={14} /> 等待模型输出</div>
           ) : null}

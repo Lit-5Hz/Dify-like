@@ -1441,11 +1441,170 @@ pre {
 }
 
 .assistant-answer-content {
+  min-width: 0;
   color: var(--text);
   line-height: 1.65;
   overflow-wrap: anywhere;
   word-break: break-word;
+  white-space: normal;
+}
+
+.assistant-answer-content > :first-child {
+  margin-top: 0;
+}
+
+.assistant-answer-content > :last-child {
+  margin-bottom: 0;
+}
+
+.assistant-answer-content h1,
+.assistant-answer-content h2,
+.assistant-answer-content h3,
+.assistant-answer-content h4,
+.assistant-answer-content h5,
+.assistant-answer-content h6 {
+  margin: 18px 0 8px;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.assistant-answer-content h1 {
+  font-size: 20px;
+}
+
+.assistant-answer-content h2 {
+  font-size: 18px;
+}
+
+.assistant-answer-content h3 {
+  font-size: 16px;
+}
+
+.assistant-answer-content h4,
+.assistant-answer-content h5,
+.assistant-answer-content h6 {
+  font-size: 14px;
+}
+
+.assistant-answer-content p,
+.assistant-answer-content ul,
+.assistant-answer-content ol,
+.assistant-answer-content blockquote,
+.assistant-answer-content pre,
+.assistant-answer-content table,
+.assistant-answer-content hr {
+  margin: 0 0 12px;
+}
+
+.assistant-answer-content ul,
+.assistant-answer-content ol {
+  padding-left: 22px;
+}
+
+.assistant-answer-content li + li {
+  margin-top: 4px;
+}
+
+.assistant-answer-content li > p {
+  margin-bottom: 4px;
+}
+
+.assistant-answer-content blockquote {
+  border-left: 3px solid var(--primary);
+  padding: 2px 0 2px 12px;
+  color: var(--muted);
+}
+
+.assistant-answer-content blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.assistant-answer-content a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.assistant-answer-content a:hover {
+  color: #0b615b;
+}
+
+.assistant-answer-content a:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid rgba(15, 118, 110, 0.32);
+  outline-offset: 2px;
+}
+
+.assistant-answer-content code {
+  border-radius: 4px;
+  padding: 2px 5px;
+  background: #e9eef2;
+  color: #243b53;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.assistant-answer-content pre {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  overflow: visible;
+  background: #f3f6f8;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-answer-content pre code {
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+}
+
+.assistant-answer-content table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.assistant-answer-content th,
+.assistant-answer-content td {
+  border: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.assistant-answer-content th {
+  background: #eef3f5;
+  font-weight: 700;
+}
+
+.assistant-answer-content tr:nth-child(even) td {
+  background: #fafbfc;
+}
+
+.assistant-answer-content hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+.assistant-answer-content img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+
+.assistant-answer-content input[type="checkbox"] {
+  margin-right: 6px;
+  accent-color: var(--primary);
 }
 
 .assistant-answer-pending {
