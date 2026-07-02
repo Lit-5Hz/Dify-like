@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from app.core.config import get_settings
 from app.mcp.protocol import MCP_PROTOCOL_VERSION, extract_jsonrpc_result
@@ -141,6 +142,7 @@ async def _post_jsonrpc(
 ) -> McpJsonRpcResponse:
     """Unified "send JSON-RPC request" function on MCP Client side."""
     headers = _build_auth_headers(auth_type, auth_secret, custom_headers, session_id)
+    _inject_trace_context(headers)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.post(server_url, json=payload, headers=headers)
@@ -165,6 +167,13 @@ async def _post_jsonrpc(
         result=extract_jsonrpc_result(body),
         session_id=_extract_session_id(response.headers),
     )
+
+
+def _inject_trace_context(headers: dict[str, str]) -> None:
+    for key in list(headers):
+        if key.lower() in {"traceparent", "tracestate"}:
+            del headers[key]
+    TraceContextTextMapPropagator().inject(headers)
 
 
 def _build_auth_headers(

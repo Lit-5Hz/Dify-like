@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from sqlalchemy.orm import Session
 
 from app.mcp.protocol import (
@@ -31,6 +36,7 @@ async def handle_workflow_mcp_request(
     server_slug: str,
     authorization: str | None,
     payload: Any, # JSON-RPC request body sent by external MCP client
+    request_headers: Mapping[str, str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     request_id = payload.get("id") if isinstance(payload, dict) else None
     try:
@@ -47,50 +53,74 @@ async def handle_workflow_mcp_request(
     if not verify_workflow_mcp_server_token(workflow_server, authorization):
         return 401, {"detail": "Invalid MCP bearer token"}
 
-    try:
-        if method == "initialize":
-            return 200, build_jsonrpc_result(
-                request_id,
-                {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {
-                        "name": workflow_server.server_name,
-                        "version": "0.1.0",
+    with _mcp_server_span(request_headers, method, server_slug, request_id):
+        try:
+            if method == "initialize":
+                return 200, build_jsonrpc_result(
+                    request_id,
+                    {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {
+                            "name": workflow_server.server_name,
+                            "version": "0.1.0",
+                        },
                     },
-                },
-            )
+                )
 
-        if method == "tools/list":
-            return 200, build_jsonrpc_result(
-                request_id,
-                {
-                    "tools": [
-                        {
-                            "name": RUN_WORKFLOW_TOOL_NAME,
-                            "description": workflow_server.description
-                            or f"Run the published workflow '{workflow.name}'.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {"type": "string"},
-                                    "conversation_id": {"type": "string"},
+            if method == "tools/list":
+                return 200, build_jsonrpc_result(
+                    request_id,
+                    {
+                        "tools": [
+                            {
+                                "name": RUN_WORKFLOW_TOOL_NAME,
+                                "description": workflow_server.description
+                                or f"Run the published workflow '{workflow.name}'.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string"},
+                                        "conversation_id": {"type": "string"},
+                                    },
+                                    "required": ["query"],
                                 },
-                                "required": ["query"],
-                            },
-                        }
-                    ]
-                },
-            )
+                            }
+                        ]
+                    },
+                )
 
-        if method == "tools/call":
-            return 200, await _handle_tools_call(db, request_id, workflow_server.server_slug, workflow, app, params)
+            if method == "tools/call":
+                return 200, await _handle_tools_call(db, request_id, workflow_server.server_slug, workflow, app, params)
 
-        return 200, build_jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {method}")
-    except JsonRpcError as exc:
-        return 200, build_jsonrpc_error(request_id, exc.code, exc.message, exc.data)
-    except Exception as exc:
-        return 200, build_jsonrpc_error(request_id, JSONRPC_INTERNAL_ERROR, str(exc))
+            return 200, build_jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {method}")
+        except JsonRpcError as exc:
+            return 200, build_jsonrpc_error(request_id, exc.code, exc.message, exc.data)
+        except Exception as exc:
+            return 200, build_jsonrpc_error(request_id, JSONRPC_INTERNAL_ERROR, str(exc))
+
+
+@contextmanager
+def _mcp_server_span(
+    request_headers: Mapping[str, str] | None,
+    method: str,
+    server_slug: str,
+    request_id: Any,
+) -> Iterator[None]:
+    parent_context = TraceContextTextMapPropagator().extract(request_headers or {})
+    tracer = trace.get_tracer("dify_like.mcp")
+    with tracer.start_as_current_span(
+        f"mcp.server {method}",
+        context=parent_context,
+        kind=SpanKind.SERVER,
+        attributes={
+            "rpc.system": "jsonrpc",
+            "rpc.method": method,
+            "mcp.server.slug": server_slug,
+            "mcp.request.id": str(request_id or ""),
+        },
+    ):
+        yield
 
 
 async def _handle_tools_call(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user
@@ -71,12 +71,18 @@ def rotate_token(
 @public_router.post("/mcp/{server_slug}")
 async def mcp_endpoint(
     server_slug: str,
+    request: Request,
     payload: dict[str, Any],
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    status_code, body = await handle_workflow_mcp_request(db, server_slug, authorization, payload)
+    status_code, body = await handle_workflow_mcp_request(
+        db,
+        server_slug,
+        authorization,
+        payload,
+        request.headers,
+    )
     if status_code >= 400:
         raise HTTPException(status_code=status_code, detail=body.get("detail", "MCP request failed"))
     return body
-
