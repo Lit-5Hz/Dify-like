@@ -69,3 +69,16 @@ def initialize_agentscope_tracing(settings: Settings) -> None:
         name="backend",
         tracing_url=tracing_url,
     )
+
+
+def activate_agentscope_tracing_context(settings: Settings) -> None:
+    if not settings.agentscope_tracing_url.strip():
+        return
+
+    # AgentScope 1.0.19 stores these values in ContextVar instances, so the
+    # FastAPI request context must be activated separately from startup.
+    from agentscope import _config
+
+    _config.project = "dify-like"
+    _config.name = "backend"
+    _config.trace_enabled = True

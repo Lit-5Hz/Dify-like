@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.config import activate_agentscope_tracing_context, get_settings
 from app.runtime.agent_adapters import AgentInvocation, RuntimeEvent, build_agent_adapter
 from app.services.agent_tool_spec import resolve_agent_enabled_builtin_tool_names
 from app.services.external_mcp_server_service import resolve_agent_mcp_tool_runtime_specs
@@ -212,6 +213,7 @@ class WorkflowExecutor:
                 "dify_like.node.id": str(node.get("id") or "agent"),
             },
         ):
+            activate_agentscope_tracing_context(get_settings())
             async for event in adapter.run(invocation):
                 if event["type"] == "tool_call":
                     tool_call = {**event, "output": None}
